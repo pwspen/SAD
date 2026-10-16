@@ -42,7 +42,7 @@ export function createSeedCounter(device) {
 export function createGradsBuffer(device, capacity) {
   return device.createBuffer({
     size: capacity * 10 * 4,
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
   });
 }
 

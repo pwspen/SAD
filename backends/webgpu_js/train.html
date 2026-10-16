@@ -269,15 +269,17 @@
         min-height: 0;
         display: grid;
         grid-template-columns: 1fr 1fr 1fr;
+        grid-auto-rows: max-content; /* cards are overflow:hidden, so rows would otherwise shrink */
         gap: 12px;
         padding: 12px;
         place-items: center;
-        align-content: center;
+        align-content: safe center;
         overflow: auto;
       }
       .canvas-card {
         position: relative;
-        width: min(100%, calc(100vh - 220px), 620px);
+        /* leave room for the 320px gradient card + grid gap below */
+        width: min(100%, max(240px, calc(100vh - 560px)), 620px);
         aspect-ratio: 1 / 1;
         background: var(--canvas-bg);
         border: 1px solid var(--line);
@@ -296,7 +298,14 @@
         display: block;
         flex: none;
       }
-      .canvas-card canvas#psnrCanvas {
+      .canvas-card.wide {
+        grid-column: 1 / -1;
+        width: 100%;
+        aspect-ratio: auto;
+        height: 320px;
+      }
+      .canvas-card canvas#psnrCanvas,
+      .canvas-card canvas#gradCanvas {
         width: 100%;
         height: 100%;
         image-rendering: auto;
@@ -367,6 +376,10 @@
         }
         .canvas-card {
           width: min(100%, 520px);
+        }
+        .canvas-card.wide {
+          width: 100%;
+          height: 360px;
         }
       }
     </style>
@@ -491,6 +504,10 @@
             <span class="card-label">PSNR vs iteration</span>
             <canvas id="psnrCanvas"></canvas>
           </div>
+          <div class="canvas-card wide">
+            <span class="card-label">|gradient| vs iteration (log)</span>
+            <canvas id="gradCanvas"></canvas>
+          </div>
         </div>
 
         <div class="footer">
@@ -501,6 +518,6 @@
       </section>
     </div>
 
-    <script type="module" src="train.js?v=psnr-plot-20261016"></script>
+    <script type="module" src="train.js?v=grad-plot-20261016"></script>
   </body>
 </html>

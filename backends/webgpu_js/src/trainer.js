@@ -712,6 +712,17 @@ export class Trainer {
           this.clearParamsPost, postSites);
       }
 
+      // Snapshot the accumulated gradients on log ticks — Adam zeroes them.
+      let gradStaging = null;
+      if (shouldLog) {
+        const gradBytes = Math.max(1, postSites) * 10 * 4;
+        gradStaging = device.createBuffer({
+          size: gradBytes,
+          usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+        });
+        encoder.copyBufferToBuffer(this.grads, 0, gradStaging, 0, gradBytes);
+      }
+
       // Adam
       this.adamEnc.encode(encoder, this.sitesBuf, this.adamBuf, this.grads,
         this.adamParams, postSites);
@@ -746,6 +757,11 @@ export class Trainer {
         const rgba = await readRgba32FloatTexture(device, this.renderTex, this.width, this.height);
         const sitesData = await readSites(device, this.sitesBuf, postSites);
         this._lastSitesCpu = sitesData;
+        await gradStaging.mapAsync(GPUMapMode.READ);
+        const gradStats = computeGradStats(new Int32Array(gradStaging.getMappedRange()),
+          postSites, this.width * this.height);
+        gradStaging.unmap();
+        gradStaging.destroy();
         const psnr = computePsnrSafe(rgba, this.target, this.width, this.height, this.maskCpu, this.maskSum);
         this.bestPsnr = Math.max(this.bestPsnr, psnr);
         const elapsed = (performance.now() - this.trainStartMs) / 1000;
@@ -755,6 +771,7 @@ export class Trainer {
             type: "iter",
             it, iters,
             psnr,
+            gradStats,
             activeSites: postActive,
             totalSites: postSites,
             itsPerSec,
@@ -994,6 +1011,60 @@ export class Trainer {
       trainSeconds: (performance.now() - this.trainStartMs) / 1000,
     };
   }
+}
+
+// Gradient groups over the consolidated grads[idx*10+ch] channels. Multi-channel
+// groups use the vector magnitude (e.g. |(dx, dy)| for position).
+export const GRAD_GROUPS = [
+  { key: "pos", label: "position", channels: [0, 1] },
+  { key: "tau", label: "log τ", channels: [2] },
+  { key: "radius", label: "radius", channels: [3] },
+  { key: "color", label: "color", channels: [4, 5, 6] },
+  { key: "dir", label: "direction", channels: [7, 8] },
+  { key: "aniso", label: "log aniso", channels: [9] },
+];
+
+const I32_LIMIT = 2147483647;
+const GRAD_QUANT_SCALE = 1e6; // K_GRAD_QUANT_SCALE in sad_shared.wgsl
+
+// Per-group mean/max of |grad| in the units Adam sees (raw * 1/quant / (W*H)).
+// Sites with every channel zero (inactive, or covering no pixels) are skipped.
+// `maxRawFrac` is the largest |raw i32| / INT32_MAX over all channels — values
+// near 1 mean the fixed-point accumulator is close to wrapping.
+function computeGradStats(raw, siteCount, numPixels) {
+  const scale = 1 / (GRAD_QUANT_SCALE * numPixels);
+  const sums = new Float64Array(GRAD_GROUPS.length);
+  const maxs = new Float64Array(GRAD_GROUPS.length);
+  let counted = 0;
+  let maxRaw = 0;
+  for (let i = 0; i < siteCount; i += 1) {
+    const base = i * 10;
+    let any = false;
+    for (let c = 0; c < 10; c += 1) {
+      const v = Math.abs(raw[base + c]);
+      if (v !== 0) any = true;
+      if (v > maxRaw) maxRaw = v;
+    }
+    if (!any) continue;
+    counted += 1;
+    for (let g = 0; g < GRAD_GROUPS.length; g += 1) {
+      let sq = 0;
+      for (const c of GRAD_GROUPS[g].channels) sq += raw[base + c] * raw[base + c];
+      const mag = Math.sqrt(sq) * scale;
+      sums[g] += mag;
+      if (mag > maxs[g]) maxs[g] = mag;
+    }
+  }
+  const groups = {};
+  GRAD_GROUPS.forEach((grp, g) => {
+    groups[grp.key] = { mean: counted ? sums[g] / counted : 0, max: maxs[g] };
+  });
+  return {
+    groups,
+    sites: counted,
+    maxRawFrac: maxRaw / I32_LIMIT,
+    limit: I32_LIMIT * scale, // per-component wrap threshold in the same units
+  };
 }
 
 // Mirrors main()'s PSNR computation: only pixels inside the mask count, values

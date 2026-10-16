@@ -3,11 +3,11 @@
 // (mask, init-sites, densify/prune/lr…) in the collapsible left panel, and a
 // side-by-side target vs reconstruction view, both aspect-fit.
 
-import { loadShaders } from "./src/shader_loader.js?v=viewer-sync-20260423j";
-import { Trainer, buildArgs } from "./src/trainer.js?v=viewer-sync-20260423j";
-import { loadImageToFloat32, loadMaskRgba32Float, whiteMaskRgba32Float } from "./src/textures.js?v=viewer-sync-20260423j";
-import { loadSitesFromFile, serializeSitesTxt, triggerDownload, floatImageToRgba8 } from "./src/io.js?v=viewer-sync-20260423j";
-import { SITE_FLOATS } from "./src/params.js?v=viewer-sync-20260423j";
+import { loadShaders } from "./src/shader_loader.js?v=grad-plot-20261016";
+import { Trainer, buildArgs, GRAD_GROUPS } from "./src/trainer.js?v=grad-plot-20261016";
+import { loadImageToFloat32, loadMaskRgba32Float, whiteMaskRgba32Float } from "./src/textures.js?v=grad-plot-20261016";
+import { loadSitesFromFile, serializeSitesTxt, triggerDownload, floatImageToRgba8 } from "./src/io.js?v=grad-plot-20261016";
+import { SITE_FLOATS } from "./src/params.js?v=grad-plot-20261016";
 
 const CONFIG_URL = "../../training_config.json";
 const DEMO_MAX_IMAGE_SIDE = 2048;
@@ -69,6 +69,8 @@ const state = {
   psnrHistory: [],       // [{ it, psnr }] from log ticks, plotted in the PSNR card
   psnrIters: 0,
   psnrHover: null,       // index into psnrHistory under the cursor
+  gradHistory: [],       // [{ it, stats }] per-param |grad| mean/max from log ticks
+  gradHover: null,       // index into gradHistory under the cursor
 };
 
 const ui = {
@@ -95,6 +97,7 @@ const ui = {
   overlayCanvas: document.getElementById("overlayCanvas"),
   targetCanvas: document.getElementById("targetCanvas"),
   psnrCanvas: document.getElementById("psnrCanvas"),
+  gradCanvas: document.getElementById("gradCanvas"),
   metricRow: document.getElementById("metricRow"),
   progressFill: document.getElementById("progressFill"),
   progressText: document.getElementById("progressText"),
@@ -219,6 +222,7 @@ function updateCanvasLayout(width = state.targetImage?.width, height = state.tar
   fitCanvasToCard(ui.previewCanvas, width || ui.previewCanvas.width, height || ui.previewCanvas.height);
   positionOverlay();
   drawPsnrPlot();
+  drawGradPlot();
 }
 
 // ---- PSNR vs iteration plot ----
@@ -404,6 +408,273 @@ function handlePsnrHover(ev) {
   }
 }
 
+// ---- |gradient| vs iteration plot (log y) ----
+// One hue per param group (fixed order, validated against --canvas-bg);
+// solid = max over sites, dashed = mean over sites with any nonzero grad.
+
+const GRAD_COLORS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300"];
+const GRAD_PAD = { left: 56, right: 16, bottom: 34 };
+const GRAD_MEAN_DASH = [6, 4];
+
+function fmtExp(v) {
+  return v > 0 ? v.toExponential(2) : "0";
+}
+
+function gradLegendLayout(ctx, w) {
+  // Legend wraps under the card label; returns item positions + bottom edge.
+  const items = GRAD_GROUPS.map((g, i) => ({ label: g.label, color: GRAD_COLORS[i] }));
+  items.push({ label: "max", line: [] }, { label: "mean", line: GRAD_MEAN_DASH },
+             { label: "i32 wrap limit", line: [2, 3], limit: true });
+  const x0 = 12, rowH = 16, swatch = 18;
+  let x = x0, y = 34;
+  for (const it of items) {
+    const iw = swatch + 6 + ctx.measureText(it.label).width + 14;
+    if (x + iw > w - 12 && x > x0) { x = x0; y += rowH; }
+    it.x = x; it.y = y;
+    x += iw;
+  }
+  return { items, bottom: y + 14, swatch };
+}
+
+function gradPlotGeometry(top) {
+  const canvas = ui.gradCanvas;
+  const w = canvas.clientWidth;
+  const h = canvas.clientHeight;
+  const data = state.gradHistory;
+  const xMax = Math.max(1, state.psnrIters, data.length ? data[data.length - 1].it : 0);
+  let lo = Infinity, hi = -Infinity;
+  for (const p of data) {
+    for (const g of GRAD_GROUPS) {
+      const s = p.stats.groups[g.key];
+      for (const v of [s.mean, s.max]) {
+        if (v > 0) { lo = Math.min(lo, v); hi = Math.max(hi, v); }
+      }
+    }
+    if (p.stats.limit > 0) hi = Math.max(hi, p.stats.limit);
+  }
+  if (!Number.isFinite(lo)) { lo = 1e-8; hi = 1e-2; }
+  const yMin = Math.floor(Math.log10(lo));
+  const yMax = Math.max(yMin + 1, Math.ceil(Math.log10(hi)));
+  const plotW = Math.max(1, w - GRAD_PAD.left - GRAD_PAD.right);
+  const plotH = Math.max(1, h - top - GRAD_PAD.bottom);
+  return {
+    w, h, xMax, yMin, yMax, top,
+    x: (it) => GRAD_PAD.left + (it / xMax) * plotW,
+    y: (v) => top + (1 - (Math.log10(v) - yMin) / (yMax - yMin)) * plotH,
+  };
+}
+
+function drawGradPlot() {
+  const canvas = ui.gradCanvas;
+  if (!canvas) return;
+  const w = canvas.clientWidth;
+  const h = canvas.clientHeight;
+  if (w <= 0 || h <= 0) return;
+  const dpr = window.devicePixelRatio || 1;
+  if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) {
+    canvas.width = Math.round(w * dpr);
+    canvas.height = Math.round(h * dpr);
+  }
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+
+  const css = getComputedStyle(document.documentElement);
+  const lineCol = css.getPropertyValue("--line").trim() || "#e6e6df";
+  const dimCol = css.getPropertyValue("--text-dim").trim() || "#66666e";
+  const softCol = css.getPropertyValue("--text-soft").trim() || "#9a9aa2";
+  const textCol = css.getPropertyValue("--text").trim() || "#1d1d1f";
+  const surface = css.getPropertyValue("--canvas-bg").trim() || "#f1f1ec";
+
+  ctx.font = "10.5px Inter, system-ui, -apple-system, sans-serif";
+  ctx.lineWidth = 1;
+
+  // Legend
+  const legend = gradLegendLayout(ctx, w);
+  ctx.textAlign = "left";
+  ctx.textBaseline = "middle";
+  for (const it of legend.items) {
+    ctx.save();
+    ctx.strokeStyle = it.color || (it.limit ? softCol : dimCol);
+    ctx.lineWidth = 2;
+    if (it.line) ctx.setLineDash(it.line);
+    ctx.beginPath(); ctx.moveTo(it.x, it.y); ctx.lineTo(it.x + legend.swatch, it.y); ctx.stroke();
+    ctx.restore();
+    ctx.fillStyle = dimCol;
+    ctx.fillText(it.label, it.x + legend.swatch + 6, it.y);
+  }
+
+  const top = legend.bottom + 10;
+  const data = state.gradHistory;
+  const g = gradPlotGeometry(top);
+  const left = GRAD_PAD.left, right = w - GRAD_PAD.right;
+  const bottom = h - GRAD_PAD.bottom;
+
+  // Decade grid + labels
+  ctx.textAlign = "right";
+  for (let e = g.yMin; e <= g.yMax; e += 1) {
+    const y = Math.round(g.y(10 ** e)) + 0.5;
+    ctx.strokeStyle = lineCol;
+    ctx.beginPath(); ctx.moveTo(left, y); ctx.lineTo(right, y); ctx.stroke();
+    ctx.fillStyle = softCol;
+    ctx.fillText(`1e${e}`, left - 6, y);
+  }
+
+  // Baseline + x labels
+  ctx.strokeStyle = softCol;
+  ctx.beginPath(); ctx.moveTo(left, bottom + 0.5); ctx.lineTo(right, bottom + 0.5); ctx.stroke();
+  ctx.textAlign = "center";
+  ctx.textBaseline = "top";
+  ctx.fillStyle = softCol;
+  for (const v of niceTicks(0, g.xMax, Math.max(2, Math.floor((right - left) / 70)))) {
+    ctx.fillText(v >= 10000 ? `${v / 1000}k` : String(v), g.x(v), bottom + 6);
+  }
+  ctx.fillStyle = dimCol;
+  ctx.fillText("iteration", (left + right) / 2, bottom + 20);
+  ctx.save();
+  ctx.translate(12, (top + bottom) / 2);
+  ctx.rotate(-Math.PI / 2);
+  ctx.textBaseline = "middle";
+  ctx.fillText("|grad|", 0, 0);
+  ctx.restore();
+
+  if (!data.length) {
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillStyle = softCol;
+    ctx.fillText(state.running ? "Waiting for first log tick…" : "Train to see gradients", (left + right) / 2, (top + bottom) / 2);
+    return;
+  }
+
+  // i32 wrap limit (per component, in Adam's units)
+  const limit = data[data.length - 1].stats.limit;
+  if (limit > 0) {
+    const y = Math.round(g.y(limit)) + 0.5;
+    ctx.save();
+    ctx.strokeStyle = softCol;
+    ctx.setLineDash([2, 3]);
+    ctx.beginPath(); ctx.moveTo(left, y); ctx.lineTo(right, y); ctx.stroke();
+    ctx.restore();
+  }
+
+  // Series: gaps where a value is 0 (can't be drawn on a log axis)
+  const drawSeries = (key, field, color, dash) => {
+    ctx.save();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    ctx.lineJoin = "round";
+    ctx.lineCap = "round";
+    ctx.setLineDash(dash);
+    ctx.beginPath();
+    let pen = false;
+    for (const p of data) {
+      const v = p.stats.groups[key][field];
+      if (!(v > 0)) { pen = false; continue; }
+      const x = g.x(p.it), y = g.y(v);
+      if (pen) ctx.lineTo(x, y); else ctx.moveTo(x, y);
+      pen = true;
+    }
+    ctx.stroke();
+    ctx.restore();
+  };
+  GRAD_GROUPS.forEach((grp, i) => {
+    drawSeries(grp.key, "mean", GRAD_COLORS[i], GRAD_MEAN_DASH);
+    drawSeries(grp.key, "max", GRAD_COLORS[i], []);
+  });
+
+  const hover = state.gradHover != null ? data[state.gradHover] : null;
+  if (!hover) return;
+
+  // Crosshair + markers + tooltip table
+  const hx = Math.round(g.x(hover.it)) + 0.5;
+  ctx.strokeStyle = softCol;
+  ctx.lineWidth = 1;
+  ctx.setLineDash([3, 3]);
+  ctx.beginPath(); ctx.moveTo(hx, top); ctx.lineTo(hx, bottom); ctx.stroke();
+  ctx.setLineDash([]);
+  GRAD_GROUPS.forEach((grp, i) => {
+    for (const field of ["mean", "max"]) {
+      const v = hover.stats.groups[grp.key][field];
+      if (!(v > 0)) continue;
+      ctx.beginPath();
+      ctx.arc(hx, g.y(v), 4, 0, Math.PI * 2);
+      ctx.fillStyle = GRAD_COLORS[i];
+      ctx.fill();
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = surface;
+      ctx.stroke();
+    }
+  });
+
+  ctx.font = "11px Inter, system-ui, -apple-system, sans-serif";
+  const rows = GRAD_GROUPS.map((grp, i) => ({
+    color: GRAD_COLORS[i],
+    cells: [grp.label, fmtExp(hover.stats.groups[grp.key].mean), fmtExp(hover.stats.groups[grp.key].max)],
+  }));
+  const header = [`iter ${hover.it}`, "mean", "max"];
+  const footer = `max |raw| / i32: ${hover.stats.maxRawFrac.toFixed(3)} · ${hover.stats.sites} sites`;
+  const colW = [0, 0, 0];
+  for (const r of [header, ...rows.map((r) => r.cells)]) {
+    r.forEach((c, j) => { colW[j] = Math.max(colW[j], ctx.measureText(c).width); });
+  }
+  const rowH = 17, padX = 8, sw = 12, gap = 14;
+  const tw = Math.max(padX * 2 + sw + 6 + colW[0] + gap + colW[1] + gap + colW[2],
+                      padX * 2 + ctx.measureText(footer).width);
+  const th = rowH * (rows.length + 2) + 8;
+  let tx = hx + 12;
+  if (tx + tw > right) tx = hx - 12 - tw;
+  const ty = Math.max(4, Math.min(h - th - 4, top));
+  ctx.fillStyle = "rgba(255, 255, 255, 0.96)";
+  ctx.strokeStyle = lineCol;
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.roundRect(tx, ty, tw, th, 5);
+  ctx.fill();
+  ctx.stroke();
+
+  ctx.textBaseline = "middle";
+  const c0 = tx + padX + sw + 6;
+  const c1 = c0 + colW[0] + gap + colW[1];
+  const c2 = c1 + gap + colW[2];
+  const drawRow = (cells, y, col) => {
+    ctx.fillStyle = col;
+    ctx.textAlign = "left";
+    ctx.fillText(cells[0], c0, y);
+    ctx.textAlign = "right";
+    ctx.fillText(cells[1], c1, y);
+    ctx.fillText(cells[2], c2, y);
+  };
+  let y = ty + 4 + rowH / 2;
+  drawRow(header, y, dimCol);
+  for (const r of rows) {
+    y += rowH;
+    ctx.fillStyle = r.color;
+    ctx.fillRect(tx + padX, y - 1, sw, 2.5);
+    drawRow(r.cells, y, textCol);
+  }
+  y += rowH;
+  ctx.fillStyle = hover.stats.maxRawFrac > 0.5 ? textCol : dimCol;
+  ctx.textAlign = "left";
+  ctx.fillText(footer, tx + padX, y);
+}
+
+function handleGradHover(ev) {
+  const data = state.gradHistory;
+  if (!data.length) return;
+  const rect = ui.gradCanvas.getBoundingClientRect();
+  const mx = ev.clientX - rect.left;
+  const g = gradPlotGeometry(0); // x mapping doesn't depend on top
+  let best = 0, bestDist = Infinity;
+  for (let i = 0; i < data.length; i++) {
+    const d = Math.abs(g.x(data[i].it) - mx);
+    if (d < bestDist) { bestDist = d; best = i; }
+  }
+  if (state.gradHover !== best) {
+    state.gradHover = best;
+    drawGradPlot();
+  }
+}
+
 function drawTarget() {
   if (!state.targetImage) return;
   const { data, width, height } = state.targetImage;
@@ -526,7 +797,10 @@ async function startTraining() {
   state.psnrHistory = [];
   state.psnrIters = args.iters;
   state.psnrHover = null;
+  state.gradHistory = [];
+  state.gradHover = null;
   drawPsnrPlot();
+  drawGradPlot();
 
   appendLog(`Target: ${width}×${height} | sites: ${initSiteCount} | iters: ${args.iters} | bpp: ${args.targetBpp > 0 ? args.targetBpp : "off"} | log: ${args.logFreq} | view: ${args.viewerFreq}`);
   updateProgress(0, args.iters, "Preparing…");
@@ -547,6 +821,10 @@ async function startTraining() {
         if (Number.isFinite(info.psnr)) {
           state.psnrHistory.push({ it: info.it, psnr: info.psnr });
           drawPsnrPlot();
+        }
+        if (info.gradStats) {
+          state.gradHistory.push({ it: info.it, stats: info.gradStats });
+          drawGradPlot();
         }
         state.lastHashed = null;
         state.lastHeatmap = null;
@@ -812,16 +1090,23 @@ async function main() {
     state.psnrHover = null;
     drawPsnrPlot();
   });
+  ui.gradCanvas.addEventListener("mousemove", handleGradHover);
+  ui.gradCanvas.addEventListener("mouseleave", () => {
+    state.gradHover = null;
+    drawGradPlot();
+  });
   window.addEventListener("resize", () => {
     requestAnimationFrame(() => {
       if (state.targetImage) updateCanvasLayout(state.targetImage.width, state.targetImage.height);
       else {
         positionOverlay();
         drawPsnrPlot();
+        drawGradPlot();
       }
     });
   });
   drawPsnrPlot();
+  drawGradPlot();
 }
 
 main();
