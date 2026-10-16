@@ -4,6 +4,11 @@
 //   0 pos_x, 1 pos_y, 2 log_tau, 3 radius_sq,
 //   4 color_r, 5 color_g, 6 color_b,
 //   7 dir_x, 8 dir_y, 9 log_aniso
+// Each slot holds f32 bits (atomic<u32>, summed with a CAS loop). It used to be
+// fixed-point i32 (x1e6), which wraps once a site's per-pixel sum exceeds ~2147
+// — routine at low site counts, where each site covers thousands of pixels.
+// Per-tile sums stay fixed-point (fast integer atomics) with a carry word, so
+// they're exact 64-bit; only the once-per-site-per-tile flush pays for the CAS.
 
 export const GRAD_CHANNELS = 10;
 
@@ -14,15 +19,25 @@ export const GRAD_CHANNELS = 10;
 // analysis (barriers must be reachable from uniform control flow), the kernel
 // is structured so NO thread takes an early `return` before either barrier:
 // every skip is expressed as an `if (guard) { work }` with no return inside.
-export const GRADIENTS_TILED_OVERRIDE = `
+const GRADIENTS_TILED_TEMPLATE = `
 @group(0) @binding(0) var<storage, read> sites : array<Site>;
 @group(0) @binding(1) var<uniform> params : GradParams;
 @group(0) @binding(2) var inCand0 : texture_2d<u32>;
 @group(0) @binding(3) var inCand1 : texture_2d<u32>;
 @group(0) @binding(4) var targetTex : texture_2d<f32>;
-@group(0) @binding(5) var<storage, read_write> grads : array<atomic<i32>>;
+@group(0) @binding(5) var<storage, read_write> grads : array<atomic<u32>>;
 @group(0) @binding(6) var<storage, read_write> removal_delta : array<atomic<u32>>;
 @group(0) @binding(7) var maskTex : texture_2d<f32>;
+
+fn atomicAddGrad(i : u32, val : f32) {
+  if (val == 0.0 || is_bad(val)) { return; }
+  var old = atomicLoad(&grads[i]);
+  loop {
+    let res = atomicCompareExchangeWeak(&grads[i], old, bitcast<u32>(bitcast<f32>(old) + val));
+    if (res.exchanged) { break; }
+    old = res.old_value;
+  }
+}
 
 fn atomicAddFloatRemoval(idx : u32, val : f32) {
   if (val == 0.0 || is_bad(val)) { return; }
@@ -36,21 +51,41 @@ fn atomicAddFloatRemoval(idx : u32, val : f32) {
   }
 }
 
-const K_TILE_HASH_SIZE : u32 = 256u;
-const K_TILE_HASH_MASK : u32 = 255u;
+// Slot count is substituted by gradientsTiledOverride(): 256 needs ~22 KB of
+// workgroup storage, 128 (~11 KB) fits the 16 KB default. Tiles touching more
+// sites than the table holds fall back to global adds.
+const K_TILE_HASH_SIZE : u32 = __TILE_SLOTS__u;
+const K_TILE_HASH_MASK : u32 = K_TILE_HASH_SIZE - 1u;
+const K_TILE_GRAD_SLOTS : u32 = K_TILE_HASH_SIZE * 10u;
 const K_TILE_MAX_PROBES : u32 = 8u;
 const K_TILE_EMPTY_KEY : u32 = 0xffffffffu;
 
 fn tile_hash(key : u32) -> u32 { return key * 2654435761u; }
 
-var<workgroup> tg_keys : array<atomic<u32>, 256>;
+var<workgroup> tg_keys : array<atomic<u32>, K_TILE_HASH_SIZE>;
 // Ten grad channels laid out interleaved: tg_grads[slot * 10 + channel].
-var<workgroup> tg_grads : array<atomic<i32>, 2560>;
-var<workgroup> tg_delta : array<atomic<u32>, 256>;
+// True sum = tg_grads_hi * 2^32 + tg_grads (signed), in units of 1/K_GRAD_QUANT_SCALE.
+var<workgroup> tg_grads : array<atomic<i32>, K_TILE_GRAD_SLOTS>;
+var<workgroup> tg_grads_hi : array<atomic<i32>, K_TILE_GRAD_SLOTS>;
+var<workgroup> tg_delta : array<atomic<u32>, K_TILE_HASH_SIZE>;
 
 fn wgAddGrad(slot : u32, ch : u32, val : f32) {
   if (val == 0.0 || is_bad(val)) { return; }
-  atomicAdd(&tg_grads[slot * 10u + ch], i32(val * K_GRAD_QUANT_SCALE));
+  let i = slot * 10u + ch;
+  // f32 -> i32 saturates, so a single pixel is capped at ~2147; sums can't wrap.
+  let q = i32(val * K_GRAD_QUANT_SCALE);
+  let old = atomicAdd(&tg_grads[i], q);
+  if (q > 0 && old > 2147483647 - q) {
+    atomicAdd(&tg_grads_hi[i], 1);
+  } else if (q < 0 && old < -2147483647 - 1 - q) {
+    atomicAdd(&tg_grads_hi[i], -1);
+  }
+}
+
+fn wgLoadGrad(i : u32) -> f32 {
+  let lo = f32(atomicLoad(&tg_grads[i]));
+  let hi = f32(atomicLoad(&tg_grads_hi[i]));
+  return (hi * 4294967296.0 + lo) * K_GRAD_QUANT_SCALE_INV;
 }
 
 fn wgAddDelta(slot : u32, val : f32) {
@@ -76,8 +111,9 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>,
     atomicStore(&tg_keys[i], K_TILE_EMPTY_KEY);
     atomicStore(&tg_delta[i], 0u);
   }
-  for (var i = local_idx; i < 2560u; i = i + local_threads) {
+  for (var i = local_idx; i < K_TILE_GRAD_SLOTS; i = i + local_threads) {
     atomicStore(&tg_grads[i], 0);
+    atomicStore(&tg_grads_hi[i], 0);
   }
   workgroupBarrier();
 
@@ -243,16 +279,16 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>,
                       }
                     }
                     if (!inserted) {
-                      atomicAdd(&grads[idx * 10u + 0u], i32(dL_dpos.x * K_GRAD_QUANT_SCALE));
-                      atomicAdd(&grads[idx * 10u + 1u], i32(dL_dpos.y * K_GRAD_QUANT_SCALE));
-                      atomicAdd(&grads[idx * 10u + 2u], i32(dL_dlog_tau * K_GRAD_QUANT_SCALE));
-                      atomicAdd(&grads[idx * 10u + 3u], i32(dL_dradius_sq * K_GRAD_QUANT_SCALE));
-                      atomicAdd(&grads[idx * 10u + 4u], i32(dL_dcolor.x * K_GRAD_QUANT_SCALE));
-                      atomicAdd(&grads[idx * 10u + 5u], i32(dL_dcolor.y * K_GRAD_QUANT_SCALE));
-                      atomicAdd(&grads[idx * 10u + 6u], i32(dL_dcolor.z * K_GRAD_QUANT_SCALE));
-                      atomicAdd(&grads[idx * 10u + 7u], i32(dL_ddir.x * K_GRAD_QUANT_SCALE));
-                      atomicAdd(&grads[idx * 10u + 8u], i32(dL_ddir.y * K_GRAD_QUANT_SCALE));
-                      atomicAdd(&grads[idx * 10u + 9u], i32(dL_dlog_aniso * K_GRAD_QUANT_SCALE));
+                      atomicAddGrad(idx * 10u + 0u, dL_dpos.x);
+                      atomicAddGrad(idx * 10u + 1u, dL_dpos.y);
+                      atomicAddGrad(idx * 10u + 2u, dL_dlog_tau);
+                      atomicAddGrad(idx * 10u + 3u, dL_dradius_sq);
+                      atomicAddGrad(idx * 10u + 4u, dL_dcolor.x);
+                      atomicAddGrad(idx * 10u + 5u, dL_dcolor.y);
+                      atomicAddGrad(idx * 10u + 6u, dL_dcolor.z);
+                      atomicAddGrad(idx * 10u + 7u, dL_ddir.x);
+                      atomicAddGrad(idx * 10u + 8u, dL_ddir.y);
+                      atomicAddGrad(idx * 10u + 9u, dL_dlog_aniso);
                     }
                   }
                 }
@@ -271,8 +307,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>,
     let siteID = atomicLoad(&tg_keys[i]);
     if (siteID != K_TILE_EMPTY_KEY) {
       for (var ch = 0u; ch < 10u; ch = ch + 1u) {
-        let g = atomicLoad(&tg_grads[i * 10u + ch]);
-        if (g != 0) { atomicAdd(&grads[siteID * 10u + ch], g); }
+        atomicAddGrad(siteID * 10u + ch, wgLoadGrad(i * 10u + ch));
       }
       if (params.computeRemoval != 0u) {
         let d = bitcast<f32>(atomicLoad(&tg_delta[i]));
@@ -283,28 +318,43 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>,
 }
 `;
 
+// Workgroup bytes per tile slot: key + delta + 10 lo + 10 hi grad words.
+const TILE_SLOT_BYTES = 22 * 4;
+
+// Largest power-of-two tile table (128 or 256) that fits the device's
+// workgroup storage. Pass the device's maxComputeWorkgroupStorageSize.
+export function tileSlotsForLimit(maxWorkgroupStorage = 16384) {
+  return maxWorkgroupStorage >= 256 * TILE_SLOT_BYTES ? 256 : 128;
+}
+
+export function gradientsTiledOverride(tileSlots = 128) {
+  return GRADIENTS_TILED_TEMPLATE.replace("__TILE_SLOTS__", String(tileSlots));
+}
+
 export const ADAM_OVERRIDE = `
 @group(0) @binding(0) var<storage, read_write> sites : array<Site>;
 @group(0) @binding(1) var<storage, read_write> adam : array<f32>;
-@group(0) @binding(2) var<storage, read_write> grads : array<atomic<i32>>;
+@group(0) @binding(2) var<storage, read_write> grads : array<atomic<u32>>;
 @group(0) @binding(3) var<uniform> params : AdamParams;
+
+fn loadGrad(i : u32) -> f32 { return bitcast<f32>(atomicLoad(&grads[i])); }
 
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   let idx = gid.x;
   let base_g = idx * 10u;
   let norm = 1.0 / f32(params.width * params.height);
-  let scale = K_GRAD_QUANT_SCALE_INV * norm;
-  let g_pos = vec2<f32>(f32(atomicLoad(&grads[base_g + 0u])),
-                        f32(atomicLoad(&grads[base_g + 1u]))) * scale;
-  let g_log_tau = f32(atomicLoad(&grads[base_g + 2u])) * scale;
-  let g_radius_sq = f32(atomicLoad(&grads[base_g + 3u])) * scale;
-  let g_color = vec3<f32>(f32(atomicLoad(&grads[base_g + 4u])),
-                          f32(atomicLoad(&grads[base_g + 5u])),
-                          f32(atomicLoad(&grads[base_g + 6u]))) * scale;
-  let g_dir = vec2<f32>(f32(atomicLoad(&grads[base_g + 7u])),
-                        f32(atomicLoad(&grads[base_g + 8u]))) * scale;
-  var g_log_aniso = f32(atomicLoad(&grads[base_g + 9u])) * scale;
+  let scale = norm;
+  let g_pos = vec2<f32>(loadGrad(base_g + 0u),
+                        loadGrad(base_g + 1u)) * scale;
+  let g_log_tau = loadGrad(base_g + 2u) * scale;
+  let g_radius_sq = loadGrad(base_g + 3u) * scale;
+  let g_color = vec3<f32>(loadGrad(base_g + 4u),
+                          loadGrad(base_g + 5u),
+                          loadGrad(base_g + 6u)) * scale;
+  let g_dir = vec2<f32>(loadGrad(base_g + 7u),
+                        loadGrad(base_g + 8u)) * scale;
+  var g_log_aniso = loadGrad(base_g + 9u) * scale;
   var safe_g_dir = g_dir;
   if (is_bad2(safe_g_dir)) { safe_g_dir = vec2<f32>(0.0, 0.0); }
   if (is_bad(g_log_aniso)) { g_log_aniso = 0.0; }
@@ -314,7 +364,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
       is_bad(sites[idx].radius_sq) || is_bad3(site_color(sites[idx])) || is_bad(sites[idx].log_aniso) ||
       is_bad(g_pos.x) || is_bad(g_pos.y) || is_bad(g_log_tau) || is_bad(g_radius_sq) ||
       is_bad3(g_color) || is_bad(safe_g_dir.x) || is_bad(safe_g_dir.y) || is_bad(g_log_aniso)) {
-    for (var c = 0u; c < 10u; c = c + 1u) { atomicStore(&grads[base_g + c], 0); }
+    for (var c = 0u; c < 10u; c = c + 1u) { atomicStore(&grads[base_g + c], 0u); }
     return;
   }
 
@@ -413,12 +463,12 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   adam[base + 18u] = m_log_aniso;
   adam[base + 19u] = v_log_aniso;
 
-  for (var c = 0u; c < 10u; c = c + 1u) { atomicStore(&grads[base_g + c], 0); }
+  for (var c = 0u; c < 10u; c = c + 1u) { atomicStore(&grads[base_g + c], 0u); }
 }
 `;
 
 export const TAU_EXTRACT_OVERRIDE = `
-@group(0) @binding(0) var<storage, read_write> grads : array<atomic<i32>>;
+@group(0) @binding(0) var<storage, read_write> grads : array<atomic<u32>>;
 @group(0) @binding(1) var<storage, read_write> grad_out : array<f32>;
 @group(0) @binding(2) var<uniform> params : ClearParams;
 
@@ -426,7 +476,7 @@ export const TAU_EXTRACT_OVERRIDE = `
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   let idx = gid.x;
   if (idx >= params.count) { return; }
-  grad_out[idx] = f32(atomicLoad(&grads[idx * 10u + 2u])) * K_GRAD_QUANT_SCALE_INV;
+  grad_out[idx] = bitcast<f32>(atomicLoad(&grads[idx * 10u + 2u]));
 }
 `;
 
@@ -571,7 +621,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
 
 export const TAU_WRITEBACK_OVERRIDE = `
 @group(0) @binding(0) var<storage, read> grad_in : array<f32>;
-@group(0) @binding(1) var<storage, read_write> grads : array<atomic<i32>>;
+@group(0) @binding(1) var<storage, read_write> grads : array<atomic<u32>>;
 @group(0) @binding(2) var<uniform> params : ClearParams;
 
 @compute @workgroup_size(256)
@@ -580,9 +630,9 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   if (idx >= params.count) { return; }
   let val = grad_in[idx];
   if (is_bad(val)) {
-    atomicStore(&grads[idx * 10u + 2u], 0);
+    atomicStore(&grads[idx * 10u + 2u], 0u);
   } else {
-    atomicStore(&grads[idx * 10u + 2u], i32(val * K_GRAD_QUANT_SCALE));
+    atomicStore(&grads[idx * 10u + 2u], bitcast<u32>(val));
   }
 }
 `;

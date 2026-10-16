@@ -758,7 +758,7 @@ export class Trainer {
         const sitesData = await readSites(device, this.sitesBuf, postSites);
         this._lastSitesCpu = sitesData;
         await gradStaging.mapAsync(GPUMapMode.READ);
-        const gradStats = computeGradStats(new Int32Array(gradStaging.getMappedRange()),
+        const gradStats = computeGradStats(new Float32Array(gradStaging.getMappedRange()),
           postSites, this.width * this.height);
         gradStaging.unmap();
         gradStaging.destroy();
@@ -1024,26 +1024,18 @@ export const GRAD_GROUPS = [
   { key: "aniso", label: "log aniso", channels: [9] },
 ];
 
-const I32_LIMIT = 2147483647;
-const GRAD_QUANT_SCALE = 1e6; // K_GRAD_QUANT_SCALE in sad_shared.wgsl
-
-// Per-group mean/max of |grad| in the units Adam sees (raw * 1/quant / (W*H)).
+// Per-group mean/max of |grad| in the units Adam sees (summed grad / (W*H)).
 // Sites with every channel zero (inactive, or covering no pixels) are skipped.
-// `maxRawFrac` is the largest |raw i32| / INT32_MAX over all channels — values
-// near 1 mean the fixed-point accumulator is close to wrapping.
 function computeGradStats(raw, siteCount, numPixels) {
-  const scale = 1 / (GRAD_QUANT_SCALE * numPixels);
+  const scale = 1 / numPixels;
   const sums = new Float64Array(GRAD_GROUPS.length);
   const maxs = new Float64Array(GRAD_GROUPS.length);
   let counted = 0;
-  let maxRaw = 0;
   for (let i = 0; i < siteCount; i += 1) {
     const base = i * 10;
     let any = false;
     for (let c = 0; c < 10; c += 1) {
-      const v = Math.abs(raw[base + c]);
-      if (v !== 0) any = true;
-      if (v > maxRaw) maxRaw = v;
+      if (raw[base + c] !== 0) { any = true; break; }
     }
     if (!any) continue;
     counted += 1;
@@ -1059,12 +1051,7 @@ function computeGradStats(raw, siteCount, numPixels) {
   GRAD_GROUPS.forEach((grp, g) => {
     groups[grp.key] = { mean: counted ? sums[g] / counted : 0, max: maxs[g] };
   });
-  return {
-    groups,
-    sites: counted,
-    maxRawFrac: maxRaw / I32_LIMIT,
-    limit: I32_LIMIT * scale, // per-component wrap threshold in the same units
-  };
+  return { groups, sites: counted };
 }
 
 // Mirrors main()'s PSNR computation: only pixels inside the mask count, values

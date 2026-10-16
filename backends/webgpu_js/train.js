@@ -3,11 +3,11 @@
 // (mask, init-sites, densify/prune/lr…) in the collapsible left panel, and a
 // side-by-side target vs reconstruction view, both aspect-fit.
 
-import { loadShaders } from "./src/shader_loader.js?v=grad-plot-20261016";
-import { Trainer, buildArgs, GRAD_GROUPS } from "./src/trainer.js?v=grad-plot-20261016";
-import { loadImageToFloat32, loadMaskRgba32Float, whiteMaskRgba32Float } from "./src/textures.js?v=grad-plot-20261016";
-import { loadSitesFromFile, serializeSitesTxt, triggerDownload, floatImageToRgba8 } from "./src/io.js?v=grad-plot-20261016";
-import { SITE_FLOATS } from "./src/params.js?v=grad-plot-20261016";
+import { loadShaders, tileSlotsForLimit } from "./src/shader_loader.js?v=float-grads-20261016e";
+import { Trainer, buildArgs, GRAD_GROUPS } from "./src/trainer.js?v=float-grads-20261016e";
+import { loadImageToFloat32, loadMaskRgba32Float, whiteMaskRgba32Float } from "./src/textures.js?v=float-grads-20261016e";
+import { loadSitesFromFile, serializeSitesTxt, triggerDownload, floatImageToRgba8 } from "./src/io.js?v=float-grads-20261016e";
+import { SITE_FLOATS } from "./src/params.js?v=float-grads-20261016e";
 
 const CONFIG_URL = "../../training_config.json";
 const DEMO_MAX_IMAGE_SIDE = 2048;
@@ -171,6 +171,8 @@ async function initDevice() {
     maxStorageBuffersPerShaderStage: Math.min(want, adapter.limits.maxStorageBuffersPerShaderStage),
     maxBufferSize: Math.min(1 << 30, adapter.limits.maxBufferSize),
     maxStorageBufferBindingSize: Math.min(1 << 30, adapter.limits.maxStorageBufferBindingSize),
+    // Room for the 256-slot gradient tile table when the adapter allows it.
+    maxComputeWorkgroupStorageSize: Math.min(32768, adapter.limits.maxComputeWorkgroupStorageSize),
   };
   const device = await adapter.requestDevice({ requiredLimits: required });
   device.lost.then((info) => appendLog(`Device lost: ${info.reason} ${info.message}`));
@@ -423,8 +425,7 @@ function fmtExp(v) {
 function gradLegendLayout(ctx, w) {
   // Legend wraps under the card label; returns item positions + bottom edge.
   const items = GRAD_GROUPS.map((g, i) => ({ label: g.label, color: GRAD_COLORS[i] }));
-  items.push({ label: "max", line: [] }, { label: "mean", line: GRAD_MEAN_DASH },
-             { label: "i32 wrap limit", line: [2, 3], limit: true });
+  items.push({ label: "max", line: [] }, { label: "mean", line: GRAD_MEAN_DASH });
   const x0 = 12, rowH = 16, swatch = 18;
   let x = x0, y = 34;
   for (const it of items) {
@@ -450,7 +451,6 @@ function gradPlotGeometry(top) {
         if (v > 0) { lo = Math.min(lo, v); hi = Math.max(hi, v); }
       }
     }
-    if (p.stats.limit > 0) hi = Math.max(hi, p.stats.limit);
   }
   if (!Number.isFinite(lo)) { lo = 1e-8; hi = 1e-2; }
   const yMin = Math.floor(Math.log10(lo));
@@ -495,7 +495,7 @@ function drawGradPlot() {
   ctx.textBaseline = "middle";
   for (const it of legend.items) {
     ctx.save();
-    ctx.strokeStyle = it.color || (it.limit ? softCol : dimCol);
+    ctx.strokeStyle = it.color || dimCol;
     ctx.lineWidth = 2;
     if (it.line) ctx.setLineDash(it.line);
     ctx.beginPath(); ctx.moveTo(it.x, it.y); ctx.lineTo(it.x + legend.swatch, it.y); ctx.stroke();
@@ -544,17 +544,6 @@ function drawGradPlot() {
     ctx.fillStyle = softCol;
     ctx.fillText(state.running ? "Waiting for first log tick…" : "Train to see gradients", (left + right) / 2, (top + bottom) / 2);
     return;
-  }
-
-  // i32 wrap limit (per component, in Adam's units)
-  const limit = data[data.length - 1].stats.limit;
-  if (limit > 0) {
-    const y = Math.round(g.y(limit)) + 0.5;
-    ctx.save();
-    ctx.strokeStyle = softCol;
-    ctx.setLineDash([2, 3]);
-    ctx.beginPath(); ctx.moveTo(left, y); ctx.lineTo(right, y); ctx.stroke();
-    ctx.restore();
   }
 
   // Series: gaps where a value is 0 (can't be drawn on a log axis)
@@ -612,7 +601,7 @@ function drawGradPlot() {
     cells: [grp.label, fmtExp(hover.stats.groups[grp.key].mean), fmtExp(hover.stats.groups[grp.key].max)],
   }));
   const header = [`iter ${hover.it}`, "mean", "max"];
-  const footer = `max |raw| / i32: ${hover.stats.maxRawFrac.toFixed(3)} · ${hover.stats.sites} sites`;
+  const footer = `${hover.stats.sites} sites with nonzero grad`;
   const colW = [0, 0, 0];
   for (const r of [header, ...rows.map((r) => r.cells)]) {
     r.forEach((c, j) => { colW[j] = Math.max(colW[j], ctx.measureText(c).width); });
@@ -653,7 +642,7 @@ function drawGradPlot() {
     drawRow(r.cells, y, textCol);
   }
   y += rowH;
-  ctx.fillStyle = hover.stats.maxRawFrac > 0.5 ? textCol : dimCol;
+  ctx.fillStyle = dimCol;
   ctx.textAlign = "left";
   ctx.fillText(footer, tx + padX, y);
 }
@@ -1061,7 +1050,9 @@ async function main() {
     state.config = await loadConfig();
     applyConfigToForm(state.config);
     state.device = await initDevice();
-    state.shaders = await loadShaders();
+    state.shaders = await loadShaders({
+      tileSlots: tileSlotsForLimit(state.device.limits.maxComputeWorkgroupStorageSize),
+    });
     setStatus("Ready");
     maybeEnableStart();
   } catch (err) {

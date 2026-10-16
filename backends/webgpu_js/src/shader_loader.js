@@ -7,13 +7,14 @@
 // storage-buffer limit is 10 on common adapters and the originals use 12.
 
 import {
-  GRADIENTS_TILED_OVERRIDE,
+  gradientsTiledOverride,
   ADAM_OVERRIDE,
   TAU_EXTRACT_OVERRIDE,
   TAU_WRITEBACK_OVERRIDE,
   RENDER_HASHED_OVERRIDE,
   RENDER_TAU_HEATMAP_OVERRIDE,
-} from "./wgsl_overrides.js";
+} from "./wgsl_overrides.js?v=float-grads-20261016e";
+export { tileSlotsForLimit } from "./wgsl_overrides.js?v=float-grads-20261016e";
 
 const COMMON_URL = new URL("../../shared/sad_shared.wgsl", import.meta.url);
 const WGSL_DIR_URL = new URL("../../shared/wgsl/", import.meta.url);
@@ -68,8 +69,9 @@ function extractCommon(source) {
   return source.slice(start + beginMarker.length, end).trim() + "\n";
 }
 
-export async function loadShaders() {
-  if (_cache) return _cache;
+// tileSlots: gradient tile hash size (see tileSlotsForLimit in wgsl_overrides.js).
+export async function loadShaders({ tileSlots = 128 } = {}) {
+  if (_cache && _cache.tileSlots === tileSlots) return _cache;
 
   const commonSource = await fetchText(COMMON_URL);
   const common = extractCommon(commonSource);
@@ -94,7 +96,7 @@ export async function loadShaders() {
     JFA_CLEAR: out.jfa_clear,
     JFA_FLOOD: out.jfa_flood,
     RENDER: out.render_compute,
-    GRADIENTS_TILED: common + GRADIENTS_TILED_OVERRIDE,
+    GRADIENTS_TILED: common + gradientsTiledOverride(tileSlots),
     ADAM: common + ADAM_OVERRIDE,
     STATS: out.stats,
     SPLIT: out.split,
@@ -111,6 +113,7 @@ export async function loadShaders() {
     RADIX_SORT: out.radix_sort,
     RENDER_HASHED: common + RENDER_HASHED_OVERRIDE,
     RENDER_TAU_HEATMAP: common + RENDER_TAU_HEATMAP_OVERRIDE,
+    tileSlots,
   };
   return _cache;
 }
