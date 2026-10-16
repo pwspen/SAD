@@ -26,8 +26,7 @@ const GRADIENTS_TILED_TEMPLATE = `
 @group(0) @binding(3) var inCand1 : texture_2d<u32>;
 @group(0) @binding(4) var targetTex : texture_2d<f32>;
 @group(0) @binding(5) var<storage, read_write> grads : array<atomic<u32>>;
-@group(0) @binding(6) var<storage, read_write> removal_delta : array<atomic<u32>>;
-@group(0) @binding(7) var maskTex : texture_2d<f32>;
+@group(0) @binding(6) var maskTex : texture_2d<f32>;
 
 fn atomicAddGrad(i : u32, val : f32) {
   if (val == 0.0 || is_bad(val)) { return; }
@@ -39,19 +38,7 @@ fn atomicAddGrad(i : u32, val : f32) {
   }
 }
 
-fn atomicAddFloatRemoval(idx : u32, val : f32) {
-  if (val == 0.0 || is_bad(val)) { return; }
-  var old = atomicLoad(&removal_delta[idx]);
-  loop {
-    let new_f = bitcast<f32>(old) + val;
-    let new_u = bitcast<u32>(new_f);
-    let res = atomicCompareExchangeWeak(&removal_delta[idx], old, new_u);
-    if (res.exchanged) { break; }
-    old = res.old_value;
-  }
-}
-
-// Slot count is substituted by gradientsTiledOverride(): 256 needs ~22 KB of
+// Slot count is substituted by gradientsTiledOverride(): 256 needs ~21 KB of
 // workgroup storage, 128 (~11 KB) fits the 16 KB default. Tiles touching more
 // sites than the table holds fall back to global adds.
 const K_TILE_HASH_SIZE : u32 = __TILE_SLOTS__u;
@@ -67,7 +54,6 @@ var<workgroup> tg_keys : array<atomic<u32>, K_TILE_HASH_SIZE>;
 // True sum = tg_grads_hi * 2^32 + tg_grads (signed), in units of 1/K_GRAD_QUANT_SCALE.
 var<workgroup> tg_grads : array<atomic<i32>, K_TILE_GRAD_SLOTS>;
 var<workgroup> tg_grads_hi : array<atomic<i32>, K_TILE_GRAD_SLOTS>;
-var<workgroup> tg_delta : array<atomic<u32>, K_TILE_HASH_SIZE>;
 
 fn wgAddGrad(slot : u32, ch : u32, val : f32) {
   if (val == 0.0 || is_bad(val)) { return; }
@@ -88,18 +74,6 @@ fn wgLoadGrad(i : u32) -> f32 {
   return (hi * 4294967296.0 + lo) * K_GRAD_QUANT_SCALE_INV;
 }
 
-fn wgAddDelta(slot : u32, val : f32) {
-  if (val == 0.0 || is_bad(val)) { return; }
-  var old = atomicLoad(&tg_delta[slot]);
-  loop {
-    let new_f = bitcast<f32>(old) + val;
-    let new_u = bitcast<u32>(new_f);
-    let res = atomicCompareExchangeWeak(&tg_delta[slot], old, new_u);
-    if (res.exchanged) { break; }
-    old = res.old_value;
-  }
-}
-
 @compute @workgroup_size(16, 16)
 fn main(@builtin(global_invocation_id) gid : vec3<u32>,
         @builtin(local_invocation_id) tid : vec3<u32>) {
@@ -109,7 +83,6 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>,
   // Init workgroup memory — uniform loop over local_idx.
   for (var i = local_idx; i < K_TILE_HASH_SIZE; i = i + local_threads) {
     atomicStore(&tg_keys[i], K_TILE_EMPTY_KEY);
-    atomicStore(&tg_delta[i], 0u);
   }
   for (var i = local_idx; i < K_TILE_GRAD_SLOTS; i = i + local_threads) {
     atomicStore(&tg_grads[i], 0);
@@ -185,43 +158,6 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>,
         let dL_dpred = 2.0 * (pred - tgt);
         let dL_ok = !is_bad3(dL_dpred);
         if (dL_ok) {
-          if (params.computeRemoval != 0u) {
-            var uniqueSites : array<u32, 8>;
-            var uniqueWeights : array<f32, 8>;
-            var numUnique = 0u;
-            for (var i = 0u; i < 8u; i = i + 1u) {
-              let idx = candIds[i];
-              if (idx < params.siteCount && sites[idx].position.x >= 0.0) {
-                let w = weights[i];
-                var found = false;
-                for (var j = 0u; j < numUnique; j = j + 1u) {
-                  if (uniqueSites[j] == idx) { uniqueWeights[j] = uniqueWeights[j] + w; found = true; break; }
-                }
-                if (!found && numUnique < 8u) {
-                  uniqueSites[numUnique] = idx;
-                  uniqueWeights[numUnique] = w;
-                  numUnique = numUnique + 1u;
-                }
-              }
-            }
-            for (var i = 0u; i < numUnique; i = i + 1u) {
-              let idx = uniqueSites[i];
-              let w_total = uniqueWeights[i];
-              if (w_total > 0.0) {
-                let delta = removalDeltaForSite(pred, tgt, site_color(sites[idx]), w_total);
-                var inserted = false;
-                let base = tile_hash(idx) & K_TILE_HASH_MASK;
-                for (var probe = 0u; probe < K_TILE_MAX_PROBES; probe = probe + 1u) {
-                  let slot = (base + probe) & K_TILE_HASH_MASK;
-                  var expected = K_TILE_EMPTY_KEY;
-                  let res = atomicCompareExchangeWeak(&tg_keys[slot], expected, idx);
-                  if (res.exchanged || res.old_value == idx) { wgAddDelta(slot, delta); inserted = true; break; }
-                }
-                if (!inserted) { atomicAddFloatRemoval(idx, delta); }
-              }
-            }
-          }
-
           for (var i = 0u; i < 8u; i = i + 1u) {
             let idx = candIds[i];
             if (idx < params.siteCount) {
@@ -309,17 +245,13 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>,
       for (var ch = 0u; ch < 10u; ch = ch + 1u) {
         atomicAddGrad(siteID * 10u + ch, wgLoadGrad(i * 10u + ch));
       }
-      if (params.computeRemoval != 0u) {
-        let d = bitcast<f32>(atomicLoad(&tg_delta[i]));
-        if (d != 0.0 && !is_bad(d)) { atomicAddFloatRemoval(siteID, d); }
-      }
     }
   }
 }
 `;
 
-// Workgroup bytes per tile slot: key + delta + 10 lo + 10 hi grad words.
-const TILE_SLOT_BYTES = 22 * 4;
+// Workgroup bytes per tile slot: key + 10 lo + 10 hi grad words.
+const TILE_SLOT_BYTES = 21 * 4;
 
 // Largest power-of-two tile table (128 or 256) that fits the device's
 // workgroup storage. Pass the device's maxComputeWorkgroupStorageSize.

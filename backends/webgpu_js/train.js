@@ -1,39 +1,24 @@
 // Entry point for the SAD trainer web page.
-// Hugging-Face-ish UI: target-bpp + target-image in top bar, advanced options
-// (mask, init-sites, densify/prune/lr…) in the collapsible left panel, and a
+// Hugging-Face-ish UI: target image in the top bar, advanced options
+// (mask, init-sites, candidates/lr…) in the collapsible left panel, and a
 // side-by-side target vs reconstruction view, both aspect-fit.
 
-import { loadShaders, tileSlotsForLimit } from "./src/shader_loader.js?v=float-grads-20261016e";
-import { Trainer, buildArgs, GRAD_GROUPS } from "./src/trainer.js?v=float-grads-20261016e";
-import { loadImageToFloat32, loadMaskRgba32Float, whiteMaskRgba32Float } from "./src/textures.js?v=float-grads-20261016e";
-import { loadSitesFromFile, serializeSitesTxt, triggerDownload, floatImageToRgba8 } from "./src/io.js?v=float-grads-20261016e";
-import { SITE_FLOATS } from "./src/params.js?v=float-grads-20261016e";
+import { loadShaders, tileSlotsForLimit } from "./src/shader_loader.js?v=no-densify-20261016";
+import { Trainer, buildArgs, GRAD_GROUPS } from "./src/trainer.js?v=no-densify-20261016";
+import { loadImageToFloat32, loadMaskRgba32Float, whiteMaskRgba32Float } from "./src/textures.js?v=no-densify-20261016";
+import { loadSitesFromFile, serializeSitesTxt, triggerDownload, floatImageToRgba8 } from "./src/io.js?v=no-densify-20261016";
+import { SITE_FLOATS } from "./src/params.js?v=no-densify-20261016";
 
 const CONFIG_URL = "../../training_config.json";
 const DEMO_MAX_IMAGE_SIDE = 2048;
-const DEMO_VIEWER_FREQ = 250;
-const MIN_TARGET_BPP = 0.2;
-const MAX_TARGET_BPP = 16.0;
 
-// Fields that live in the advanced panel. Target BPP and target image are in
-// the top bar; init-sites / mask are pickers inside the panel (not listed here).
+// Fields that live in the advanced panel. The target image is in the top bar;
+// init-sites / mask are pickers inside the panel (not listed here).
 const UI_FIELDS = [
   ["iters", "p-iters"],
   ["sites", "p-sites"],
-  ["maxSites", "p-maxSites"],
   ["logFreq", "p-logFreq"],
   ["viewerFreq", "p-viewerFreq"],
-  ["densify", "p-densify"],
-  ["densifyStart", "p-densifyStart"],
-  ["densifyEnd", "p-densifyEnd"],
-  ["densifyFreq", "p-densifyFreq"],
-  ["densifyPercentile", "p-densifyPercentile"],
-  ["densifyScoreAlpha", "p-densifyScoreAlpha"],
-  ["pruneStart", "p-pruneStart"],
-  ["pruneEnd", "p-pruneEnd"],
-  ["pruneFreq", "p-pruneFreq"],
-  ["prunePercentile", "p-prunePercentile"],
-  ["pruneDuringDensify", "p-pruneDuringDensify"],
   ["candFreq", "p-candFreq"],
   ["candUpdatePasses", "p-candUpdatePasses"],
   ["candDownscale", "p-candDownscale"],
@@ -81,8 +66,6 @@ const ui = {
   maskLabel: document.getElementById("maskLabel"),
   initSitesInput: document.getElementById("initSitesInput"),
   initLabel: document.getElementById("initLabel"),
-  bppInput: document.getElementById("bppInput"),
-  bppValue: document.getElementById("bppValue"),
   startBtn: document.getElementById("startBtn"),
   stopBtn: document.getElementById("stopBtn"),
   toggleParamsBtn: document.getElementById("toggleParamsBtn"),
@@ -110,20 +93,6 @@ function appendLog(line) {
   ui.log.scrollTop = ui.log.scrollHeight;
 }
 
-function clampTargetBpp(value) {
-  return Number.isFinite(value)
-    ? Math.min(MAX_TARGET_BPP, Math.max(MIN_TARGET_BPP, value))
-    : MIN_TARGET_BPP;
-}
-
-function setTargetBpp(value) {
-  const targetBpp = clampTargetBpp(Number(value));
-  ui.bppInput.value = targetBpp.toFixed(2);
-  ui.bppValue.value = targetBpp.toFixed(2);
-  ui.bppValue.textContent = targetBpp.toFixed(2);
-  return targetBpp;
-}
-
 function applyConfigToForm(config) {
   const defaults = buildArgs(config, {});
   for (const [key, elId] of UI_FIELDS) {
@@ -133,12 +102,6 @@ function applyConfigToForm(config) {
     if (el.type === "checkbox") el.checked = Boolean(v);
     else if (v === undefined) el.value = "";
     else el.value = v;
-  }
-  document.getElementById("p-viewerFreq").value = DEMO_VIEWER_FREQ;
-  if (Number.isFinite(defaults.targetBpp) && defaults.targetBpp > 0) {
-    setTargetBpp(defaults.targetBpp);
-  } else {
-    setTargetBpp(MIN_TARGET_BPP);
   }
 }
 
@@ -150,14 +113,6 @@ function readFormArgs() {
     if (el.type === "checkbox") overrides[key] = el.checked;
     else if (el.value === "") continue;
     else overrides[key] = Number(el.value);
-  }
-  const bpp = Number(ui.bppInput.value);
-  const targetBpp = setTargetBpp(bpp);
-  overrides.targetBpp = targetBpp;
-  if (overrides.viewerFreq === undefined || !Number.isFinite(overrides.viewerFreq)) {
-    overrides.viewerFreq = DEMO_VIEWER_FREQ;
-  } else {
-    overrides.viewerFreq = Math.max(1, overrides.viewerFreq);
   }
   return buildArgs(state.config, overrides);
 }
@@ -791,7 +746,7 @@ async function startTraining() {
   drawPsnrPlot();
   drawGradPlot();
 
-  appendLog(`Target: ${width}×${height} | sites: ${initSiteCount} | iters: ${args.iters} | bpp: ${args.targetBpp > 0 ? args.targetBpp : "off"} | log: ${args.logFreq} | view: ${args.viewerFreq}`);
+  appendLog(`Target: ${width}×${height} | sites: ${initSiteCount} | iters: ${args.iters} | log: ${args.logFreq} | view: ${args.viewerFreq}`);
   updateProgress(0, args.iters, "Preparing…");
 
   const trainer = new Trainer(state.device, state.shaders, args, {
@@ -1063,7 +1018,6 @@ async function main() {
   ui.imageInput.addEventListener("change", handleImageInput);
   ui.maskInput.addEventListener("change", handleMaskInput);
   ui.initSitesInput.addEventListener("change", handleInitSitesInput);
-  ui.bppInput.addEventListener("input", () => setTargetBpp(ui.bppInput.value));
   ui.startBtn.addEventListener("click", startTraining);
   ui.stopBtn.addEventListener("click", stopTraining);
   ui.toggleParamsBtn.addEventListener("click", toggleParams);

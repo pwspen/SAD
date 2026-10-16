@@ -1,11 +1,10 @@
-// Direct port of backends/webgpu_py/train_wgpu.py main() training loop.
-// Every numbered stage and flag mirrors the Python source — keep this lined up
-// with that file so cross-backend behaviour stays in sync.
+// Port of backends/webgpu_py/train_wgpu.py main() training loop, minus
+// densify/prune: the JS trainer optimizes a fixed site count for the whole run.
+// The remaining stages mirror the Python source — keep them lined up.
 
 import {
   SITE_FLOATS,
   ADAM_FLOATS,
-  BITS_PER_SITE,
   PACKED_CAND_BYTES,
   TAU_DIFFUSE_PASSES,
   TAU_DIFFUSE_LAMBDA,
@@ -14,28 +13,16 @@ import {
   updateParamsBuffer,
   createInitParamsBuffer,
   createGradParamsBuffer,
-  updateGradParamsBuffer,
   createAdamParamsBuffer,
   updateAdamParamsBuffer,
-  createSplitParamsBuffer,
-  updateSplitParamsBuffer,
-  createPruneParamsBuffer,
-  updatePruneParamsBuffer,
-  createCountParamsBuffer,
-  updateCountParamsBuffer,
   createClearParamsBuffer,
-  updateClearParamsBuffer,
   createTauParamsBuffer,
   updateTauParamsBuffer,
-  createDensifyScoreParamsBuffer,
-  updateDensifyScoreParamsBuffer,
-  createPruneScoreParamsBuffer,
-  updatePruneScoreParamsBuffer,
   createHilbertParamsBuffer,
   updateHilbertParamsBuffer,
   packJumpStep,
   hilbertBitsForSize,
-} from "./params.js";
+} from "./params.js?v=no-densify-20261016";
 
 import {
   createSitesBuffer,
@@ -44,13 +31,10 @@ import {
   createSeedCounter,
   createGradsBuffer,
   createAtomicU32Buffer,
-  createStatBuffers,
-  createPairsBuffer,
-  createIndicesBuffer,
   createHilbertBuffers,
   createDummyStorageBuffer,
   readSites,
-} from "./buffers.js";
+} from "./buffers.js?v=no-densify-20261016";
 
 import {
   createRgba32FloatTexture,
@@ -58,7 +42,7 @@ import {
   writeFloat32ToRgba32FloatTexture,
   readRgba32FloatTexture,
   whiteMaskRgba32Float,
-} from "./textures.js";
+} from "./textures.js?v=no-densify-20261016";
 
 import {
   InitGradientEncoder,
@@ -73,150 +57,17 @@ import {
   GradientsEncoder,
   AdamEncoder,
   TauEncoder,
-  StatsEncoder,
-  SplitEncoder,
-  PruneEncoder,
   ClearBufferEncoder,
-  ScorePairsEncoder,
-  WriteIndicesEncoder,
   HilbertEncoder,
-} from "./encoders.js";
+} from "./encoders.js?v=no-densify-20261016";
 
-import { RadixSortUInt2 } from "./radix_sort.js";
+import { RadixSortUInt2 } from "./radix_sort.js?v=no-densify-20261016";
 
 const MAX_PREVIEW_IMAGE_READBACKS = 2;
+// Direction/anisotropy start learning here. Previously derived from the prune
+// schedule as max(10, PRUNE_START / 2) = 50 with the shared config.
+const ANI_START_ITER = 50;
 const MAX_PREVIEW_SITE_READBACKS = 8;
-
-// Small "simulate final site count" helper — matches simulate_final_sites().
-function simulateFinalSites(initSites, maxSites, iters, densifyEnabled, densifyStart,
-                            densifyEnd, densifyFreq, densifyPercentile, pruneDuringDensify,
-                            pruneStart, pruneEnd, pruneFreq, prunePercentile, maxSplitIndices) {
-  let actualSites = initSites;
-  let activeEstimate = initSites;
-  maxSites = Math.max(maxSites, initSites);
-
-  let effectivePruneStart = pruneStart;
-  if (densifyEnabled && !pruneDuringDensify && pruneStart < densifyEnd) {
-    effectivePruneStart = densifyEnd;
-  }
-
-  for (let it = 0; it < iters; it += 1) {
-    if (densifyEnabled && densifyPercentile > 0 && it >= densifyStart &&
-        it <= densifyEnd && (it % densifyFreq === 0) && actualSites < maxSites) {
-      const desired = Math.floor(activeEstimate * densifyPercentile);
-      const available = maxSites - actualSites;
-      const numToSplit = Math.min(desired, available, maxSplitIndices);
-      if (numToSplit > 0) {
-        actualSites += numToSplit;
-        activeEstimate += numToSplit;
-      }
-    }
-    if (prunePercentile > 0 && it >= effectivePruneStart && it < pruneEnd && (it % pruneFreq === 0)) {
-      const desired = Math.floor(activeEstimate * prunePercentile);
-      const numToPrune = Math.min(desired, maxSplitIndices);
-      if (numToPrune > 0) {
-        activeEstimate = Math.max(0, activeEstimate - numToPrune);
-      }
-    }
-  }
-  return activeEstimate;
-}
-
-// Mirrors solve_target_bpp().
-export function solveTargetBpp(args, width, height, initSiteCount, maxSites, iters) {
-  const targetSites = Math.max(1, Math.round(args.targetBpp * width * height / BITS_PER_SITE));
-  const baseDensify = args.densifyPercentile;
-  const basePrune = args.prunePercentile;
-  const maxBase = Math.max(baseDensify, basePrune);
-  const maxSplitIndices = 65536;
-
-  if (maxBase <= 0) {
-    const final = simulateFinalSites(initSiteCount, maxSites, iters, args.densify,
-      args.densifyStart, args.densifyEnd, Math.max(1, args.densifyFreq), 0,
-      args.pruneDuringDensify, args.pruneStart, args.pruneEnd, Math.max(1, args.pruneFreq),
-      0, maxSplitIndices);
-    return { densifyPercentile: 0, prunePercentile: 0, finalSites: final,
-             achievedBpp: final * BITS_PER_SITE / (width * height) };
-  }
-
-  const maxPct = 0.95;
-  let sMax = maxPct / maxBase;
-  if (sMax > 50) sMax = 50;
-
-  const evalSites = (scale) => {
-    const d = args.densify ? Math.min(maxPct, baseDensify * scale) : 0;
-    const p = Math.min(maxPct, basePrune * scale);
-    return simulateFinalSites(initSiteCount, maxSites, iters, args.densify,
-      args.densifyStart, args.densifyEnd, Math.max(1, args.densifyFreq), d,
-      args.pruneDuringDensify, args.pruneStart, args.pruneEnd, Math.max(1, args.pruneFreq),
-      p, maxSplitIndices);
-  };
-
-  let bestScale = 0;
-  let bestSites = evalSites(0);
-  let bestErr = Math.abs(bestSites - targetSites);
-  const samples = 80;
-  for (let i = 0; i <= samples; i += 1) {
-    const s = sMax * i / samples;
-    const sites = evalSites(s);
-    const err = Math.abs(sites - targetSites);
-    if (err < bestErr) { bestErr = err; bestScale = s; bestSites = sites; }
-  }
-
-  let step = sMax / samples;
-  for (let k = 0; k < 20; k += 1) {
-    let improved = false;
-    const s0 = bestScale - step;
-    const s1 = bestScale + step;
-    if (s0 >= 0) {
-      const sites = evalSites(s0);
-      const err = Math.abs(sites - targetSites);
-      if (err < bestErr) { bestErr = err; bestScale = s0; bestSites = sites; improved = true; }
-    }
-    if (s1 <= sMax) {
-      const sites = evalSites(s1);
-      const err = Math.abs(sites - targetSites);
-      if (err < bestErr) { bestErr = err; bestScale = s1; bestSites = sites; improved = true; }
-    }
-    if (!improved) step *= 0.5;
-  }
-
-  const densify = args.densify ? Math.min(maxPct, baseDensify * bestScale) : 0;
-  const prune = Math.min(maxPct, basePrune * bestScale);
-  return {
-    densifyPercentile: densify,
-    prunePercentile: prune,
-    finalSites: bestSites,
-    achievedBpp: bestSites * BITS_PER_SITE / (width * height),
-  };
-}
-
-// Mirrors plan_site_capacity().
-function planSiteCapacity(args, initialSiteCount, numPixels) {
-  const needsPairs = Boolean(args.densify) || args.prunePercentile > 0;
-  const needsPrune = args.prunePercentile > 0;
-  let maxSitesCapacity;
-  if (args.maxSites > 0) {
-    maxSitesCapacity = args.maxSites;
-  } else if (args.densify) {
-    maxSitesCapacity = Math.min(numPixels * 2, Math.max(initialSiteCount * 8, 8192));
-  } else {
-    maxSitesCapacity = numPixels * 2;
-  }
-  const requestedCapacity = args.densify ? maxSitesCapacity : initialSiteCount;
-  const bufferCapacity = Math.max(initialSiteCount, requestedCapacity);
-  const scorePairsCount = needsPairs ? Math.max(1, bufferCapacity) : 0;
-  return {
-    densifyEnabled: Boolean(args.densify),
-    needsPairs,
-    needsPrune,
-    maxSitesCapacity,
-    requestedCapacity,
-    bufferCapacity,
-    scorePairsCount,
-    maxSplitIndices: 65536,
-  };
-}
 
 // Collect default args from a training_config.json-style object + user
 // overrides. Overrides use the argument name (e.g. "iters") and take precedence
@@ -231,21 +82,10 @@ export function buildArgs(config, overrides = {}) {
     return fallback;
   };
   const args = {
-    iters: Number(pick("iters", "DEFAULT_ITERS", 2000)),
-    sites: Number(pick("sites", "DEFAULT_SITES", 65536)),
-    maxSites: Number(pick("maxSites", "DEFAULT_MAX_SITES", 70000)),
-    densify: Boolean(pick("densify", null, true)),
-    densifyStart: Number(pick("densifyStart", "DENSIFY_START", 20)),
-    densifyEnd: Number(pick("densifyEnd", "DENSIFY_END", 3500)),
-    densifyFreq: Number(pick("densifyFreq", "DENSIFY_FREQ", 20)),
-    densifyPercentile: Number(pick("densifyPercentile", "DENSIFY_PERCENTILE", 0.01)),
-    densifyScoreAlpha: Number(pick("densifyScoreAlpha", "DENSIFY_SCORE_ALPHA", 0.7)),
-    pruneDuringDensify: Boolean(pick("pruneDuringDensify", "PRUNE_DURING_DENSIFY", true)),
-    pruneStart: Number(pick("pruneStart", "PRUNE_START", 100)),
-    pruneEnd: Number(pick("pruneEnd", "PRUNE_END", 3600)),
-    pruneFreq: Number(pick("pruneFreq", "PRUNE_FREQ", 20)),
-    prunePercentile: Number(pick("prunePercentile", "PRUNE_PERCENTILE", 0.01)),
-    targetBpp: Number(pick("targetBpp", "DEFAULT_TARGET_BPP", -1.0)),
+    // WebGPU-specific defaults; training_config.json's DEFAULT_ITERS/SITES are
+    // tuned for the other backends' densify/prune schedule, which JS doesn't run.
+    iters: Number(pick("iters", null, 10000)),
+    sites: Number(pick("sites", null, 1000)),
     candFreq: Number(pick("candFreq", "CAND_UPDATE_FREQ", 1)),
     candHilbertWindow: Number(pick("candHilbertWindow", "CAND_HILBERT_WINDOW", 0)),
     candHilbertProbes: Number(pick("candHilbertProbes", "CAND_HILBERT_PROBES", 0)),
@@ -254,8 +94,8 @@ export function buildArgs(config, overrides = {}) {
     candRadiusScale: Number(pick("candRadiusScale", "CAND_RADIUS_SCALE", 64.0)),
     candRadiusProbes: Number(pick("candRadiusProbes", "CAND_RADIUS_PROBES", 0)),
     candInjectCount: Number(pick("candInjectCount", "CAND_INJECT_COUNT", 16)),
-    logFreq: Math.max(1, Number(pick("logFreq", null, 1000))),
-    viewerFreq: Math.max(1, Number(pick("viewerFreq", null, 10))),
+    logFreq: Math.max(1, Number(pick("logFreq", null, 50))),
+    viewerFreq: Math.max(1, Number(pick("viewerFreq", null, 50))),
     lrPosBase: Number(pick("lrPosBase", "LR_POS_BASE", 0.05)),
     lrTauBase: Number(pick("lrTauBase", "LR_TAU_BASE", 0.01)),
     lrRadiusBase: Number(pick("lrRadiusBase", "LR_RADIUS_BASE", 0.02)),
@@ -306,13 +146,7 @@ export class Trainer {
     this.gradsEnc = new GradientsEncoder(device, shaders);
     this.adamEnc = new AdamEncoder(device, shaders);
     this.tauEnc = new TauEncoder(device, shaders);
-    this.statsEnc = new StatsEncoder(device, shaders);
-    this.splitEnc = new SplitEncoder(device, shaders);
-    this.pruneEnc = new PruneEncoder(device, shaders);
-    this.clearEnc = new ClearBufferEncoder(device, shaders, { useI32: false });
     this.clearI32Enc = new ClearBufferEncoder(device, shaders, { useI32: true });
-    this.scoreEnc = new ScorePairsEncoder(device, shaders);
-    this.writeIdxEnc = new WriteIndicesEncoder(device, shaders);
     this.hilbertEnc = this.usesHilbert ? new HilbertEncoder(device, shaders) : null;
   }
 
@@ -341,26 +175,9 @@ export class Trainer {
     const maskData = maskRgba32f || whiteMaskRgba32Float(width, height).rgba;
     writeFloat32ToRgba32FloatTexture(device, this.maskTex, maskData, width, height);
 
-    // Optional target-BPP solver — runs pure-JS before allocating anything else.
-    if (args.targetBpp > 0) {
-      let maxSitesCapacity;
-      if (args.maxSites > 0) maxSitesCapacity = args.maxSites;
-      else if (args.densify) maxSitesCapacity = Math.min(width * height * 2, Math.max(initSiteCount * 8, 8192));
-      else maxSitesCapacity = width * height * 2;
-      const maxSites = Math.max(maxSitesCapacity, initSiteCount);
-      const solved = solveTargetBpp(args, width, height, initSiteCount, maxSites, args.iters);
-      args.densifyPercentile = solved.densifyPercentile;
-      args.prunePercentile = solved.prunePercentile;
-      this._log(
-        `Target BPP: ${args.targetBpp.toFixed(3)} -> densify_percentile=${solved.densifyPercentile.toFixed(4)}, ` +
-        `prune_percentile=${solved.prunePercentile.toFixed(4)}, predicted final sites ${solved.finalSites} ` +
-        `(${solved.achievedBpp.toFixed(3)} bpp)`,
-      );
-    }
-
-    // Plan capacity
-    this.plan = planSiteCapacity(args, initSiteCount, width * height);
-    this.bufferCapacity = this.plan.bufferCapacity;
+    // Site count is fixed for the whole run (no densify/prune).
+    this.siteCount = initSiteCount;
+    this.bufferCapacity = initSiteCount;
 
     // Buffers
     this.sitesBuf = createSitesBuffer(device, this.bufferCapacity);
@@ -368,14 +185,9 @@ export class Trainer {
     this.adamBuf = createAdamBuffer(device, this.bufferCapacity);
     this.seedCounter = createSeedCounter(device);
     this.grads = createGradsBuffer(device, this.bufferCapacity);
-    this.removalDelta = createAtomicU32Buffer(device, this.bufferCapacity);
     this.tauGradRaw = createAtomicU32Buffer(device, this.bufferCapacity);
     this.tauGradTmp = createAtomicU32Buffer(device, this.bufferCapacity);
     this.tauGradTmp2 = createAtomicU32Buffer(device, this.bufferCapacity);
-    this.statBufs = args.densify ? createStatBuffers(device, this.bufferCapacity) : null;
-    this.pairsBuf = this.plan.needsPairs ? createPairsBuffer(device, this.plan.scorePairsCount) : null;
-    this.splitIndicesBuf = args.densify ? createIndicesBuffer(device, this.plan.maxSplitIndices) : null;
-    this.pruneIndicesBuf = this.plan.needsPrune ? createIndicesBuffer(device, this.plan.maxSplitIndices) : null;
 
     // Candidate textures
     this.cand0A = createCandidateTexture(device, this.candWidth, this.candHeight);
@@ -396,24 +208,13 @@ export class Trainer {
 
     const invScaleSq = 1.0 / Math.pow(Math.max(width, height), 2);
     this.invScaleSq = invScaleSq;
-    this.gradParamsStats = createGradParamsBuffer(device, initSiteCount, invScaleSq, 0);
-    this.gradParamsGrad = createGradParamsBuffer(device, initSiteCount, invScaleSq, 0);
+    this.gradParams = createGradParamsBuffer(device, initSiteCount, invScaleSq);
     this.adamParams = createAdamParamsBuffer(device,
       args.lrPosBase, args.lrTauBase, args.lrRadiusBase, args.lrColorBase,
       args.lrDirBase, args.lrAnisoBase, args.beta1, args.beta2, args.eps,
       1, width, height);
-    this.clearParamsPre = createClearParamsBuffer(device, initSiteCount);
-    this.clearParamsPost = createClearParamsBuffer(device, initSiteCount);
-    this.packParams = createClearParamsBuffer(device, initSiteCount);
-    this.splitParams = this.splitIndicesBuf ? createSplitParamsBuffer(device, 0, initSiteCount) : null;
-    this.densifyIndicesParams = this.splitIndicesBuf ? createPruneParamsBuffer(device, 0) : null;
-    this.pruneIndicesParams = this.plan.needsPrune ? createPruneParamsBuffer(device, 0) : null;
-    this.densifyScoreParams = this.statBufs
-      ? createDensifyScoreParamsBuffer(device, initSiteCount, this.plan.scorePairsCount, 1.0, args.densifyScoreAlpha)
-      : null;
-    this.pruneScoreParams = this.plan.needsPrune
-      ? createPruneScoreParamsBuffer(device, initSiteCount, this.plan.scorePairsCount, 1.0 / (width * height))
-      : null;
+    this.countParams = createClearParamsBuffer(device, initSiteCount);
+    this.gradCountParams = createClearParamsBuffer(device, initSiteCount * 10);
     this.tauParams = createTauParamsBuffer(device, initSiteCount, TAU_DIFFUSE_LAMBDA, this.candDownscale);
 
     // Hilbert resources
@@ -433,11 +234,6 @@ export class Trainer {
       this.hilbertParams = null;
       this.hilbertSort = null;
     }
-
-    // Densify/prune radix sort (different padded count than Hilbert's)
-    this.radixSort = this.plan.needsPairs
-      ? new RadixSortUInt2(device, shaders, this.plan.scorePairsCount)
-      : null;
 
     // Initialize sites
     if (initSites) {
@@ -488,15 +284,15 @@ export class Trainer {
       [this.cand0A, this.cand0B] = [this.cand0B, this.cand0A];
     }
 
-    this.clearedSiteCount = 0;
-    this.jumpPassIndex = 0;
-    this.aniStartIter = Math.max(10, Math.floor(args.pruneStart / 2));
-    this.effectivePruneStart = args.pruneStart;
-    if (args.densify && !args.pruneDuringDensify && args.pruneStart < args.densifyEnd) {
-      this.effectivePruneStart = args.densifyEnd;
-      this._log(`Note: Adjusting prune start from ${args.pruneStart} -> ${this.effectivePruneStart} ` +
-                 `to avoid pruning during densification.`);
+    // Zero the gradient accumulators once; Adam re-zeroes each site after use.
+    {
+      const encoder = device.createCommandEncoder();
+      this.clearI32Enc.encode(encoder, this.grads, this.gradCountParams, initSiteCount * 10);
+      device.queue.submit([encoder.finish()]);
     }
+
+    this.jumpPassIndex = 0;
+    this.aniStartIter = ANI_START_ITER;
     this.trainStartMs = performance.now();
     this.bestPsnr = 0;
   }
@@ -559,40 +355,10 @@ export class Trainer {
         break;
       }
 
-      const preSites = this.actualSites;
-      const preActive = this.activeEstimate;
+      const siteCount = this.siteCount;
+      const activeSites = this.activeEstimate;
       const updateCandidates = (it % candUpdateFreq === 0);
       const candPasses = this.candUpdatePasses;
-
-      const shouldDensify =
-        args.densify &&
-        it >= args.densifyStart &&
-        it <= args.densifyEnd &&
-        (it % args.densifyFreq === 0) &&
-        preSites < this.bufferCapacity;
-      const shouldPrune =
-        args.prunePercentile > 0 &&
-        it >= this.effectivePruneStart &&
-        it < args.pruneEnd &&
-        (it % args.pruneFreq === 0) &&
-        this.plan.needsPrune;
-
-      let numToSplit = 0;
-      if (shouldDensify) {
-        const desired = Math.floor(preActive * args.densifyPercentile);
-        const available = this.bufferCapacity - preSites;
-        numToSplit = Math.min(desired, available, this.plan.maxSplitIndices);
-      }
-      const runDensify = shouldDensify && numToSplit > 0;
-
-      const postSites = preSites + numToSplit;
-      let postActive = preActive + numToSplit;
-      let numToPrune = 0;
-      if (shouldPrune) {
-        const desired = Math.floor(postActive * args.prunePercentile);
-        numToPrune = Math.min(desired, this.plan.maxSplitIndices);
-      }
-      postActive = Math.max(0, postActive - numToPrune);
 
       // Update candidate params for each pass
       if (updateCandidates) {
@@ -600,22 +366,9 @@ export class Trainer {
           const stepIndex = this.jumpPassIndex + p;
           const step = packJumpStep(stepIndex, this.candWidth, this.candHeight);
           const seed = (stepIndex >>> 16) & 0xffff;
-          updateParamsBuffer(queue, this.candParams[p], this._paramsArgs(preSites, step, seed));
+          updateParamsBuffer(queue, this.candParams[p], this._paramsArgs(siteCount, step, seed));
         }
       }
-
-      updateCountParamsBuffer(queue, this.clearParamsPre, preSites);
-      if (updateCandidates) updateCountParamsBuffer(queue, this.packParams, preSites);
-      if (runDensify) {
-        updateGradParamsBuffer(queue, this.gradParamsStats, preSites, this.invScaleSq, 0);
-        updateDensifyScoreParamsBuffer(queue, this.densifyScoreParams, preSites,
-          this.plan.scorePairsCount, 1.0, args.densifyScoreAlpha);
-        updatePruneParamsBuffer(queue, this.densifyIndicesParams, numToSplit);
-        updateSplitParamsBuffer(queue, this.splitParams, numToSplit, preSites);
-      }
-
-      updateCountParamsBuffer(queue, this.clearParamsPost, postSites);
-      updateGradParamsBuffer(queue, this.gradParamsGrad, postSites, this.invScaleSq, shouldPrune ? 1 : 0);
 
       const lrDir = it >= this.aniStartIter ? args.lrDirBase : 0;
       const lrAniso = it >= this.aniStartIter ? args.lrAnisoBase : 0;
@@ -625,26 +378,20 @@ export class Trainer {
 
       const blend = it / Math.max(1, iters);
       const lambda = TAU_DIFFUSE_LAMBDA * (0.1 + 0.9 * blend);
-      updateTauParamsBuffer(queue, this.tauParams, postSites, lambda, this.candDownscale);
-
-      if (shouldPrune) {
-        updatePruneScoreParamsBuffer(queue, this.pruneScoreParams, postSites,
-          this.plan.scorePairsCount, 1.0 / (this.width * this.height));
-        if (numToPrune > 0) updatePruneParamsBuffer(queue, this.pruneIndicesParams, numToPrune);
-      }
+      updateTauParamsBuffer(queue, this.tauParams, siteCount, lambda, this.candDownscale);
 
       const shouldLog = (it % logFreq === 0) || (it === iters - 1);
       const shouldPreview = shouldLog || (it % viewerFreq === 0);
       if (shouldLog || shouldPreview) {
-        updateParamsBuffer(queue, this.renderParams, this._paramsArgs(postSites, 0, 0));
+        updateParamsBuffer(queue, this.renderParams, this._paramsArgs(siteCount, 0, 0));
       }
 
       const encoder = device.createCommandEncoder();
 
       // Candidate update
       if (updateCandidates) {
-        this._maybeRefreshHilbert(encoder, preSites);
-        this.packEnc.encode(encoder, this.sitesBuf, this.packedSitesBuf, this.packParams, preSites);
+        this._maybeRefreshHilbert(encoder, siteCount);
+        this.packEnc.encode(encoder, this.sitesBuf, this.packedSitesBuf, this.countParams, siteCount);
         for (let p = 0; p < candPasses; p += 1) {
           this.candsEnc.encodeUpdate(encoder,
             this.packedSitesBuf, this.candParams[p],
@@ -657,51 +404,20 @@ export class Trainer {
         }
       }
 
-      // Densify: stats → score → sort → write indices → split
-      if (runDensify) {
-        for (const buf of this.statBufs) {
-          this.clearEnc.encode(encoder, buf, this.clearParamsPre, preSites);
-        }
-        this.statsEnc.encode(encoder,
-          this.sitesBuf, this.gradParamsStats,
-          this.cand0A, this.cand1A,
-          this.targetTex, this.maskTex,
-          this.statBufs, this.width, this.height);
-        this.scoreEnc.encodeDensify(encoder, this.sitesBuf,
-          this.statBufs[0], this.statBufs[1],
-          this.pairsBuf, this.densifyScoreParams, this.plan.scorePairsCount);
-        if (this.radixSort) this.radixSort.encode(encoder, this.pairsBuf, 0xffffffff);
-        this.writeIdxEnc.encode(encoder, this.pairsBuf, this.splitIndicesBuf,
-          this.densifyIndicesParams, numToSplit);
-        this.splitEnc.encode(encoder, this.sitesBuf, this.adamBuf, this.splitIndicesBuf,
-          this.statBufs, this.splitParams, this.targetTex, numToSplit);
-      }
-
-      // Clear removal_delta if pruning; clear grad buffers if site count grew
-      if (shouldPrune) {
-        this.clearEnc.encode(encoder, this.removalDelta, this.clearParamsPost, postSites);
-      }
-      if (postSites > this.clearedSiteCount) {
-        // Clear the grown portion of the consolidated grads buffer (one u32
-        // slot per channel per site).
-        this.clearI32Enc.encode(encoder, this.grads, this.clearParamsPost, postSites * 10);
-        this.clearedSiteCount = postSites;
-      }
-
       // Gradients
-      this.gradsEnc.encode(encoder, this.sitesBuf, this.gradParamsGrad,
+      this.gradsEnc.encode(encoder, this.sitesBuf, this.gradParams,
         this.cand0A, this.cand1A, this.targetTex, this.maskTex,
-        this.grads, this.removalDelta, this.width, this.height);
+        this.grads, this.width, this.height);
 
       // Tau diffusion
       if (TAU_DIFFUSE_PASSES > 0 && TAU_DIFFUSE_LAMBDA > 0) {
         this.tauEnc.encodeExtract(encoder, this.grads, this.tauGradRaw,
-          this.clearParamsPost, postSites);
+          this.countParams, siteCount);
         let curIn = this.tauGradRaw;
         let curOut = this.tauGradTmp;
         for (let p = 0; p < TAU_DIFFUSE_PASSES; p += 1) {
           this.tauEnc.encodeDiffuse(encoder, this.cand0A, this.cand1A,
-            this.sitesBuf, this.tauGradRaw, curIn, curOut, this.tauParams, postSites);
+            this.sitesBuf, this.tauGradRaw, curIn, curOut, this.tauParams, siteCount);
           if (curOut === this.tauGradTmp) {
             [curIn, curOut] = [curOut, this.tauGradTmp2];
           } else {
@@ -709,13 +425,13 @@ export class Trainer {
           }
         }
         this.tauEnc.encodeWriteback(encoder, curIn, this.grads,
-          this.clearParamsPost, postSites);
+          this.countParams, siteCount);
       }
 
       // Snapshot the accumulated gradients on log ticks — Adam zeroes them.
       let gradStaging = null;
       if (shouldLog) {
-        const gradBytes = Math.max(1, postSites) * 10 * 4;
+        const gradBytes = Math.max(1, siteCount) * 10 * 4;
         gradStaging = device.createBuffer({
           size: gradBytes,
           usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
@@ -725,20 +441,7 @@ export class Trainer {
 
       // Adam
       this.adamEnc.encode(encoder, this.sitesBuf, this.adamBuf, this.grads,
-        this.adamParams, postSites);
-
-      // Prune: score → sort → write indices → prune
-      if (shouldPrune) {
-        this.scoreEnc.encodePrune(encoder, this.sitesBuf, this.removalDelta,
-          this.pairsBuf, this.pruneScoreParams, this.plan.scorePairsCount);
-        if (this.radixSort) this.radixSort.encode(encoder, this.pairsBuf, 0xffffffff);
-        if (numToPrune > 0) {
-          this.writeIdxEnc.encode(encoder, this.pairsBuf, this.pruneIndicesBuf,
-            this.pruneIndicesParams, numToPrune);
-          this.pruneEnc.encode(encoder, this.sitesBuf, this.pruneIndicesBuf,
-            this.pruneIndicesParams, numToPrune);
-        }
-      }
+        this.adamParams, siteCount);
 
       // Preview/log renders. The log path does a blocking readback for PSNR.
       // Viewer ticks wait only for the small site readback so centroid overlays
@@ -748,18 +451,18 @@ export class Trainer {
         this.renderEnc.encode(encoder, this.sitesBuf, this.renderParams,
           this.cand0A, this.cand1A, this.renderTex, this.width, this.height);
         if (!shouldLog) {
-          previewReadback = this._encodePreviewReadback(encoder, it, iters, postActive, postSites);
+          previewReadback = this._encodePreviewReadback(encoder, it, iters, activeSites, siteCount);
         }
       }
       queue.submit([encoder.finish()]);
 
       if (shouldLog) {
         const rgba = await readRgba32FloatTexture(device, this.renderTex, this.width, this.height);
-        const sitesData = await readSites(device, this.sitesBuf, postSites);
+        const sitesData = await readSites(device, this.sitesBuf, siteCount);
         this._lastSitesCpu = sitesData;
         await gradStaging.mapAsync(GPUMapMode.READ);
         const gradStats = computeGradStats(new Float32Array(gradStaging.getMappedRange()),
-          postSites, this.width * this.height);
+          siteCount, this.width * this.height);
         gradStaging.unmap();
         gradStaging.destroy();
         const psnr = computePsnrSafe(rgba, this.target, this.width, this.height, this.maskCpu, this.maskSum);
@@ -772,8 +475,8 @@ export class Trainer {
             it, iters,
             psnr,
             gradStats,
-            activeSites: postActive,
-            totalSites: postSites,
+            activeSites,
+            totalSites: siteCount,
             itsPerSec,
             elapsedSec: elapsed,
             renderRgba: rgba,
@@ -791,8 +494,6 @@ export class Trainer {
         await yieldToBrowser();
       }
 
-      this.actualSites = postSites;
-      this.activeEstimate = postActive;
     }
 
     const queue2 = device.queue;

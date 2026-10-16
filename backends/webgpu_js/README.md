@@ -28,6 +28,7 @@ Both pages use the shared SAD WGSL kernels under `backends/shared/` and hyperpar
 
 - Pick a target image (and optional mask / init-sites file).
 - Edit hyperparameters in the left panel (they mirror the CLI flags in `train_wgpu.py`; values are pre-filled from `training_config.json`).
+- The site count is fixed for the whole run: the JS trainer has no densify/prune (and so no target-bpp). Defaults: `iters` 10000, `sites` 1000, `log-freq` 50, `viewer-freq` 50.
 - Click **Train**. `viewer-freq` controls visual refreshes, while `log-freq` controls PSNR log lines (`Iter N | PSNR: X dB | Active: a/t | it/s | seconds`).
 - **Export PNG** / **Export sites.txt** produce the same formats the Python and Metal trainers write.
 
@@ -54,10 +55,10 @@ The page logs `BENCH_RESULT` with final PSNR, active sites, training time, and t
 - `src/params.js` - parameter buffer writers, `pack_jump_step`, and `hilbert_bits_for_size`.
 - `src/radix_sort.js` - radix-sort GPU pass orchestration.
 - `src/encoders.js` - one class per GPU kernel.
-- `src/buffers.js` - site/Adam/grad/stats/pairs buffer factories.
+- `src/buffers.js` - site/Adam/grad buffer factories.
 - `src/textures.js` - target / mask / candidate texture helpers + image upload.
 - `src/io.js` - sites `.txt` parsing + serialization + PNG download.
-- `src/trainer.js` - training loop, site simulation, target-bpp planning, and epilogue.
+- `src/trainer.js` - training loop (fixed site count; no densify/prune) and epilogue.
 
 ## Shader Source
 

@@ -4,7 +4,6 @@
 
 export const SITE_FLOATS = 10;
 export const ADAM_FLOATS = 24;
-export const BITS_PER_SITE = 16.0 * 8.0;
 export const PACKED_CAND_BYTES = 16;
 export const TAU_DIFFUSE_PASSES = 4;
 export const TAU_DIFFUSE_LAMBDA = 0.05;
@@ -102,26 +101,27 @@ export function createInitParamsBuffer(device, numSites, gradThreshold, maxAttem
 }
 
 // ---------------------------------------------------------------------------
-// GradParams (gradients_tiled.wgsl, stats.wgsl):
+// GradParams (gradients_tiled.wgsl):
 //   u32 siteCount, u32 computeRemoval, u32 _pad0, u32 _pad1,
 //   f32 invScaleSq, f32 _pad2, f32 _pad3, f32 _pad4     (32 bytes)
+// computeRemoval (prune scoring) is always 0 here — the JS trainer has no prune.
 // ---------------------------------------------------------------------------
 
-export function createGradParamsBuffer(device, siteCount, invScaleSq, computeRemoval) {
+export function createGradParamsBuffer(device, siteCount, invScaleSq) {
   const buf = device.createBuffer({
     size: 32,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
-  updateGradParamsBuffer(device.queue, buf, siteCount, invScaleSq, computeRemoval);
+  updateGradParamsBuffer(device.queue, buf, siteCount, invScaleSq);
   return buf;
 }
 
-export function updateGradParamsBuffer(queue, buffer, siteCount, invScaleSq, computeRemoval) {
+export function updateGradParamsBuffer(queue, buffer, siteCount, invScaleSq) {
   const bytes = new ArrayBuffer(32);
   const u = new Uint32Array(bytes);
   const f = new Float32Array(bytes);
   u[0] = siteCount >>> 0;
-  u[1] = computeRemoval >>> 0;
+  u[1] = 0;
   u[2] = 0;
   u[3] = 0;
   f[4] = invScaleSq;
@@ -173,33 +173,8 @@ export function updateAdamParamsBuffer(queue, buffer, lrPos, lrTau, lrRadius, lr
 }
 
 // ---------------------------------------------------------------------------
-// SplitParams (split.wgsl):
-//   u32 numToSplit, u32 currentSiteCount, u32 _pad, u32 _pad   (16 bytes)
-// ---------------------------------------------------------------------------
-
-export function createSplitParamsBuffer(device, numToSplit, currentSiteCount) {
-  const buf = device.createBuffer({
-    size: 16,
-    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-  });
-  updateSplitParamsBuffer(device.queue, buf, numToSplit, currentSiteCount);
-  return buf;
-}
-
-export function updateSplitParamsBuffer(queue, buffer, numToSplit, currentSiteCount) {
-  const bytes = new ArrayBuffer(16);
-  const u = new Uint32Array(bytes);
-  u[0] = numToSplit >>> 0;
-  u[1] = currentSiteCount >>> 0;
-  u[2] = 0;
-  u[3] = 0;
-  queue.writeBuffer(buffer, 0, bytes);
-}
-
-// ---------------------------------------------------------------------------
-// PruneParams / ClearParams / WriteIndicesParams: single u32 count + pad
-// (used by prune.wgsl, clear_buffer_*.wgsl, candidate_pack.wgsl, write_indices.wgsl,
-// tau_extract.wgsl, tau_writeback.wgsl).
+// ClearParams: single u32 count + pad
+// (used by clear_buffer_*.wgsl, candidate_pack.wgsl, tau_extract.wgsl, tau_writeback.wgsl).
 // ---------------------------------------------------------------------------
 
 export function createCountParamsBuffer(device, count) {
@@ -223,9 +198,7 @@ export function updateCountParamsBuffer(queue, buffer, count) {
 
 // Aliases to match Python naming
 export const createClearParamsBuffer = createCountParamsBuffer;
-export const createPruneParamsBuffer = createCountParamsBuffer;
 export const updateClearParamsBuffer = updateCountParamsBuffer;
-export const updatePruneParamsBuffer = updateCountParamsBuffer;
 
 // ---------------------------------------------------------------------------
 // TauDiffuseParams (tau_diffuse.wgsl):
@@ -251,67 +224,6 @@ export function updateTauParamsBuffer(queue, buffer, siteCount, lambda, candDown
   u[2] = 0;
   u[3] = 0;
   f[4] = lambda;
-  f[5] = 0;
-  f[6] = 0;
-  f[7] = 0;
-  queue.writeBuffer(buffer, 0, bytes);
-}
-
-// ---------------------------------------------------------------------------
-// DensifyScoreParams (score_pairs_densify.wgsl):
-//   u32 siteCount, u32 pairCount, u32 _pad, u32 _pad,
-//   f32 minMass, f32 scoreAlpha, f32 _pad, f32 _pad  (32 bytes)
-// ---------------------------------------------------------------------------
-
-export function createDensifyScoreParamsBuffer(device, siteCount, pairCount, minMass, scoreAlpha) {
-  const buf = device.createBuffer({
-    size: 32,
-    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-  });
-  updateDensifyScoreParamsBuffer(device.queue, buf, siteCount, pairCount, minMass, scoreAlpha);
-  return buf;
-}
-
-export function updateDensifyScoreParamsBuffer(queue, buffer, siteCount, pairCount,
-                                                minMass, scoreAlpha) {
-  const bytes = new ArrayBuffer(32);
-  const u = new Uint32Array(bytes);
-  const f = new Float32Array(bytes);
-  u[0] = siteCount >>> 0;
-  u[1] = pairCount >>> 0;
-  u[2] = 0;
-  u[3] = 0;
-  f[4] = minMass;
-  f[5] = scoreAlpha;
-  f[6] = 0;
-  f[7] = 0;
-  queue.writeBuffer(buffer, 0, bytes);
-}
-
-// ---------------------------------------------------------------------------
-// PruneScoreParams (score_pairs_prune.wgsl):
-//   u32 siteCount, u32 pairCount, u32 _pad, u32 _pad,
-//   f32 deltaNorm, f32 _pad, f32 _pad, f32 _pad   (32 bytes)
-// ---------------------------------------------------------------------------
-
-export function createPruneScoreParamsBuffer(device, siteCount, pairCount, deltaNorm) {
-  const buf = device.createBuffer({
-    size: 32,
-    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-  });
-  updatePruneScoreParamsBuffer(device.queue, buf, siteCount, pairCount, deltaNorm);
-  return buf;
-}
-
-export function updatePruneScoreParamsBuffer(queue, buffer, siteCount, pairCount, deltaNorm) {
-  const bytes = new ArrayBuffer(32);
-  const u = new Uint32Array(bytes);
-  const f = new Float32Array(bytes);
-  u[0] = siteCount >>> 0;
-  u[1] = pairCount >>> 0;
-  u[2] = 0;
-  u[3] = 0;
-  f[4] = deltaNorm;
   f[5] = 0;
   f[6] = 0;
   f[7] = 0;

@@ -36,7 +36,7 @@ export function createSeedCounter(device) {
   return buf;
 }
 
-// Consolidated gradient buffer: `grads[idx * 10 + channel]`, atomic<i32>.
+// Consolidated gradient buffer: `grads[idx * 10 + channel]`, f32 bits in atomic<u32>.
 // This replaces the 10 separate per-channel buffers the Python/Metal backends
 // use, so we stay within WebGPU's 10-storage-buffer-per-stage limit.
 export function createGradsBuffer(device, capacity) {
@@ -50,24 +50,6 @@ export function createAtomicU32Buffer(device, count) {
   return device.createBuffer({
     size: Math.max(1, count) * 4,
     usage: GPUBufferUsage.STORAGE,
-  });
-}
-
-export function createStatBuffers(device, capacity) {
-  return Array.from({ length: 8 }, () => createAtomicU32Buffer(device, capacity));
-}
-
-export function createPairsBuffer(device, pairCount) {
-  return device.createBuffer({
-    size: Math.max(8, pairCount * 8),
-    usage: GPUBufferUsage.STORAGE,
-  });
-}
-
-export function createIndicesBuffer(device, maxCount) {
-  return device.createBuffer({
-    size: Math.max(4, maxCount * 4),
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
   });
 }
 

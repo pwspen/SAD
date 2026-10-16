@@ -31,9 +31,9 @@
     <pre id="summary"></pre>
 
     <script type="module">
-      import { loadShaders } from "./src/shader_loader.js";
-      import { Trainer, buildArgs } from "./src/trainer.js";
-      import { loadImageToFloat32 } from "./src/textures.js";
+      import { loadShaders, tileSlotsForLimit } from "./src/shader_loader.js?v=no-densify-20261016";
+      import { Trainer, buildArgs } from "./src/trainer.js?v=no-densify-20261016";
+      import { loadImageToFloat32 } from "./src/textures.js?v=no-densify-20261016";
 
       const logEl = document.getElementById("log");
       const summaryEl = document.getElementById("summary");
@@ -51,15 +51,6 @@
         if (raw === null || raw === "") return fallback;
         const value = Number(raw);
         return Number.isFinite(value) ? value : fallback;
-      }
-
-      function boolParam(name, fallback = undefined) {
-        const raw = params.get(name);
-        if (raw === null || raw === "") return fallback;
-        const normalized = raw.toLowerCase();
-        if (normalized === "1" || normalized === "true") return true;
-        if (normalized === "0" || normalized === "false") return false;
-        return fallback;
       }
 
       function computePsnr(render, target, width, height) {
@@ -87,6 +78,7 @@
           ),
           maxBufferSize: Math.min(1 << 30, adapter.limits.maxBufferSize),
           maxStorageBufferBindingSize: Math.min(1 << 30, adapter.limits.maxStorageBufferBindingSize),
+          maxComputeWorkgroupStorageSize: Math.min(32768, adapter.limits.maxComputeWorkgroupStorageSize),
         };
         const device = await adapter.requestDevice({ requiredLimits });
         return { adapter, device };
@@ -102,19 +94,15 @@
         const overrides = {
           iters: numberParam("iters"),
           sites: numberParam("sites"),
-          maxSites: numberParam("maxSites"),
-          targetBpp: numberParam("targetBpp"),
           logFreq: numberParam("logFreq"),
           viewerFreq: numberParam("viewerFreq"),
-          densify: boolParam("densify"),
-          prunePercentile: numberParam("prunePercentile"),
           candUpdatePasses: numberParam("candPasses"),
         };
         for (const key of Object.keys(overrides)) {
           if (overrides[key] === undefined) delete overrides[key];
         }
         const args = buildArgs(config, overrides);
-        log(`Config | target-bpp=${args.targetBpp.toFixed(3)} | iters=${args.iters} | sites=${args.sites}/${args.maxSites} | log-freq=${args.logFreq} | viewer-freq=${args.viewerFreq}`);
+        log(`Config | iters=${args.iters} | sites=${args.sites} | log-freq=${args.logFreq} | viewer-freq=${args.viewerFreq}`);
 
         const imageBlob = await fetch(imageUrl, { cache: "no-cache" }).then((r) => {
           if (!r.ok) throw new Error(`Failed to load image: ${r.status}`);
@@ -127,7 +115,9 @@
         const { adapter, device } = await initDevice();
         log(`Device | ${adapter.info?.device || adapter.info?.description || adapter.info?.vendor || "unknown"}`);
 
-        const shaders = await loadShaders();
+        const shaders = await loadShaders({
+          tileSlots: tileSlotsForLimit(device.limits.maxComputeWorkgroupStorageSize),
+        });
         const trainer = new Trainer(device, shaders, args, {
           onLog: (info) => {
             if (info.type === "msg") {
@@ -164,7 +154,6 @@
         const summary = {
           backend: "webgpu_js",
           image: `${target.width}x${target.height}`,
-          targetBpp: args.targetBpp,
           iters: args.iters,
           logFreq: args.logFreq,
           viewerFreq: args.viewerFreq,

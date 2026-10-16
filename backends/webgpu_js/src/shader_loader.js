@@ -13,8 +13,8 @@ import {
   TAU_WRITEBACK_OVERRIDE,
   RENDER_HASHED_OVERRIDE,
   RENDER_TAU_HEATMAP_OVERRIDE,
-} from "./wgsl_overrides.js?v=float-grads-20261016e";
-export { tileSlotsForLimit } from "./wgsl_overrides.js?v=float-grads-20261016e";
+} from "./wgsl_overrides.js?v=no-densify-20261016";
+export { tileSlotsForLimit } from "./wgsl_overrides.js?v=no-densify-20261016";
 
 const COMMON_URL = new URL("../../shared/sad_shared.wgsl", import.meta.url);
 const WGSL_DIR_URL = new URL("../../shared/wgsl/", import.meta.url);
@@ -30,17 +30,11 @@ const SHADER_FILES = [
   "render_compute",
   "gradients_tiled",
   "adam",
-  "stats",
-  "split",
-  "prune",
   "clear_buffer_u32",
   "clear_buffer_i32",
   "tau_extract",
   "tau_diffuse",
   "tau_writeback",
-  "score_pairs_densify",
-  "score_pairs_prune",
-  "write_indices",
   "hilbert",
   "radix_sort",
 ];
@@ -98,17 +92,11 @@ export async function loadShaders({ tileSlots = 128 } = {}) {
     RENDER: out.render_compute,
     GRADIENTS_TILED: common + gradientsTiledOverride(tileSlots),
     ADAM: common + ADAM_OVERRIDE,
-    STATS: out.stats,
-    SPLIT: out.split,
-    PRUNE: out.prune,
     CLEAR_BUFFER_U32: out.clear_buffer_u32,
     CLEAR_BUFFER_I32: out.clear_buffer_i32,
     TAU_EXTRACT: common + TAU_EXTRACT_OVERRIDE,
     TAU_DIFFUSE: out.tau_diffuse,
     TAU_WRITEBACK: common + TAU_WRITEBACK_OVERRIDE,
-    SCORE_PAIRS_DENSIFY: out.score_pairs_densify,
-    SCORE_PAIRS_PRUNE: out.score_pairs_prune,
-    WRITE_INDICES: out.write_indices,
     HILBERT: out.hilbert,
     RADIX_SORT: out.radix_sort,
     RENDER_HASHED: common + RENDER_HASHED_OVERRIDE,

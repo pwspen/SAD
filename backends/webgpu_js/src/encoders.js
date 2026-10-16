@@ -236,7 +236,7 @@ export class GradientsEncoder {
   // gradsBuffer is the consolidated interleaved atomic<i32> buffer of size
   // capacity * 10; index with `idx * 10 + channel`.
   encode(encoder, sitesBuffer, gradParams, cand0, cand1, targetTex, maskTex,
-         gradsBuffer, removalDelta, width, height) {
+         gradsBuffer, width, height) {
     const entries = [
       { binding: 0, resource: { buffer: sitesBuffer } },
       { binding: 1, resource: { buffer: gradParams } },
@@ -244,8 +244,7 @@ export class GradientsEncoder {
       { binding: 3, resource: getTextureView(this._views, cand1) },
       { binding: 4, resource: getTextureView(this._views, targetTex) },
       { binding: 5, resource: { buffer: gradsBuffer } },
-      { binding: 6, resource: { buffer: removalDelta } },
-      { binding: 7, resource: getTextureView(this._views, maskTex) },
+      { binding: 6, resource: getTextureView(this._views, maskTex) },
     ];
     const layout = this.pipeline.getBindGroupLayout(0);
     const bg = getBindGroup(this.device, this._bgs, layout, entries);
@@ -322,85 +321,6 @@ export class TauEncoder {
   }
 }
 
-export class StatsEncoder {
-  constructor(device, shaders) {
-    this.device = device;
-    this.pipeline = makePipeline(device, shaders.STATS);
-    this._views = new Map();
-    this._bgs = new Map();
-  }
-  encode(encoder, sitesBuffer, gradParams, cand0, cand1, targetTex, maskTex,
-         statBuffers, width, height) {
-    const entries = [
-      { binding: 0, resource: { buffer: sitesBuffer } },
-      { binding: 1, resource: { buffer: gradParams } },
-      { binding: 2, resource: getTextureView(this._views, cand0) },
-      { binding: 3, resource: getTextureView(this._views, cand1) },
-      { binding: 4, resource: getTextureView(this._views, targetTex) },
-      { binding: 5, resource: { buffer: statBuffers[0] } },
-      { binding: 6, resource: { buffer: statBuffers[1] } },
-      { binding: 7, resource: { buffer: statBuffers[2] } },
-      { binding: 8, resource: { buffer: statBuffers[3] } },
-      { binding: 9, resource: { buffer: statBuffers[4] } },
-      { binding: 10, resource: { buffer: statBuffers[5] } },
-      { binding: 11, resource: { buffer: statBuffers[6] } },
-      { binding: 12, resource: { buffer: statBuffers[7] } },
-      { binding: 13, resource: getTextureView(this._views, maskTex) },
-    ];
-    const layout = this.pipeline.getBindGroupLayout(0);
-    const bg = getBindGroup(this.device, this._bgs, layout, entries);
-    dispatch2D(encoder, this.pipeline, bg,
-      Math.ceil(width / 16), Math.ceil(height / 16));
-  }
-}
-
-export class SplitEncoder {
-  constructor(device, shaders) {
-    this.device = device;
-    this.pipeline = makePipeline(device, shaders.SPLIT);
-    this._views = new Map();
-    this._bgs = new Map();
-  }
-  encode(encoder, sitesBuffer, adamBuffer, splitIndices, statBuffers, splitParams,
-         targetTex, numToSplit) {
-    const entries = [
-      { binding: 0, resource: { buffer: sitesBuffer } },
-      { binding: 1, resource: { buffer: adamBuffer } },
-      { binding: 2, resource: { buffer: splitIndices } },
-      { binding: 3, resource: { buffer: statBuffers[0] } },
-      { binding: 4, resource: { buffer: statBuffers[2] } },
-      { binding: 5, resource: { buffer: statBuffers[3] } },
-      { binding: 6, resource: { buffer: statBuffers[4] } },
-      { binding: 7, resource: { buffer: statBuffers[5] } },
-      { binding: 8, resource: { buffer: statBuffers[6] } },
-      { binding: 9, resource: { buffer: statBuffers[7] } },
-      { binding: 10, resource: { buffer: splitParams } },
-      { binding: 11, resource: getTextureView(this._views, targetTex) },
-    ];
-    const layout = this.pipeline.getBindGroupLayout(0);
-    const bg = getBindGroup(this.device, this._bgs, layout, entries);
-    dispatch1D(encoder, this.pipeline, bg, Math.ceil(numToSplit / 256));
-  }
-}
-
-export class PruneEncoder {
-  constructor(device, shaders) {
-    this.device = device;
-    this.pipeline = makePipeline(device, shaders.PRUNE);
-    this._bgs = new Map();
-  }
-  encode(encoder, sitesBuffer, indices, pruneParams, count) {
-    const entries = [
-      { binding: 0, resource: { buffer: sitesBuffer } },
-      { binding: 1, resource: { buffer: indices } },
-      { binding: 2, resource: { buffer: pruneParams } },
-    ];
-    const layout = this.pipeline.getBindGroupLayout(0);
-    const bg = getBindGroup(this.device, this._bgs, layout, entries);
-    dispatch1D(encoder, this.pipeline, bg, Math.ceil(count / 256));
-  }
-}
-
 export class ClearBufferEncoder {
   constructor(device, shaders, { useI32 = false } = {}) {
     this.device = device;
@@ -412,56 +332,6 @@ export class ClearBufferEncoder {
     const entries = [
       { binding: 0, resource: { buffer } },
       { binding: 1, resource: { buffer: clearParams } },
-    ];
-    const layout = this.pipeline.getBindGroupLayout(0);
-    const bg = getBindGroup(this.device, this._bgs, layout, entries);
-    dispatch1D(encoder, this.pipeline, bg, Math.ceil(count / 256));
-  }
-}
-
-export class ScorePairsEncoder {
-  constructor(device, shaders) {
-    this.device = device;
-    this.densifyPipeline = makePipeline(device, shaders.SCORE_PAIRS_DENSIFY);
-    this.prunePipeline = makePipeline(device, shaders.SCORE_PAIRS_PRUNE);
-    this._bgs = new Map();
-  }
-  encodeDensify(encoder, sitesBuffer, mass, energy, pairs, paramsBuf, pairCount) {
-    const entries = [
-      { binding: 0, resource: { buffer: sitesBuffer } },
-      { binding: 1, resource: { buffer: mass } },
-      { binding: 2, resource: { buffer: energy } },
-      { binding: 3, resource: { buffer: pairs } },
-      { binding: 4, resource: { buffer: paramsBuf } },
-    ];
-    const layout = this.densifyPipeline.getBindGroupLayout(0);
-    const bg = getBindGroup(this.device, this._bgs, layout, entries);
-    dispatch1D(encoder, this.densifyPipeline, bg, Math.ceil(pairCount / 256));
-  }
-  encodePrune(encoder, sitesBuffer, removalDelta, pairs, paramsBuf, pairCount) {
-    const entries = [
-      { binding: 0, resource: { buffer: sitesBuffer } },
-      { binding: 1, resource: { buffer: removalDelta } },
-      { binding: 2, resource: { buffer: pairs } },
-      { binding: 3, resource: { buffer: paramsBuf } },
-    ];
-    const layout = this.prunePipeline.getBindGroupLayout(0);
-    const bg = getBindGroup(this.device, this._bgs, layout, entries);
-    dispatch1D(encoder, this.prunePipeline, bg, Math.ceil(pairCount / 256));
-  }
-}
-
-export class WriteIndicesEncoder {
-  constructor(device, shaders) {
-    this.device = device;
-    this.pipeline = makePipeline(device, shaders.WRITE_INDICES);
-    this._bgs = new Map();
-  }
-  encode(encoder, sortedPairs, indices, paramsBuf, count) {
-    const entries = [
-      { binding: 0, resource: { buffer: sortedPairs } },
-      { binding: 1, resource: { buffer: indices } },
-      { binding: 2, resource: { buffer: paramsBuf } },
     ];
     const layout = this.pipeline.getBindGroupLayout(0);
     const bg = getBindGroup(this.device, this._bgs, layout, entries);
