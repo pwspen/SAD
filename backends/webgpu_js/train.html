@@ -268,7 +268,7 @@
         flex: 1;
         min-height: 0;
         display: grid;
-        grid-template-columns: 1fr 1fr;
+        grid-template-columns: 1fr 1fr 1fr;
         gap: 12px;
         padding: 12px;
         place-items: center;
@@ -295,6 +295,12 @@
         image-rendering: pixelated;
         display: block;
         flex: none;
+      }
+      .canvas-card canvas#psnrCanvas {
+        width: 100%;
+        height: 100%;
+        image-rendering: auto;
+        cursor: crosshair;
       }
       .card-label {
         position: absolute;
@@ -481,6 +487,10 @@
             <canvas id="previewCanvas"></canvas>
             <canvas id="overlayCanvas" style="position:absolute;pointer-events:none"></canvas>
           </div>
+          <div class="canvas-card">
+            <span class="card-label">PSNR vs iteration</span>
+            <canvas id="psnrCanvas"></canvas>
+          </div>
         </div>
 
         <div class="footer">
@@ -491,6 +501,6 @@
       </section>
     </div>
 
-    <script type="module" src="train.js?v=viewer-sync-20260423j"></script>
+    <script type="module" src="train.js?v=psnr-plot-20261016"></script>
   </body>
 </html>

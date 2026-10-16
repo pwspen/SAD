@@ -66,6 +66,9 @@ const state = {
   lastSites: null,
   lastSiteCount: 0,
   lastPsnr: null,        // persists between log ticks so preview updates don't blank the PSNR
+  psnrHistory: [],       // [{ it, psnr }] from log ticks, plotted in the PSNR card
+  psnrIters: 0,
+  psnrHover: null,       // index into psnrHistory under the cursor
 };
 
 const ui = {
@@ -91,6 +94,7 @@ const ui = {
   previewCanvas: document.getElementById("previewCanvas"),
   overlayCanvas: document.getElementById("overlayCanvas"),
   targetCanvas: document.getElementById("targetCanvas"),
+  psnrCanvas: document.getElementById("psnrCanvas"),
   metricRow: document.getElementById("metricRow"),
   progressFill: document.getElementById("progressFill"),
   progressText: document.getElementById("progressText"),
@@ -214,6 +218,190 @@ function updateCanvasLayout(width = state.targetImage?.width, height = state.tar
   fitCanvasToCard(ui.targetCanvas, width || ui.targetCanvas.width, height || ui.targetCanvas.height);
   fitCanvasToCard(ui.previewCanvas, width || ui.previewCanvas.width, height || ui.previewCanvas.height);
   positionOverlay();
+  drawPsnrPlot();
+}
+
+// ---- PSNR vs iteration plot ----
+
+const PSNR_PAD = { left: 46, right: 16, top: 42, bottom: 34 };
+const PSNR_LINE_COLOR = "#e0611a"; // darker accent: >= 3:1 against --canvas-bg
+
+function niceTicks(min, max, count = 5) {
+  const span = max - min;
+  if (!(span > 0)) return [min];
+  const raw = span / count;
+  const mag = 10 ** Math.floor(Math.log10(raw));
+  const norm = raw / mag;
+  const step = (norm < 1.5 ? 1 : norm < 3 ? 2 : norm < 7 ? 5 : 10) * mag;
+  const ticks = [];
+  for (let v = Math.ceil(min / step) * step; v <= max + step * 1e-6; v += step) ticks.push(v);
+  return ticks;
+}
+
+function psnrPlotGeometry() {
+  const canvas = ui.psnrCanvas;
+  const w = canvas.clientWidth;
+  const h = canvas.clientHeight;
+  const data = state.psnrHistory;
+  const xMax = Math.max(1, state.psnrIters, data.length ? data[data.length - 1].it : 0);
+  let yMin = Infinity, yMax = -Infinity;
+  for (const p of data) {
+    yMin = Math.min(yMin, p.psnr);
+    yMax = Math.max(yMax, p.psnr);
+  }
+  if (!Number.isFinite(yMin)) { yMin = 0; yMax = 40; }
+  const yPad = Math.max(0.5, (yMax - yMin) * 0.08);
+  yMin = Math.floor(yMin - yPad);
+  yMax = Math.ceil(yMax + yPad);
+  const plotW = Math.max(1, w - PSNR_PAD.left - PSNR_PAD.right);
+  const plotH = Math.max(1, h - PSNR_PAD.top - PSNR_PAD.bottom);
+  return {
+    w, h, xMax, yMin, yMax,
+    x: (it) => PSNR_PAD.left + (it / xMax) * plotW,
+    y: (v) => PSNR_PAD.top + (1 - (v - yMin) / (yMax - yMin)) * plotH,
+  };
+}
+
+function drawPsnrPlot() {
+  const canvas = ui.psnrCanvas;
+  if (!canvas) return;
+  const w = canvas.clientWidth;
+  const h = canvas.clientHeight;
+  if (w <= 0 || h <= 0) return;
+  const dpr = window.devicePixelRatio || 1;
+  if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) {
+    canvas.width = Math.round(w * dpr);
+    canvas.height = Math.round(h * dpr);
+  }
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+
+  const css = getComputedStyle(document.documentElement);
+  const lineCol = css.getPropertyValue("--line").trim() || "#e6e6df";
+  const dimCol = css.getPropertyValue("--text-dim").trim() || "#66666e";
+  const softCol = css.getPropertyValue("--text-soft").trim() || "#9a9aa2";
+  const textCol = css.getPropertyValue("--text").trim() || "#1d1d1f";
+  const surface = css.getPropertyValue("--canvas-bg").trim() || "#f1f1ec";
+
+  const data = state.psnrHistory;
+  const g = psnrPlotGeometry();
+  const left = PSNR_PAD.left, right = w - PSNR_PAD.right;
+  const top = PSNR_PAD.top, bottom = h - PSNR_PAD.bottom;
+
+  ctx.font = "10.5px Inter, system-ui, -apple-system, sans-serif";
+  ctx.lineWidth = 1;
+
+  // Horizontal grid + y labels
+  ctx.textAlign = "right";
+  ctx.textBaseline = "middle";
+  for (const v of niceTicks(g.yMin, g.yMax, Math.max(2, Math.floor((bottom - top) / 48)))) {
+    const y = Math.round(g.y(v)) + 0.5;
+    ctx.strokeStyle = lineCol;
+    ctx.beginPath(); ctx.moveTo(left, y); ctx.lineTo(right, y); ctx.stroke();
+    ctx.fillStyle = softCol;
+    ctx.fillText(String(Math.round(v * 10) / 10), left - 6, y);
+  }
+
+  // Baseline + x labels
+  ctx.strokeStyle = softCol;
+  ctx.beginPath(); ctx.moveTo(left, bottom + 0.5); ctx.lineTo(right, bottom + 0.5); ctx.stroke();
+  ctx.textAlign = "center";
+  ctx.textBaseline = "top";
+  ctx.fillStyle = softCol;
+  for (const v of niceTicks(0, g.xMax, Math.max(2, Math.floor((right - left) / 70)))) {
+    ctx.fillText(v >= 10000 ? `${v / 1000}k` : String(v), g.x(v), bottom + 6);
+  }
+
+  // Axis titles
+  ctx.fillStyle = dimCol;
+  ctx.fillText("iteration", (left + right) / 2, bottom + 20);
+  ctx.save();
+  ctx.translate(12, (top + bottom) / 2);
+  ctx.rotate(-Math.PI / 2);
+  ctx.textBaseline = "middle";
+  ctx.fillText("PSNR (dB)", 0, 0);
+  ctx.restore();
+
+  if (!data.length) {
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillStyle = softCol;
+    ctx.fillText(state.running ? "Waiting for first log tick…" : "Train to see PSNR", (left + right) / 2, (top + bottom) / 2);
+    return;
+  }
+
+  // Series line
+  ctx.strokeStyle = PSNR_LINE_COLOR;
+  ctx.lineWidth = 2;
+  ctx.lineJoin = "round";
+  ctx.lineCap = "round";
+  ctx.beginPath();
+  data.forEach((p, i) => {
+    const x = g.x(p.it), y = g.y(p.psnr);
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  });
+  ctx.stroke();
+
+  const drawMarker = (p) => {
+    ctx.beginPath();
+    ctx.arc(g.x(p.it), g.y(p.psnr), 4, 0, Math.PI * 2);
+    ctx.fillStyle = PSNR_LINE_COLOR;
+    ctx.fill();
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = surface;
+    ctx.stroke();
+  };
+
+  const hover = state.psnrHover != null ? data[state.psnrHover] : null;
+  if (!hover) {
+    drawMarker(data[data.length - 1]);
+    return;
+  }
+
+  // Crosshair + tooltip
+  const hx = Math.round(g.x(hover.it)) + 0.5;
+  ctx.strokeStyle = softCol;
+  ctx.lineWidth = 1;
+  ctx.setLineDash([3, 3]);
+  ctx.beginPath(); ctx.moveTo(hx, top); ctx.lineTo(hx, bottom); ctx.stroke();
+  ctx.setLineDash([]);
+  drawMarker(hover);
+
+  const label = `iter ${hover.it} · ${hover.psnr.toFixed(2)} dB`;
+  ctx.font = "11px Inter, system-ui, -apple-system, sans-serif";
+  const tw = ctx.measureText(label).width + 14;
+  const th = 22;
+  let tx = hx + 10;
+  if (tx + tw > right) tx = hx - 10 - tw;
+  const ty = Math.max(top, Math.min(bottom - th, g.y(hover.psnr) - th - 8));
+  ctx.fillStyle = "rgba(255, 255, 255, 0.94)";
+  ctx.strokeStyle = lineCol;
+  ctx.beginPath();
+  ctx.roundRect(tx, ty, tw, th, 5);
+  ctx.fill();
+  ctx.stroke();
+  ctx.fillStyle = textCol;
+  ctx.textAlign = "left";
+  ctx.textBaseline = "middle";
+  ctx.fillText(label, tx + 7, ty + th / 2);
+}
+
+function handlePsnrHover(ev) {
+  const data = state.psnrHistory;
+  if (!data.length) return;
+  const rect = ui.psnrCanvas.getBoundingClientRect();
+  const mx = ev.clientX - rect.left;
+  const g = psnrPlotGeometry();
+  let best = 0, bestDist = Infinity;
+  for (let i = 0; i < data.length; i++) {
+    const d = Math.abs(g.x(data[i].it) - mx);
+    if (d < bestDist) { bestDist = d; best = i; }
+  }
+  if (state.psnrHover !== best) {
+    state.psnrHover = best;
+    drawPsnrPlot();
+  }
 }
 
 function drawTarget() {
@@ -335,6 +523,11 @@ async function startTraining() {
   if (init) init = overrideInitLogTau(init, args.initLogTau);
   const initSiteCount = init ? init.count : args.sites;
 
+  state.psnrHistory = [];
+  state.psnrIters = args.iters;
+  state.psnrHover = null;
+  drawPsnrPlot();
+
   appendLog(`Target: ${width}×${height} | sites: ${initSiteCount} | iters: ${args.iters} | bpp: ${args.targetBpp > 0 ? args.targetBpp : "off"} | log: ${args.logFreq} | view: ${args.viewerFreq}`);
   updateProgress(0, args.iters, "Preparing…");
 
@@ -351,6 +544,10 @@ async function startTraining() {
         state.lastSites = info.sitesData;
         state.lastSiteCount = info.totalSites;
         state.lastPsnr = info.psnr;
+        if (Number.isFinite(info.psnr)) {
+          state.psnrHistory.push({ it: info.it, psnr: info.psnr });
+          drawPsnrPlot();
+        }
         state.lastHashed = null;
         state.lastHeatmap = null;
         updateProgress(info.it + 1, info.iters,
@@ -610,12 +807,21 @@ async function main() {
     }
   });
   ui.viewMode.addEventListener("change", drawView);
+  ui.psnrCanvas.addEventListener("mousemove", handlePsnrHover);
+  ui.psnrCanvas.addEventListener("mouseleave", () => {
+    state.psnrHover = null;
+    drawPsnrPlot();
+  });
   window.addEventListener("resize", () => {
     requestAnimationFrame(() => {
       if (state.targetImage) updateCanvasLayout(state.targetImage.width, state.targetImage.height);
-      else positionOverlay();
+      else {
+        positionOverlay();
+        drawPsnrPlot();
+      }
     });
   });
+  drawPsnrPlot();
 }
 
 main();
