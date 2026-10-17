@@ -1,6 +1,4 @@
 // Texture creation + image ↔ rgba32float helpers.
-// Equivalent of the inline texture calls and sad_shared.py's
-// write_texture_rgba32float / read_texture_rgba32float.
 
 export function createRgba32FloatTexture(device, width, height, { storage = true, copyDst = true, copySrc = false } = {}) {
   let usage = GPUTextureUsage.TEXTURE_BINDING;

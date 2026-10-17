@@ -3,7 +3,7 @@
 Browser tools backed by the shared WGSL kernels:
 
 - `index.html` - **viewer** for `*_sites.txt` files (renderer-only)
-- `train.html` - **trainer** (direct JS port of `backends/webgpu_py/train_wgpu.py`)
+- `train.html` - **trainer** (originally ported from the wgpu-py trainer at the `multi-backend` tag)
 - `bench.html` - automated browser benchmark harness for the trainer modules
 
 Both pages use the shared SAD WGSL kernels under `backends/shared/` and hyperparameters from `training_config.json`.
@@ -27,7 +27,7 @@ Both pages use the shared SAD WGSL kernels under `backends/shared/` and hyperpar
 ## Trainer (`train.html`)
 
 - Pick a target image (and optional mask / init-sites file).
-- Edit hyperparameters in the left panel (they mirror the CLI flags in `train_wgpu.py`; values are pre-filled from `training_config.json`).
+- Edit hyperparameters in the left panel (values are pre-filled from `training_config.json`).
 - The site count is fixed for the whole run: the JS trainer has no densify/prune (and so no target-bpp). Defaults: `iters` 10000, `sites` 1000, `log-freq` 50, `viewer-freq` 50.
 - Click **Train**. `viewer-freq` controls visual refreshes, while `log-freq` controls PSNR log lines (`Iter N | PSNR: X dB | Active: a/t | it/s | seconds`).
 - **Export PNG** / **Export sites.txt** produce the same formats the Python and Metal trainers write.

@@ -416,8 +416,8 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
 `;
 
 // Voronoi-diagram visualization: same softmax blending as render_compute, but
-// substitutes each candidate site's color with hashColor(siteId). Mirrors the
-// Metal `renderVoronoiHashed` kernel (backends/metal/shaders/encoders/render_encoder.metal).
+// substitutes each candidate site's color with hashColor(siteId), like the
+// former Metal `renderVoronoiHashed` kernel.
 export const RENDER_HASHED_OVERRIDE = `
 @group(0) @binding(0) var<storage, read> sites : array<Site>;
 @group(0) @binding(1) var<uniform> params : Params;

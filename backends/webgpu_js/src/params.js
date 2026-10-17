@@ -1,5 +1,5 @@
-// Direct port of backends/webgpu_py/sad_shared.py + the per-pipeline param
-// buffer creators sprinkled through backends/webgpu_py/train_wgpu.py.
+// Uniform/param buffer creators for every pipeline (originally ported from
+// wgpu-py's sad_shared.py and train_wgpu.py).
 // Every struct layout here matches the WGSL declarations in sad_shared.wgsl.
 
 export const SITE_FLOATS = 10;

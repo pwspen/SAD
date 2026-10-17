@@ -1,4 +1,4 @@
-// Direct port of backends/webgpu_py/encoders.py.
+// Pipeline + bind-group wrappers (originally ported from wgpu-py's encoders.py).
 // One class per WGSL kernel entry point; bindings match the WGSL @group(0)
 // declarations one-for-one.
 

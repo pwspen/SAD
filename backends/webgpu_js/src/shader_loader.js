@@ -1,4 +1,4 @@
-// Direct port of backends/webgpu_py/sad_shaders.py.
+// WGSL assembly (originally ported from wgpu-py's sad_shaders.py).
 // Fetches sad_shared.wgsl (the COMMON block between // BEGIN COMMON / // END COMMON)
 // and concatenates it with each per-kernel snippet from backends/shared/wgsl/*.wgsl.
 // Some kernels (gradients_tiled, adam, tau_extract, tau_writeback) are replaced

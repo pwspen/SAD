@@ -1,6 +1,5 @@
 // Sites .txt parsing + serialization. PNG download helper.
-// Direct port of the corresponding functions in backends/webgpu_py/train_wgpu.py:
-// load_sites_txt, write_sites_txt.
+// The .txt format matches what the former native backends read and wrote.
 
 import { SITE_FLOATS } from "./params.js";
 

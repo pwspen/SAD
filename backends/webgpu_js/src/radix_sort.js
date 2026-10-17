@@ -1,4 +1,4 @@
-// Direct port of backends/webgpu_py/radix_sort.py.
+// GPU radix sort of (key, value) u32 pairs.
 
 export class RadixSortUInt2 {
   constructor(device, shaders, paddedCount) {

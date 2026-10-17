@@ -1,103 +1,49 @@
 # SAD: Soft Anisotropic Diagrams
 
-Code for the paper _Soft Anisotropic Diagrams for Differentiable Image Representation_, with Metal, WGPU, CUDA, PyTorch, and browser backends.
+Code for the paper _Soft Anisotropic Diagrams for Differentiable Image Representation_, implemented in WebGPU. It runs in the browser and headless under Node.
 
 Project page: https://luckyiyi.github.io/SAD/
 
-## Run
+The Metal, CUDA, PyTorch and wgpu-py backends, along with the `run.sh` / `install.sh` /
+`reproduce_table4.sh` scripts, were removed after the `multi-backend` tag. Check out that
+tag to reproduce the paper's numbers with the native backends:
 
 ```bash
-./run.sh /path/to/image.png
-./run.sh /path/to/image.png --backend auto
-./run.sh /path/to/image.png --backend metal
-./run.sh /path/to/image.png --backend cuda
-./run.sh /path/to/image.png --backend wgpu
-./run.sh /path/to/image.png --backend pytorch --target-bpp 2.0
+git checkout multi-backend
 ```
 
-Backend options: `auto`, `metal`, `wgpu`, `cuda`, `pytorch`.
-Compatibility note: `--backend webgpu` is still accepted and maps to `wgpu`.
-Default training targets `DEFAULT_TARGET_BPP=1.0` from `training_config.json`; pass `--target-bpp` to override it.
-Pass an image path explicitly; `run.sh` only uses `test.png` when that file exists at the repo root.
-Default training output is intentionally small: a reconstruction PNG and a `*_sites.txt` file.
-Metal can also write debug cells and tau heatmaps with `--include-debug-mask`.
+## Train in the Browser
 
-## Install
-
-`run.sh` is the preferred entry point on a new machine. It builds native
-backends automatically when sources changed and, if no usable backend is found,
-bootstraps Python backend dependencies through `install.sh`. Set
-`SAD_NO_AUTO_INSTALL=1` to disable automatic Python package installs.
-
-Manual install is still available:
+Serve the repository over HTTP. ES modules and `fetch` don't work from `file://`.
 
 ```bash
-./install.sh --backend auto
+python3 -m http.server 8000
 ```
 
-Or install a specific backend:
+Then open:
+
+- http://localhost:8000/backends/webgpu_js/train.html: interactive trainer
+- http://localhost:8000/backends/webgpu_js/index.html: viewer for saved `*_sites.txt` files
+- http://localhost:8000/backends/webgpu_js/bench.html?image=../../test.png: scripted benchmark
+
+## Headless Sweeps (Node)
 
 ```bash
-./install.sh --backend metal
-./install.sh --backend cuda
-./install.sh --backend wgpu
-./install.sh --backend pytorch
+cd backends/webgpu_js/node
+npm install
+node sweep.mjs --image /path/to/image.png --set sites=500,1000,2000 --set lrPosBase=0.025,0.05
 ```
 
-Notes:
-- Metal requires macOS + Xcode command line tools (`xcode-select --install`).
-- `./build.sh` and `./install.sh --backend metal` build the Metal executable into `build/metal/`.
-- CUDA requires a CUDA toolkit with `nvcc` on PATH and CMake 3.20+.
-- WGPU (wgpu-py) installs Python deps from `backends/webgpu_py/requirements.txt`.
-- PyTorch requires Python 3.9+, PyTorch, CMake 3.26+, and Metal or CUDA.
+Each run appends one JSON line with its args, PSNR curve and timing to `results/`.
+Run `node sweep.mjs --help` for every option.
 
-## Render From Saved Sites
+## Layout
 
-All backends support render-only mode from a saved `*_sites.txt`:
-
-```bash
-./run.sh --render /path/to/sites.txt --backend metal
-./run.sh --render /path/to/sites.txt --backend cuda --width 1024 --height 1024
-./run.sh --render /path/to/sites.txt --backend wgpu --width 1024 --height 1024
-./run.sh --render /path/to/sites.txt --backend pytorch --width 1024 --height 1024
-```
-
-Metal also has a convenience script:
-
-```bash
-./render.sh results/foo_sites.txt --width 1024 --height 1024
-```
-
-## Viewer
-
-Open `backends/webgpu_js/index.html` in a WebGPU-capable browser, load a `*_sites.txt`,
-and inspect the forward pass with render modes, optional site dots, and PNG export.
+- `backends/webgpu_js/` contains the trainer (`src/`), the browser pages, and the Node runner (`node/`).
+  See `backends/webgpu_js/README.md`.
+- `backends/shared/` contains the WGSL kernels.
+- `training_config.json` holds the hyperparameter defaults read by both hosts.
 
 ## Browser Demo
 
 The hosted demo is available from the project page: https://luckyiyi.github.io/SAD/
-
-## Reproducing Results
-
-Run the Table 4 Kodak evaluation from the repository root:
-
-```bash
-./reproduce_table4.sh
-```
-
-The script downloads the 24 [Kodak images](https://r0k.us/graphics/kodak/),
-trains them at 16.0 BPP using `training_config.json`, and reports the mean PSNR.
-Inputs, reconstructions, `*_sites.txt` files, and the summary are written to
-`results/reproduction/table4/`.
-
-## Backends
-
-Each backend has its own README with setup, build, and usage details:
-
-- `backends/metal/README.md` (Swift + Metal)
-- `backends/cuda/README.md` (C++/CUDA)
-- `backends/pytorch/README.md` (PyTorch MPS/CUDA extension)
-- `backends/webgpu_py/README.md` (wgpu-py training)
-- `backends/webgpu_js/README.md` (browser viewer, trainer, and demo)
-
-See `backends/README.md` for an overview.

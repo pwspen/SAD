@@ -1,6 +1,6 @@
-// Port of backends/webgpu_py/train_wgpu.py main() training loop, minus
-// densify/prune: the JS trainer optimizes a fixed site count for the whole run.
-// The remaining stages mirror the Python source — keep them lined up.
+// SAD training loop. Originally ported from the wgpu-py trainer (train_wgpu.py
+// at the `multi-backend` tag), minus densify/prune: it optimizes a fixed site
+// count for the whole run.
 
 import {
   SITE_FLOATS,
@@ -660,9 +660,8 @@ export class Trainer {
   }
 
   _taskHeatmapParamsBuffer() {
-    // Compute tau min / mean / max from the last-read sites — Metal does the
-    // same scan before every heatmap render. Dot radius scales with resolution
-    // like `backends/metal/sources/training/training.swift` (`centroidRadius = 2.0`).
+    // Compute tau min / mean / max from the last-read sites before every
+    // heatmap render, as the former Metal backend did.
     if (!this._tauHeatBuf) {
       this._tauHeatBuf = this.device.createBuffer({
         size: 16,

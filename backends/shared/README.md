@@ -1,9 +1,9 @@
 # Shared WGSL
 
-This folder holds WGSL sources shared by the WebGPU backends:
+This folder holds the WGSL sources loaded by `backends/webgpu_js/`:
 
-- The top-level shared WGSL source contains common structs/helpers and the JS viewer kernels for SAD's soft anisotropic site scoring.
-- `wgsl/` contains per-kernel snippets used by the Python WebGPU trainer.
+- `sad_shared.wgsl` contains common structs/helpers (the `COMMON` block) and the viewer kernels for SAD's soft anisotropic site scoring.
+- `wgsl/` contains the per-kernel bodies that the trainer concatenates with `COMMON`. `gradients_tiled`, `adam`, `tau_extract` and `tau_writeback` are currently superseded by the versions in `webgpu_js/src/wgsl_overrides.js`.
 
 ## Regenerate JS Shader Bundle
 
