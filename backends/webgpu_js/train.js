@@ -4,6 +4,7 @@
 // side-by-side target vs reconstruction view, both aspect-fit.
 
 import { loadShaders, tileSlotsForLimit } from "./src/shader_loader.js?v=adam-bounds-20261016b";
+import { requestTrainingDevice } from "./src/device.js?v=adam-bounds-20261016b";
 import { Trainer, buildArgs, GRAD_GROUPS } from "./src/trainer.js?v=adam-bounds-20261016b";
 import { loadImageToFloat32, loadMaskRgba32Float, whiteMaskRgba32Float } from "./src/textures.js?v=adam-bounds-20261016b";
 import { loadSitesFromFile, serializeSitesTxt, triggerDownload, floatImageToRgba8 } from "./src/io.js?v=adam-bounds-20261016b";
@@ -118,18 +119,7 @@ function readFormArgs() {
 }
 
 async function initDevice() {
-  if (!navigator.gpu) throw new Error("WebGPU not available.");
-  const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
-  if (!adapter) throw new Error("No WebGPU adapter.");
-  const want = Math.max(12, adapter.limits.maxStorageBuffersPerShaderStage || 8);
-  const required = {
-    maxStorageBuffersPerShaderStage: Math.min(want, adapter.limits.maxStorageBuffersPerShaderStage),
-    maxBufferSize: Math.min(1 << 30, adapter.limits.maxBufferSize),
-    maxStorageBufferBindingSize: Math.min(1 << 30, adapter.limits.maxStorageBufferBindingSize),
-    // Room for the 256-slot gradient tile table when the adapter allows it.
-    maxComputeWorkgroupStorageSize: Math.min(32768, adapter.limits.maxComputeWorkgroupStorageSize),
-  };
-  const device = await adapter.requestDevice({ requiredLimits: required });
+  const { device } = await requestTrainingDevice(navigator.gpu);
   device.lost.then((info) => appendLog(`Device lost: ${info.reason} ${info.message}`));
   device.addEventListener?.("uncapturederror", (e) => {
     appendLog(`GPU error: ${e.error?.message || e.error}`);

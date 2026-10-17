@@ -41,6 +41,8 @@ const SHADER_FILES = [
 
 let _cache = null;
 
+// Default reader for the browser. Node passes its own `readText` (fs-backed),
+// since fetch() can't read file: URLs there.
 async function fetchText(url) {
   // Cache-bust so local shader edits always take effect on reload.
   const bust = new URL(url);
@@ -64,15 +66,16 @@ function extractCommon(source) {
 }
 
 // tileSlots: gradient tile hash size (see tileSlotsForLimit in wgsl_overrides.js).
-export async function loadShaders({ tileSlots = 128 } = {}) {
+// readText: async (URL) => string; defaults to fetch().
+export async function loadShaders({ tileSlots = 128, readText = fetchText } = {}) {
   if (_cache && _cache.tileSlots === tileSlots) return _cache;
 
-  const commonSource = await fetchText(COMMON_URL);
+  const commonSource = await readText(COMMON_URL);
   const common = extractCommon(commonSource);
 
   const snippets = await Promise.all(
     SHADER_FILES.map((name) =>
-      fetchText(new URL(`${name}.wgsl`, WGSL_DIR_URL)).then((text) => [name, text])
+      readText(new URL(`${name}.wgsl`, WGSL_DIR_URL)).then((text) => [name, text])
     )
   );
 

@@ -34,6 +34,7 @@
       import { loadShaders, tileSlotsForLimit } from "./src/shader_loader.js?v=adam-bounds-20261016b";
       import { Trainer, buildArgs } from "./src/trainer.js?v=adam-bounds-20261016b";
       import { loadImageToFloat32 } from "./src/textures.js?v=adam-bounds-20261016b";
+      import { requestTrainingDevice, adapterLabel } from "./src/device.js?v=adam-bounds-20261016b";
 
       const logEl = document.getElementById("log");
       const summaryEl = document.getElementById("summary");
@@ -68,20 +69,7 @@
       }
 
       async function initDevice() {
-        if (!navigator.gpu) throw new Error("WebGPU not available in this browser.");
-        const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
-        if (!adapter) throw new Error("No WebGPU adapter found.");
-        const requiredLimits = {
-          maxStorageBuffersPerShaderStage: Math.min(
-            Math.max(12, adapter.limits.maxStorageBuffersPerShaderStage || 8),
-            adapter.limits.maxStorageBuffersPerShaderStage,
-          ),
-          maxBufferSize: Math.min(1 << 30, adapter.limits.maxBufferSize),
-          maxStorageBufferBindingSize: Math.min(1 << 30, adapter.limits.maxStorageBufferBindingSize),
-          maxComputeWorkgroupStorageSize: Math.min(32768, adapter.limits.maxComputeWorkgroupStorageSize),
-        };
-        const device = await adapter.requestDevice({ requiredLimits });
-        return { adapter, device };
+        return await requestTrainingDevice(navigator.gpu);
       }
 
       async function run() {
@@ -113,7 +101,7 @@
         log(`Image | ${target.width}x${target.height}`);
 
         const { adapter, device } = await initDevice();
-        log(`Device | ${adapter.info?.device || adapter.info?.description || adapter.info?.vendor || "unknown"}`);
+        log(`Device | ${adapterLabel(adapter)}`);
 
         const shaders = await loadShaders({
           tileSlots: tileSlotsForLimit(device.limits.maxComputeWorkgroupStorageSize),

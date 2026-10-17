@@ -257,6 +257,7 @@ export class Trainer {
                            this.targetTex, this.maskTex, initSiteCount);
       device.queue.submit([encoder.finish()]);
       const sitesData = await readSites(device, this.sitesBuf, initSiteCount);
+      initParamsBuf.destroy();
       this.actualSites = initSiteCount;
       this.activeEstimate = 0;
       for (let i = 0; i < initSiteCount; i += 1) {
@@ -711,6 +712,35 @@ export class Trainer {
       bestPsnr: this.bestPsnr,
       trainSeconds: (performance.now() - this.trainStartMs) / 1000,
     };
+  }
+
+  // Free every GPU buffer/texture this trainer allocated, so sweeps can run
+  // many trainers on one device. Call after run()/finalize() have resolved;
+  // the trainer is unusable afterwards. Safe to call more than once.
+  destroy() {
+    if (this._destroyed) return;
+    this._destroyed = true;
+    const owned = [
+      this.targetTex, this.maskTex, this.renderTex,
+      this.cand0A, this.cand0B, this.cand1A, this.cand1B,
+      this.sitesBuf, this.packedSitesBuf, this.adamBuf, this.seedCounter, this.grads,
+      this.tauGradRaw, this.tauGradTmp, this.tauGradTmp2,
+      ...(this.candParams || []),
+      this.renderParams, this.gradParams, this.adamParams,
+      this.countParams, this.gradCountParams, this.tauParams,
+      this.dummyHilbertBuf, this.hilbertParams, this._tauHeatBuf,
+    ];
+    if (this.hilbertRes) {
+      owned.push(this.hilbertRes.pairs, this.hilbertRes.order, this.hilbertRes.pos);
+    }
+    if (this.hilbertSort) {
+      const s = this.hilbertSort;
+      owned.push(s.histBuffer, s.blockSums, s.scratch, ...s.paramsBuffers);
+    }
+    for (const res of owned) res?.destroy();
+    this.target = null;
+    this.maskCpu = null;
+    this._lastSitesCpu = null;
   }
 }
 

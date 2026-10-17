@@ -1,0 +1,13 @@
+{
+  "name": "sad-webgpu-node",
+  "private": true,
+  "type": "module",
+  "description": "Headless Node runner for the SAD WebGPU JS trainer (Dawn bindings).",
+  "scripts": {
+    "sweep": "node sweep.mjs"
+  },
+  "dependencies": {
+    "pngjs": "7.0.0",
+    "webgpu": "0.6.2"
+  }
+}
