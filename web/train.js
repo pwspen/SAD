@@ -104,6 +104,7 @@ const ui = {
   overlayCanvas: document.getElementById("overlayCanvas"),
   targetCanvas: document.getElementById("targetCanvas"),
   residualCanvas: document.getElementById("residualCanvas"),
+  importanceCanvas: document.getElementById("importanceCanvas"),
   psnrCanvas: document.getElementById("psnrCanvas"),
   bppCanvas: document.getElementById("bppCanvas"),
   gradCanvas: document.getElementById("gradCanvas"),
@@ -185,7 +186,7 @@ function fitCanvasToCard(canvas, width = canvas.width, height = canvas.height) {
 
 function updateCanvasLayout(width = state.targetImage?.width, height = state.targetImage?.height) {
   const cards = [ui.targetCanvas.parentElement, ui.previewCanvas.parentElement,
-    ui.residualCanvas.parentElement];
+    ui.residualCanvas.parentElement, ui.importanceCanvas.parentElement];
   for (const card of cards) {
     card.style.removeProperty("aspect-ratio");
     card.style.removeProperty("width");
@@ -194,6 +195,7 @@ function updateCanvasLayout(width = state.targetImage?.width, height = state.tar
   fitCanvasToCard(ui.targetCanvas, width || ui.targetCanvas.width, height || ui.targetCanvas.height);
   fitCanvasToCard(ui.previewCanvas, width || ui.previewCanvas.width, height || ui.previewCanvas.height);
   fitCanvasToCard(ui.residualCanvas, width || ui.residualCanvas.width, height || ui.residualCanvas.height);
+  fitCanvasToCard(ui.importanceCanvas, width || ui.importanceCanvas.width, height || ui.importanceCanvas.height);
   positionOverlay();
   drawPsnrPlot();
   drawBppPlot();
@@ -915,6 +917,147 @@ function drawTarget() {
   drawToCanvas(ui.targetCanvas, data, width, height);
 }
 
+// Multi-scale importance map (visualization only — not used by the optimizer).
+// Luma Laplacian pyramid L_k = G_k − up(G_{k+1}); each band's energy L_k² is
+// upsampled to full res and combined as
+//   w = mask · (ε + sqrt(Σ_k β_k · up(L_k²)))^γ
+// so smooth large-scale structure (coarse bands) counts as well as fine edges.
+const IMPORTANCE_LEVELS = 6;
+const IMPORTANCE_BAND_WEIGHTS = [0.5, 1, 1, 1, 1, 1]; // β_k, finest band first
+const IMPORTANCE_GAMMA = 1.0;
+const IMPORTANCE_EPS = 1e-3;
+const IMPORTANCE_DISPLAY_PCT = 0.995; // map this percentile to the top of the ramp
+const IMPORTANCE_STOPS = [ // viridis-like, to keep it distinct from the residual card
+  [0.00, [68, 1, 84]],
+  [0.25, [59, 82, 139]],
+  [0.50, [33, 145, 140]],
+  [0.75, [94, 201, 98]],
+  [1.00, [253, 231, 37]],
+];
+const IMPORTANCE_LUT = (() => {
+  const lut = new Uint8Array(256 * 3);
+  for (let i = 0; i < 256; i += 1) {
+    const t = i / 255;
+    let k = 1;
+    while (k < IMPORTANCE_STOPS.length - 1 && IMPORTANCE_STOPS[k][0] < t) k += 1;
+    const [t0, c0] = IMPORTANCE_STOPS[k - 1];
+    const [t1, c1] = IMPORTANCE_STOPS[k];
+    const f = (t - t0) / (t1 - t0);
+    for (let c = 0; c < 3; c += 1) lut[i * 3 + c] = Math.round(c0[c] + (c1[c] - c0[c]) * f);
+  }
+  return lut;
+})();
+
+// Separable [1 4 6 4 1]/16 blur followed by 2× decimation (clamped edges).
+function pyrDown(src, w, h) {
+  const k = [1 / 16, 4 / 16, 6 / 16, 4 / 16, 1 / 16];
+  const dw = Math.ceil(w / 2);
+  const dh = Math.ceil(h / 2);
+  const tmp = new Float32Array(dw * h);
+  for (let y = 0; y < h; y += 1) {
+    for (let dx = 0; dx < dw; dx += 1) {
+      const x = dx * 2;
+      let s = 0;
+      for (let t = -2; t <= 2; t += 1) {
+        const xx = Math.min(w - 1, Math.max(0, x + t));
+        s += k[t + 2] * src[y * w + xx];
+      }
+      tmp[y * dw + dx] = s;
+    }
+  }
+  const out = new Float32Array(dw * dh);
+  for (let dy = 0; dy < dh; dy += 1) {
+    const y = dy * 2;
+    for (let dx = 0; dx < dw; dx += 1) {
+      let s = 0;
+      for (let t = -2; t <= 2; t += 1) {
+        const yy = Math.min(h - 1, Math.max(0, y + t));
+        s += k[t + 2] * tmp[yy * dw + dx];
+      }
+      out[dy * dw + dx] = s;
+    }
+  }
+  return { data: out, width: dw, height: dh };
+}
+
+// Bilinear resample of a (sw×sh) grid onto (w×h), pixel-center aligned.
+function upsampleBilinear(src, sw, sh, w, h) {
+  const out = new Float32Array(w * h);
+  const sx = sw / w;
+  const sy = sh / h;
+  for (let y = 0; y < h; y += 1) {
+    const fy = Math.min(sh - 1, Math.max(0, (y + 0.5) * sy - 0.5));
+    const y0 = Math.floor(fy);
+    const y1 = Math.min(sh - 1, y0 + 1);
+    const ty = fy - y0;
+    for (let x = 0; x < w; x += 1) {
+      const fx = Math.min(sw - 1, Math.max(0, (x + 0.5) * sx - 0.5));
+      const x0 = Math.floor(fx);
+      const x1 = Math.min(sw - 1, x0 + 1);
+      const tx = fx - x0;
+      const a = src[y0 * sw + x0] + (src[y0 * sw + x1] - src[y0 * sw + x0]) * tx;
+      const b = src[y1 * sw + x0] + (src[y1 * sw + x1] - src[y1 * sw + x0]) * tx;
+      out[y * w + x] = a + (b - a) * ty;
+    }
+  }
+  return out;
+}
+
+function computeImportanceMap(rgbaF, width, height, maskRgba) {
+  const n = width * height;
+  let level = { data: new Float32Array(n), width, height };
+  for (let p = 0, i = 0; p < n; p += 1, i += 4) {
+    level.data[p] = 0.299 * rgbaF[i] + 0.587 * rgbaF[i + 1] + 0.114 * rgbaF[i + 2];
+  }
+  const energy = new Float32Array(n);
+  for (let k = 0; k < IMPORTANCE_LEVELS; k += 1) {
+    if (level.width < 2 || level.height < 2) break;
+    const next = pyrDown(level.data, level.width, level.height);
+    const up = upsampleBilinear(next.data, next.width, next.height, level.width, level.height);
+    const band = new Float32Array(level.width * level.height);
+    for (let p = 0; p < band.length; p += 1) {
+      const l = level.data[p] - up[p];
+      band[p] = l * l;
+    }
+    const full = k === 0 ? band : upsampleBilinear(band, level.width, level.height, width, height);
+    const beta = IMPORTANCE_BAND_WEIGHTS[k] ?? 1;
+    for (let p = 0; p < n; p += 1) energy[p] += beta * full[p];
+    level = next;
+  }
+  const out = new Float32Array(n);
+  for (let p = 0; p < n; p += 1) {
+    const m = maskRgba ? maskRgba[p * 4] : 1;
+    out[p] = m * Math.pow(IMPORTANCE_EPS + Math.sqrt(energy[p]), IMPORTANCE_GAMMA);
+  }
+  return out;
+}
+
+function drawImportance() {
+  const target = state.targetImage;
+  if (!target) return;
+  const { data, width, height } = target;
+  const n = width * height;
+  const maskRgba = state.maskData?.rgba?.length === n * 4 ? state.maskData.rgba : null;
+  const w = computeImportanceMap(data, width, height, maskRgba);
+  const sorted = Float32Array.from(w).sort();
+  const top = sorted[Math.min(n - 1, Math.floor(IMPORTANCE_DISPLAY_PCT * n))] || 1;
+  const out = new Uint8ClampedArray(n * 4);
+  for (let p = 0, i = 0; p < n; p += 1, i += 4) {
+    const idx = Math.min(255, Math.round((w[p] / top) * 255)) * 3;
+    out[i] = IMPORTANCE_LUT[idx];
+    out[i + 1] = IMPORTANCE_LUT[idx + 1];
+    out[i + 2] = IMPORTANCE_LUT[idx + 2];
+    out[i + 3] = 255;
+  }
+  const canvas = ui.importanceCanvas;
+  if (canvas.width !== width || canvas.height !== height) {
+    canvas.width = width;
+    canvas.height = height;
+  }
+  fitCanvasToCard(canvas, width, height);
+  canvas.getContext("2d").putImageData(new ImageData(out, width, height), 0, 0);
+}
+
 async function handleImageInput(ev) {
   const file = ev.target.files[0];
   if (!file) return;
@@ -974,6 +1117,7 @@ async function setTarget(file, name, token = ++state.targetToken) {
     state.bppHover = null;
     drawBppPlot();
     drawTarget();
+    drawImportance();
     // Blank the preview canvas to same size so layout matches immediately.
     ui.previewCanvas.width = img.width;
     ui.previewCanvas.height = img.height;
@@ -1006,6 +1150,7 @@ async function handleMaskInput(ev) {
     state.maskData = await loadMaskRgba32Float(file, state.targetImage.width, state.targetImage.height);
     ui.maskLabel.textContent = file.name;
     appendLog(`Mask loaded (sum=${state.maskData.maskSum}).`);
+    drawImportance();
   } catch (err) {
     appendLog(`Mask load failed: ${err.message}`);
   }

@@ -237,7 +237,7 @@
         flex: 1;
         min-height: 0;
         display: grid;
-        grid-template-columns: repeat(5, 1fr);
+        grid-template-columns: repeat(6, 1fr);
         grid-auto-rows: max-content; /* cards are overflow:hidden, so rows would otherwise shrink */
         gap: 12px;
         padding: 12px;
@@ -478,6 +478,10 @@
           <div class="canvas-card">
             <span class="card-label">Residual |recon − target|</span>
             <canvas id="residualCanvas"></canvas>
+          </div>
+          <div class="canvas-card">
+            <span class="card-label">Importance (Laplacian bands)</span>
+            <canvas id="importanceCanvas"></canvas>
           </div>
           <div class="canvas-card">
             <span class="card-label">PSNR vs iteration</span>
