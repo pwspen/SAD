@@ -98,16 +98,8 @@ const ui = {
   savePng: document.getElementById("savePng"),
   saveTxt: document.getElementById("saveTxt"),
   paramsPanel: document.getElementById("paramsPanel"),
-  viewMode: document.getElementById("viewMode"),
-  previewLabel: document.getElementById("previewLabel"),
-  previewCanvas: document.getElementById("previewCanvas"),
-  overlayCanvas: document.getElementById("overlayCanvas"),
-  targetCanvas: document.getElementById("targetCanvas"),
-  residualCanvas: document.getElementById("residualCanvas"),
-  importanceCanvas: document.getElementById("importanceCanvas"),
-  psnrCanvas: document.getElementById("psnrCanvas"),
-  bppCanvas: document.getElementById("bppCanvas"),
-  gradCanvas: document.getElementById("gradCanvas"),
+  layoutSelect: document.getElementById("layoutSelect"),
+  canvases: document.getElementById("canvases"),
   metricRow: document.getElementById("metricRow"),
   progressFill: document.getElementById("progressFill"),
   progressText: document.getElementById("progressText"),
@@ -184,22 +176,168 @@ function fitCanvasToCard(canvas, width = canvas.width, height = canvas.height) {
   canvas.style.height = `${Math.max(1, height * scale)}px`;
 }
 
-function updateCanvasLayout(width = state.targetImage?.width, height = state.targetImage?.height) {
-  const cards = [ui.targetCanvas.parentElement, ui.previewCanvas.parentElement,
-    ui.residualCanvas.parentElement, ui.importanceCanvas.parentElement];
-  for (const card of cards) {
-    card.style.removeProperty("aspect-ratio");
-    card.style.removeProperty("width");
-    card.style.removeProperty("height");
+// ---- Views & layouts ----
+// Every card in the viewer grid is a view. "image" views aspect-fit a canvas
+// at the target's resolution; "plot" views fill their card and redraw at
+// device resolution. `blank` is the fill shown before the first render
+// (views without one are drawn straight from the target). Only views named in
+// the active layout get a card; the others keep canvas = null and their draw
+// functions return early, so hidden views cost nothing.
+const VIEWS = {
+  target:     { label: "Target", kind: "image" },
+  preview:    { label: "Reconstruction + centroids", kind: "image", overlay: true, blank: "#0a0a0f" },
+  residual:   { label: "Residual |recon − target|", kind: "image", blank: "#000004" },
+  importance: { label: "Importance (Laplacian bands)", kind: "image" },
+  siteIds:    { label: "Site IDs", kind: "image", blank: "#0a0a0f" },
+  tau:        { label: "Tau heatmap", kind: "image", blank: "#0a0a0f" },
+  psnr:       { label: "PSNR vs iteration", kind: "plot", draw: drawPsnrPlot, hover: handlePsnrHover,
+                leave: () => { state.psnrHover = null; drawPsnrPlot(); } },
+  bpp:        { label: "PSNR vs bpp", kind: "plot", draw: drawBppPlot, hover: handleBppHover,
+                leave: () => { state.bppHover = null; drawBppPlot(); } },
+  grad:       { label: "|gradient| vs iteration (log)", kind: "plot", draw: drawGradPlot, hover: handleGradHover,
+                leave: () => { state.gradHover = null; drawGradPlot(); } },
+};
+
+// Layouts are CSS grid-template-areas: one quoted string per row, one view id
+// per cell, "." for an empty cell. Repeat an id to span cells (each view must
+// cover a rectangle). `rows` optionally sizes the rows; the default splits the
+// height evenly. Columns are always equal width.
+const LAYOUTS = {
+  overview: {
+    label: "Overview",
+    areas: `"target preview residual importance psnr bpp"
+            "grad   grad    grad     grad       grad grad"`,
+    rows: "minmax(0, 1fr) 320px",
+  },
+  images: {
+    label: "Images 2×2",
+    areas: `"target   preview"
+            "residual importance"`,
+  },
+  sites: {
+    label: "Sites & tau",
+    areas: `"preview  siteIds    tau"
+            "residual importance psnr"`,
+  },
+  plots: {
+    label: "Plots",
+    areas: `"psnr bpp"
+            "grad grad"`,
+  },
+};
+const DEFAULT_LAYOUT = "overview";
+const LAYOUT_STORAGE_KEY = "sad.train.layout";
+
+// Parses and validates a layout's areas string into a grid of view ids.
+function parseLayoutAreas(areas) {
+  const grid = [...areas.matchAll(/"([^"]*)"/g)].map((m) => m[1].trim().split(/\s+/));
+  if (!grid.length) throw new Error("no rows");
+  const cols = grid[0].length;
+  if (grid.some((row) => row.length !== cols)) throw new Error("rows have different cell counts");
+  const boxes = new Map();
+  grid.forEach((row, r) => row.forEach((id, c) => {
+    if (id === ".") return;
+    if (!VIEWS[id]) throw new Error(`unknown view "${id}"`);
+    const b = boxes.get(id) || { r0: r, r1: r, c0: c, c1: c, n: 0 };
+    b.r0 = Math.min(b.r0, r); b.r1 = Math.max(b.r1, r);
+    b.c0 = Math.min(b.c0, c); b.c1 = Math.max(b.c1, c);
+    b.n += 1;
+    boxes.set(id, b);
+  }));
+  for (const [id, b] of boxes) {
+    if (b.n !== (b.r1 - b.r0 + 1) * (b.c1 - b.c0 + 1)) throw new Error(`"${id}" is not a rectangle`);
   }
-  fitCanvasToCard(ui.targetCanvas, width || ui.targetCanvas.width, height || ui.targetCanvas.height);
-  fitCanvasToCard(ui.previewCanvas, width || ui.previewCanvas.width, height || ui.previewCanvas.height);
-  fitCanvasToCard(ui.residualCanvas, width || ui.residualCanvas.width, height || ui.residualCanvas.height);
-  fitCanvasToCard(ui.importanceCanvas, width || ui.importanceCanvas.width, height || ui.importanceCanvas.height);
+  return { grid, ids: [...boxes.keys()] };
+}
+
+function buildCards(name) {
+  const layout = LAYOUTS[name];
+  const { grid, ids } = parseLayoutAreas(layout.areas);
+  for (const view of Object.values(VIEWS)) {
+    view.card = null;
+    view.canvas = null;
+    view.overlayCanvas = null;
+  }
+  const root = ui.canvases;
+  root.replaceChildren();
+  root.style.setProperty("--layout-areas", grid.map((row) => `"${row.join(" ")}"`).join(" "));
+  root.style.setProperty("--layout-cols", `repeat(${grid[0].length}, minmax(0, 1fr))`);
+  root.style.setProperty("--layout-rows", layout.rows || `repeat(${grid.length}, minmax(0, 1fr))`);
+  for (const id of ids) {
+    const view = VIEWS[id];
+    const card = document.createElement("div");
+    card.className = `canvas-card ${view.kind}`;
+    card.style.setProperty("--view", id);
+    const label = document.createElement("span");
+    label.className = "card-label";
+    label.textContent = view.label;
+    const canvas = document.createElement("canvas");
+    card.append(label, canvas);
+    if (view.overlay) {
+      view.overlayCanvas = document.createElement("canvas");
+      view.overlayCanvas.className = "overlay-canvas";
+      card.append(view.overlayCanvas);
+    }
+    if (view.hover) canvas.addEventListener("mousemove", view.hover);
+    if (view.leave) canvas.addEventListener("mouseleave", view.leave);
+    root.append(card);
+    view.card = card;
+    view.canvas = canvas;
+  }
+}
+
+async function setLayout(name) {
+  if (!LAYOUTS[name]) name = DEFAULT_LAYOUT;
+  try {
+    buildCards(name);
+  } catch (err) {
+    appendLog(`Layout "${name}" is invalid (${err.message}); using ${DEFAULT_LAYOUT}.`);
+    name = DEFAULT_LAYOUT;
+    buildCards(name);
+  }
+  ui.layoutSelect.value = name;
+  try { localStorage.setItem(LAYOUT_STORAGE_KEY, name); } catch {}
+  // Fresh canvases are empty: repaint everything we have.
+  if (state.targetImage) {
+    const { width, height } = state.targetImage;
+    blankRenderViews(width, height);
+    drawTarget();
+    drawImportance();
+  } else {
+    updateCanvasLayout();
+  }
+  await drawView();
+}
+
+function savedLayout() {
+  try { return localStorage.getItem(LAYOUT_STORAGE_KEY) || DEFAULT_LAYOUT; } catch { return DEFAULT_LAYOUT; }
+}
+
+// Fills render-driven image views with their placeholder at the target size so
+// the layout matches before the first render arrives.
+function blankRenderViews(width, height) {
+  for (const view of Object.values(VIEWS)) {
+    if (!view.canvas || !view.blank) continue;
+    view.canvas.width = width;
+    view.canvas.height = height;
+    const ctx = view.canvas.getContext("2d");
+    ctx.fillStyle = view.blank;
+    ctx.fillRect(0, 0, width, height);
+  }
+  const overlay = VIEWS.preview.overlayCanvas;
+  if (overlay) {
+    overlay.width = width;
+    overlay.height = height;
+  }
+}
+
+function updateCanvasLayout(width = state.targetImage?.width, height = state.targetImage?.height) {
+  for (const view of Object.values(VIEWS)) {
+    if (!view.canvas) continue;
+    if (view.kind === "image") fitCanvasToCard(view.canvas, width || view.canvas.width, height || view.canvas.height);
+    else view.draw();
+  }
   positionOverlay();
-  drawPsnrPlot();
-  drawBppPlot();
-  drawGradPlot();
 }
 
 // ---- PSNR vs iteration plot ----
@@ -220,7 +358,7 @@ function niceTicks(min, max, count = 5) {
 }
 
 function psnrPlotGeometry() {
-  const canvas = ui.psnrCanvas;
+  const canvas = VIEWS.psnr.canvas;
   const w = canvas.clientWidth;
   const h = canvas.clientHeight;
   const data = state.psnrHistory;
@@ -244,7 +382,7 @@ function psnrPlotGeometry() {
 }
 
 function drawPsnrPlot() {
-  const canvas = ui.psnrCanvas;
+  const canvas = VIEWS.psnr.canvas;
   if (!canvas) return;
   const w = canvas.clientWidth;
   const h = canvas.clientHeight;
@@ -371,7 +509,7 @@ function drawPsnrPlot() {
 function handlePsnrHover(ev) {
   const data = state.psnrHistory;
   if (!data.length) return;
-  const rect = ui.psnrCanvas.getBoundingClientRect();
+  const rect = VIEWS.psnr.canvas.getBoundingClientRect();
   const mx = ev.clientX - rect.left;
   const g = psnrPlotGeometry();
   let best = 0, bestDist = Infinity;
@@ -424,7 +562,7 @@ function bppPlotPoints() {
 }
 
 function bppPlotGeometry(pts) {
-  const canvas = ui.bppCanvas;
+  const canvas = VIEWS.bpp.canvas;
   const w = canvas.clientWidth;
   const h = canvas.clientHeight;
   let xMin = Infinity, xMax = -Infinity, yMin = Infinity, yMax = -Infinity;
@@ -455,7 +593,7 @@ function bppPlotGeometry(pts) {
 }
 
 function drawBppPlot() {
-  const canvas = ui.bppCanvas;
+  const canvas = VIEWS.bpp.canvas;
   if (!canvas) return;
   const w = canvas.clientWidth;
   const h = canvas.clientHeight;
@@ -589,7 +727,7 @@ function drawBppPlot() {
 function handleBppHover(ev) {
   const pts = bppPlotPoints();
   if (!pts.length) return;
-  const rect = ui.bppCanvas.getBoundingClientRect();
+  const rect = VIEWS.bpp.canvas.getBoundingClientRect();
   const mx = ev.clientX - rect.left, my = ev.clientY - rect.top;
   const g = bppPlotGeometry(pts);
   let best = null, bestDist = Infinity;
@@ -632,7 +770,7 @@ function gradLegendLayout(ctx, w) {
 }
 
 function gradPlotGeometry(top) {
-  const canvas = ui.gradCanvas;
+  const canvas = VIEWS.grad.canvas;
   const w = canvas.clientWidth;
   const h = canvas.clientHeight;
   const data = state.gradHistory;
@@ -659,7 +797,7 @@ function gradPlotGeometry(top) {
 }
 
 function drawGradPlot() {
-  const canvas = ui.gradCanvas;
+  const canvas = VIEWS.grad.canvas;
   if (!canvas) return;
   const w = canvas.clientWidth;
   const h = canvas.clientHeight;
@@ -844,7 +982,7 @@ function drawGradPlot() {
 function handleGradHover(ev) {
   const data = state.gradHistory;
   if (!data.length) return;
-  const rect = ui.gradCanvas.getBoundingClientRect();
+  const rect = VIEWS.grad.canvas.getBoundingClientRect();
   const mx = ev.clientX - rect.left;
   const g = gradPlotGeometry(0); // x mapping doesn't depend on top
   let best = 0, bestDist = Infinity;
@@ -885,9 +1023,10 @@ const RESIDUAL_LUT = (() => {
 })();
 
 function drawResidual() {
+  const canvas = VIEWS.residual.canvas;
   const target = state.targetImage;
   const render = state.lastRender;
-  if (!target || !render || render.width !== target.width || render.height !== target.height) return;
+  if (!canvas || !target || !render || render.width !== target.width || render.height !== target.height) return;
   const { width, height } = render;
   const a = render.rgba;
   const b = target.data;
@@ -901,7 +1040,6 @@ function drawResidual() {
     out[i + 2] = RESIDUAL_LUT[idx + 2];
     out[i + 3] = 255;
   }
-  const canvas = ui.residualCanvas;
   if (canvas.width !== width || canvas.height !== height) {
     canvas.width = width;
     canvas.height = height;
@@ -914,7 +1052,7 @@ function drawTarget() {
   if (!state.targetImage) return;
   const { data, width, height } = state.targetImage;
   updateCanvasLayout(width, height);
-  drawToCanvas(ui.targetCanvas, data, width, height);
+  if (VIEWS.target.canvas) drawToCanvas(VIEWS.target.canvas, data, width, height);
 }
 
 // Multi-scale importance map (visualization only — not used by the optimizer).
@@ -1033,8 +1171,9 @@ function computeImportanceMap(rgbaF, width, height, maskRgba) {
 }
 
 function drawImportance() {
+  const canvas = VIEWS.importance.canvas;
   const target = state.targetImage;
-  if (!target) return;
+  if (!canvas || !target) return;
   const { data, width, height } = target;
   const n = width * height;
   const maskRgba = state.maskData?.rgba?.length === n * 4 ? state.maskData.rgba : null;
@@ -1049,7 +1188,6 @@ function drawImportance() {
     out[i + 2] = IMPORTANCE_LUT[idx + 2];
     out[i + 3] = 255;
   }
-  const canvas = ui.importanceCanvas;
   if (canvas.width !== width || canvas.height !== height) {
     canvas.width = width;
     canvas.height = height;
@@ -1118,20 +1256,7 @@ async function setTarget(file, name, token = ++state.targetToken) {
     drawBppPlot();
     drawTarget();
     drawImportance();
-    // Blank the preview canvas to same size so layout matches immediately.
-    ui.previewCanvas.width = img.width;
-    ui.previewCanvas.height = img.height;
-    const ctx = ui.previewCanvas.getContext("2d");
-    ctx.fillStyle = "#0a0a0f";
-    ctx.fillRect(0, 0, img.width, img.height);
-    ui.residualCanvas.width = img.width;
-    ui.residualCanvas.height = img.height;
-    const rctx = ui.residualCanvas.getContext("2d");
-    rctx.fillStyle = "#000004";
-    rctx.fillRect(0, 0, img.width, img.height);
-    ui.overlayCanvas.width = img.width;
-    ui.overlayCanvas.height = img.height;
-    fitCanvasToCard(ui.previewCanvas, img.width, img.height);
+    blankRenderViews(img.width, img.height);
     updateCanvasLayout(img.width, img.height);
     setStatus(scaled
       ? `Target ${img.width}×${img.height} (downscaled from ${img.sourceWidth}×${img.sourceHeight})`
@@ -1353,82 +1478,60 @@ function updateProgress(cur, total, text) {
 }
 
 function clearOverlay() {
-  const ctx = ui.overlayCanvas.getContext("2d");
-  ctx.clearRect(0, 0, ui.overlayCanvas.width, ui.overlayCanvas.height);
+  const overlay = VIEWS.preview.overlayCanvas;
+  if (!overlay) return;
+  overlay.getContext("2d").clearRect(0, 0, overlay.width, overlay.height);
 }
 
 // The overlay canvas sits inside the same card as the preview but is absolutely
 // positioned, so we need to match its drawing buffer and CSS box to the
 // preview's actual displayed rect (which is aspect-fit inside the card).
 function positionOverlay() {
-  const parent = ui.previewCanvas.parentElement;
-  const prect = ui.previewCanvas.getBoundingClientRect();
-  const crect = parent.getBoundingClientRect();
+  const { canvas, card, overlayCanvas: overlay } = VIEWS.preview;
+  if (!canvas || !overlay) return;
+  const prect = canvas.getBoundingClientRect();
+  const crect = card.getBoundingClientRect();
   // Absolute offsets are relative to the parent's padding box, while
   // getBoundingClientRect is its border box, so subtract the card border.
-  ui.overlayCanvas.style.left = `${prect.left - crect.left - parent.clientLeft}px`;
-  ui.overlayCanvas.style.top = `${prect.top - crect.top - parent.clientTop}px`;
-  ui.overlayCanvas.style.width = `${prect.width}px`;
-  ui.overlayCanvas.style.height = `${prect.height}px`;
+  overlay.style.left = `${prect.left - crect.left - card.clientLeft}px`;
+  overlay.style.top = `${prect.top - crect.top - card.clientTop}px`;
+  overlay.style.width = `${prect.width}px`;
+  overlay.style.height = `${prect.height}px`;
 }
 
 function prepareOverlay(width, height) {
-  if (ui.overlayCanvas.width !== width || ui.overlayCanvas.height !== height) {
-    ui.overlayCanvas.width = width;
-    ui.overlayCanvas.height = height;
+  const overlay = VIEWS.preview.overlayCanvas;
+  if (overlay.width !== width || overlay.height !== height) {
+    overlay.width = width;
+    overlay.height = height;
   }
   positionOverlay();
   clearOverlay();
-  return ui.overlayCanvas.getContext("2d");
+  return overlay.getContext("2d");
 }
 
 function drawCentroidOverlay() {
-  if (ui.viewMode.value !== "centroids") return;
+  if (!VIEWS.preview.overlayCanvas) return;
   if (!state.lastRender || !state.lastSites) return;
   const ctx = prepareOverlay(state.lastRender.width, state.lastRender.height);
   drawCentroids(ctx);
 }
 
+// Redraws every view that depends on the latest render. Site IDs and tau need
+// an extra GPU pass each, so they only run when their view is in the layout.
 async function drawView() {
   if (!state.lastRender) return;
   drawResidual();
-  const mode = ui.viewMode.value;
   const { rgba, width, height } = state.lastRender;
-  ui.previewLabel.textContent = {
-    render: "Reconstruction",
-    centroids: "Reconstruction + centroids",
-    diagram: "Site IDs",
-    heatmap: "Tau heatmap",
-  }[mode] || "Reconstruction";
-
-  if (mode === "render") {
-    drawToCanvas(ui.previewCanvas, rgba, width, height);
-    positionOverlay();
-    clearOverlay();
-    return;
-  }
-  if (mode === "centroids") {
-    drawToCanvas(ui.previewCanvas, rgba, width, height);
+  if (VIEWS.preview.canvas) {
+    drawToCanvas(VIEWS.preview.canvas, rgba, width, height);
     drawCentroidOverlay();
-    return;
   }
-  if (mode === "diagram") {
-    const img = await ensureRender("hashed");
-    if (img) {
-      drawToCanvas(ui.previewCanvas, img.rgba, img.width, img.height);
-      positionOverlay();
-      clearOverlay();
-    }
-    return;
-  }
-  if (mode === "heatmap") {
-    const img = await ensureRender("heatmap");
-    if (img) {
-      drawToCanvas(ui.previewCanvas, img.rgba, img.width, img.height);
-      positionOverlay();
-      clearOverlay();
-    }
-    return;
+  for (const [id, mode] of [["siteIds", "hashed"], ["tau", "heatmap"]]) {
+    if (!VIEWS[id].canvas) continue;
+    const img = await ensureRender(mode);
+    // The layout may have changed while the render was in flight.
+    if (img && VIEWS[id].canvas) drawToCanvas(VIEWS[id].canvas, img.rgba, img.width, img.height);
   }
 }
 
@@ -1478,7 +1581,12 @@ function stopTraining() {
 
 function exportPng() {
   if (!state.lastRender) return;
-  ui.previewCanvas.toBlob((blob) => {
+  const { rgba, width, height } = state.lastRender;
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  canvas.getContext("2d").putImageData(new ImageData(floatImageToRgba8(rgba, width, height), width, height), 0, 0);
+  canvas.toBlob((blob) => {
     if (blob) triggerDownload(blob, `sad_${Date.now()}.png`);
   }, "image/png");
   ui.savePopover.classList.add("hidden");
@@ -1499,16 +1607,13 @@ function toggleSaveMenu(ev) {
 }
 
 function toggleParams() {
+  // The viewer's ResizeObserver refits the cards.
   ui.paramsPanel.classList.toggle("hidden");
-  // Positioning depends on the preview's bounding rect, which changes when the
-  // panel collapses/expands.
-  requestAnimationFrame(() => {
-    if (state.targetImage) updateCanvasLayout(state.targetImage.width, state.targetImage.height);
-    else positionOverlay();
-  });
 }
 
 async function main() {
+  for (const [name, layout] of Object.entries(LAYOUTS)) ui.layoutSelect.add(new Option(layout.label, name));
+  setLayout(savedLayout());
   try {
     state.config = await loadConfig();
     applyConfigToForm(state.config);
@@ -1553,36 +1658,9 @@ async function main() {
       ui.savePopover.classList.add("hidden");
     }
   });
-  ui.viewMode.addEventListener("change", drawView);
-  ui.psnrCanvas.addEventListener("mousemove", handlePsnrHover);
-  ui.psnrCanvas.addEventListener("mouseleave", () => {
-    state.psnrHover = null;
-    drawPsnrPlot();
-  });
-  ui.bppCanvas.addEventListener("mousemove", handleBppHover);
-  ui.bppCanvas.addEventListener("mouseleave", () => {
-    state.bppHover = null;
-    drawBppPlot();
-  });
-  ui.gradCanvas.addEventListener("mousemove", handleGradHover);
-  ui.gradCanvas.addEventListener("mouseleave", () => {
-    state.gradHover = null;
-    drawGradPlot();
-  });
-  window.addEventListener("resize", () => {
-    requestAnimationFrame(() => {
-      if (state.targetImage) updateCanvasLayout(state.targetImage.width, state.targetImage.height);
-      else {
-        positionOverlay();
-        drawPsnrPlot();
-        drawBppPlot();
-        drawGradPlot();
-      }
-    });
-  });
-  drawPsnrPlot();
-  drawBppPlot();
-  drawGradPlot();
+  ui.layoutSelect.addEventListener("change", () => setLayout(ui.layoutSelect.value));
+  // Card sizes follow the viewer area (window resize, advanced panel toggle).
+  new ResizeObserver(() => updateCanvasLayout()).observe(ui.canvases);
 }
 
 main();
