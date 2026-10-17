@@ -1,0 +1,55 @@
+# Web
+
+Browser pages for SAD. They run the trainer in `trainer/` and the WGSL kernels in `shaders/`:
+
+- `index.html` - **viewer** for `*_sites.txt` files (renderer-only)
+- `train.html` - **trainer** (originally ported from the wgpu-py trainer at the `multi-backend` tag)
+- `bench.html` - automated browser benchmark harness for the trainer modules
+
+All pages read hyperparameters from `training_config.json`.
+
+## Requirements
+
+- WebGPU-capable browser (Chrome/Edge, Safari Tech Preview).
+- HTTP(S) hosting. ES modules + `fetch` won't run from `file://`; GitHub Pages
+  works because it serves the repository over HTTPS:
+
+  ```bash
+  python -m http.server 8000 -d /path/to/SAD
+  # then open http://localhost:8000/web/train.html
+  ```
+
+## Viewer (`index.html`)
+
+- Load a `*_sites.txt` file with an `# Image size: W H` header.
+- Choose render mode, toggle site dots, and export PNG.
+
+## Trainer (`train.html`)
+
+- Pick a target image (and optional mask / init-sites file).
+- Edit hyperparameters in the left panel (values are pre-filled from `training_config.json`).
+- The site count is fixed for the whole run: the JS trainer has no densify/prune (and so no target-bpp). Defaults: `iters` 10000, `sites` 1000, `log-freq` 50, `viewer-freq` 50.
+- Click **Train**. `viewer-freq` controls visual refreshes, while `log-freq` controls PSNR log lines (`Iter N | PSNR: X dB | Active: a/t | it/s | seconds`).
+- **Export PNG** / **Export sites.txt** produce the same formats the Python and Metal trainers write.
+
+## Benchmark (`bench.html`)
+
+Run the browser trainer without manual file picking:
+
+```bash
+python -m http.server 8000 -d /path/to/SAD
+# then open:
+# http://localhost:8000/web/bench.html?image=../test.png
+```
+
+The page logs `BENCH_RESULT` with final PSNR, active sites, training time, and total elapsed time.
+
+## Shader Source
+
+The viewer has `shaders.js` as a fallback with embedded WGSL. After editing any WGSL under `shaders/`, regenerate it with:
+
+```bash
+python shaders/gen_shaders_js.py
+```
+
+The trainer fetches WGSL at runtime and has no embedded fallback.

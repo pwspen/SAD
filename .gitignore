@@ -13,4 +13,4 @@ __pycache__/
 
 /untracked/
 # Node runner deps
-/backends/webgpu_js/node/node_modules/
+/node/node_modules/

@@ -57,8 +57,8 @@ let VPT_HILBERT_PROBES = 0;
 let VPT_HILBERT_WINDOW = 0;
 let candDownscale = 1;
 
-const SHADER_URL = "../shared/sad_shared.wgsl";
-const CONFIG_URL = "../../training_config.json";
+const SHADER_URL = "../shaders/sad_shared.wgsl";
+const CONFIG_URL = "../training_config.json";
 let shaderCode = "";
 let sharedConfig = null;
 

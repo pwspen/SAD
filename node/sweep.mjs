@@ -11,8 +11,8 @@ import { dirname, join, resolve, basename } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 
-import { Trainer, buildArgs } from "../src/trainer.js";
-import { parseSitesTxt, serializeSitesTxt, computePsnr } from "../src/io.js";
+import { Trainer, buildArgs } from "../trainer/trainer.js";
+import { parseSitesTxt, serializeSitesTxt, computePsnr } from "../trainer/io.js";
 import {
   createHeadlessDevice,
   loadShadersFromDisk,
@@ -23,7 +23,7 @@ import {
 } from "./headless.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const DEFAULT_CONFIG = resolve(HERE, "../../../training_config.json");
+const DEFAULT_CONFIG = resolve(HERE, "../training_config.json");
 
 const HELP = `Usage: node sweep.mjs --image <png> [options]
 
@@ -228,7 +228,7 @@ async function main() {
   const initSites = cli["init-sites"] ? parseSitesTxt(await readFile(cli["init-sites"], "utf8")) : null;
 
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-  const outPath = cli.out || resolve(HERE, `../../../results/sweep_${stamp}.jsonl`);
+  const outPath = cli.out || resolve(HERE, `../results/sweep_${stamp}.jsonl`);
   await mkdir(dirname(outPath), { recursive: true });
   if (cli["save-dir"]) await mkdir(cli["save-dir"], { recursive: true });
 

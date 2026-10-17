@@ -1,5 +1,5 @@
 // Node host for the WebGPU JS trainer: Dawn device, file-backed shader reads,
-// and PNG I/O. Everything training-related lives in ../src and is shared with
+// and PNG I/O. Everything training-related lives in ../trainer and is shared with
 // train.html / bench.html; this file only replaces the browser-specific pieces.
 
 import { readFile, writeFile } from "node:fs/promises";
@@ -7,9 +7,9 @@ import { fileURLToPath } from "node:url";
 import { create, globals } from "webgpu";
 import { PNG } from "pngjs";
 
-import { requestTrainingDevice, adapterLabel } from "../src/device.js";
-import { loadShaders, tileSlotsForLimit } from "../src/shader_loader.js";
-import { floatImageToRgba8 } from "../src/io.js";
+import { requestTrainingDevice, adapterLabel } from "../trainer/device.js";
+import { loadShaders, tileSlotsForLimit } from "../trainer/shader_loader.js";
+import { floatImageToRgba8 } from "../trainer/io.js";
 
 // GPUBufferUsage, GPUMapMode, GPUTextureUsage, ... are globals in the browser.
 Object.assign(globalThis, globals);

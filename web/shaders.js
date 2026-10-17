@@ -1,4 +1,4 @@
-// Generated from backends/shared/sad_shared.wgsl.
+// Generated from shaders/sad_shared.wgsl.
 window.SAD_SHADER_CODE = `
 // BEGIN COMMON
 

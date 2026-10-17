@@ -3,14 +3,14 @@
 // (mask, init-sites, candidates/lr…) in the collapsible left panel, and a
 // side-by-side target vs reconstruction view, both aspect-fit.
 
-import { loadShaders, tileSlotsForLimit } from "./src/shader_loader.js?v=shared-wgsl-20261017";
-import { requestTrainingDevice } from "./src/device.js?v=shared-wgsl-20261017";
-import { Trainer, buildArgs, GRAD_GROUPS } from "./src/trainer.js?v=shared-wgsl-20261017";
-import { loadImageToFloat32, loadMaskRgba32Float, whiteMaskRgba32Float } from "./src/textures.js?v=shared-wgsl-20261017";
-import { loadSitesFromFile, serializeSitesTxt, triggerDownload, floatImageToRgba8 } from "./src/io.js?v=shared-wgsl-20261017";
-import { SITE_FLOATS } from "./src/params.js?v=shared-wgsl-20261017";
+import { loadShaders, tileSlotsForLimit } from "../trainer/shader_loader.js?v=shared-wgsl-20261017";
+import { requestTrainingDevice } from "../trainer/device.js?v=shared-wgsl-20261017";
+import { Trainer, buildArgs, GRAD_GROUPS } from "../trainer/trainer.js?v=shared-wgsl-20261017";
+import { loadImageToFloat32, loadMaskRgba32Float, whiteMaskRgba32Float } from "../trainer/textures.js?v=shared-wgsl-20261017";
+import { loadSitesFromFile, serializeSitesTxt, triggerDownload, floatImageToRgba8 } from "../trainer/io.js?v=shared-wgsl-20261017";
+import { SITE_FLOATS } from "../trainer/params.js?v=shared-wgsl-20261017";
 
-const CONFIG_URL = "../../training_config.json";
+const CONFIG_URL = "../training_config.json";
 const DEMO_MAX_IMAGE_SIDE = 2048;
 
 // Fields that live in the advanced panel. The target image is in the top bar;

@@ -31,16 +31,16 @@
     <pre id="summary"></pre>
 
     <script type="module">
-      import { loadShaders, tileSlotsForLimit } from "./src/shader_loader.js?v=shared-wgsl-20261017";
-      import { Trainer, buildArgs } from "./src/trainer.js?v=shared-wgsl-20261017";
-      import { loadImageToFloat32 } from "./src/textures.js?v=shared-wgsl-20261017";
-      import { requestTrainingDevice, adapterLabel } from "./src/device.js?v=shared-wgsl-20261017";
+      import { loadShaders, tileSlotsForLimit } from "../trainer/shader_loader.js?v=shared-wgsl-20261017";
+      import { Trainer, buildArgs } from "../trainer/trainer.js?v=shared-wgsl-20261017";
+      import { loadImageToFloat32 } from "../trainer/textures.js?v=shared-wgsl-20261017";
+      import { requestTrainingDevice, adapterLabel } from "../trainer/device.js?v=shared-wgsl-20261017";
 
       const logEl = document.getElementById("log");
       const summaryEl = document.getElementById("summary");
       const params = new URLSearchParams(location.search);
-      const imageUrl = params.get("image") || "../../test.png";
-      const configUrl = params.get("config") || "../../training_config.json";
+      const imageUrl = params.get("image") || "../test.png";
+      const configUrl = params.get("config") || "../training_config.json";
 
       function log(line) {
         logEl.textContent += `${line}\n`;

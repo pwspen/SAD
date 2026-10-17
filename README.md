@@ -22,14 +22,14 @@ python3 -m http.server 8000
 
 Then open:
 
-- http://localhost:8000/backends/webgpu_js/train.html: interactive trainer
-- http://localhost:8000/backends/webgpu_js/index.html: viewer for saved `*_sites.txt` files
-- http://localhost:8000/backends/webgpu_js/bench.html?image=../../test.png: scripted benchmark
+- http://localhost:8000/web/train.html: interactive trainer
+- http://localhost:8000/web/index.html: viewer for saved `*_sites.txt` files
+- http://localhost:8000/web/bench.html?image=../test.png: scripted benchmark
 
 ## Headless Sweeps (Node)
 
 ```bash
-cd backends/webgpu_js/node
+cd node
 npm install
 node sweep.mjs --image /path/to/image.png --set sites=500,1000,2000 --set lrPosBase=0.025,0.05
 ```
@@ -39,9 +39,11 @@ Run `node sweep.mjs --help` for every option.
 
 ## Layout
 
-- `backends/webgpu_js/` contains the trainer (`src/`), the browser pages, and the Node runner (`node/`).
-  See `backends/webgpu_js/README.md`.
-- `backends/shared/` contains the WGSL kernels.
+- `web/` contains the browser pages: trainer UI, viewer and benchmark. See `web/README.md`.
+- `trainer/` contains the WebGPU optimizer (training loop, Adam schedule, buffers, kernel
+  dispatch). It has no DOM code, so the browser and Node both use it. See `trainer/README.md`.
+- `shaders/` contains the WGSL kernels. See `shaders/README.md`.
+- `node/` contains the headless sweep runner. See `node/README.md`.
 - `training_config.json` holds the hyperparameter defaults read by both hosts.
 
 ## Browser Demo
