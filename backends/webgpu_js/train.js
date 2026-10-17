@@ -3,12 +3,12 @@
 // (mask, init-sites, candidates/lr…) in the collapsible left panel, and a
 // side-by-side target vs reconstruction view, both aspect-fit.
 
-import { loadShaders, tileSlotsForLimit } from "./src/shader_loader.js?v=adam-bounds-20261016b";
-import { requestTrainingDevice } from "./src/device.js?v=adam-bounds-20261016b";
-import { Trainer, buildArgs, GRAD_GROUPS } from "./src/trainer.js?v=adam-bounds-20261016b";
-import { loadImageToFloat32, loadMaskRgba32Float, whiteMaskRgba32Float } from "./src/textures.js?v=adam-bounds-20261016b";
-import { loadSitesFromFile, serializeSitesTxt, triggerDownload, floatImageToRgba8 } from "./src/io.js?v=adam-bounds-20261016b";
-import { SITE_FLOATS } from "./src/params.js?v=adam-bounds-20261016b";
+import { loadShaders, tileSlotsForLimit } from "./src/shader_loader.js?v=shared-wgsl-20261017";
+import { requestTrainingDevice } from "./src/device.js?v=shared-wgsl-20261017";
+import { Trainer, buildArgs, GRAD_GROUPS } from "./src/trainer.js?v=shared-wgsl-20261017";
+import { loadImageToFloat32, loadMaskRgba32Float, whiteMaskRgba32Float } from "./src/textures.js?v=shared-wgsl-20261017";
+import { loadSitesFromFile, serializeSitesTxt, triggerDownload, floatImageToRgba8 } from "./src/io.js?v=shared-wgsl-20261017";
+import { SITE_FLOATS } from "./src/params.js?v=shared-wgsl-20261017";
 
 const CONFIG_URL = "../../training_config.json";
 const DEMO_MAX_IMAGE_SIDE = 2048;

@@ -1,20 +1,28 @@
 // WGSL assembly (originally ported from wgpu-py's sad_shaders.py).
 // Fetches sad_shared.wgsl (the COMMON block between // BEGIN COMMON / // END COMMON)
 // and concatenates it with each per-kernel snippet from backends/shared/wgsl/*.wgsl.
-// Some kernels (gradients_tiled, adam, tau_extract, tau_writeback) are replaced
-// by JS-specific overrides that consolidate the 10 per-channel gradient buffers
-// into a single interleaved buffer — required because the WebGPU per-stage
-// storage-buffer limit is 10 on common adapters and the originals use 12.
+// gradients_tiled's `const TILE_SLOTS` line is rewritten at load time.
 
-import {
-  gradientsTiledOverride,
-  ADAM_OVERRIDE,
-  TAU_EXTRACT_OVERRIDE,
-  TAU_WRITEBACK_OVERRIDE,
-  RENDER_HASHED_OVERRIDE,
-  RENDER_TAU_HEATMAP_OVERRIDE,
-} from "./wgsl_overrides.js?v=adam-bounds-20261016b";
-export { tileSlotsForLimit } from "./wgsl_overrides.js?v=adam-bounds-20261016b";
+// Channels per site in the interleaved gradient buffer (see gradients_tiled.wgsl).
+export const GRAD_CHANNELS = 10;
+
+// Workgroup bytes per tile slot: key + 10 lo + 10 hi grad words.
+const TILE_SLOT_BYTES = 21 * 4;
+
+// Largest power-of-two tile table (128 or 256) that fits the device's
+// workgroup storage. Pass the device's maxComputeWorkgroupStorageSize.
+export function tileSlotsForLimit(maxWorkgroupStorage = 16384) {
+  return maxWorkgroupStorage >= 256 * TILE_SLOT_BYTES ? 256 : 128;
+}
+
+const TILE_SLOTS_RE = /const TILE_SLOTS : u32 = \d+u;/;
+
+function withTileSlots(source, tileSlots) {
+  if (!TILE_SLOTS_RE.test(source)) {
+    throw new Error("gradients_tiled.wgsl is missing its `const TILE_SLOTS : u32 = Nu;` line");
+  }
+  return source.replace(TILE_SLOTS_RE, `const TILE_SLOTS : u32 = ${tileSlots}u;`);
+}
 
 const COMMON_URL = new URL("../../shared/sad_shared.wgsl", import.meta.url);
 const WGSL_DIR_URL = new URL("../../shared/wgsl/", import.meta.url);
@@ -37,6 +45,8 @@ const SHADER_FILES = [
   "tau_writeback",
   "hilbert",
   "radix_sort",
+  "render_hashed",
+  "render_tau_heatmap",
 ];
 
 let _cache = null;
@@ -65,7 +75,7 @@ function extractCommon(source) {
   return source.slice(start + beginMarker.length, end).trim() + "\n";
 }
 
-// tileSlots: gradient tile hash size (see tileSlotsForLimit in wgsl_overrides.js).
+// tileSlots: gradient tile hash size (see tileSlotsForLimit).
 // readText: async (URL) => string; defaults to fetch().
 export async function loadShaders({ tileSlots = 128, readText = fetchText } = {}) {
   if (_cache && _cache.tileSlots === tileSlots) return _cache;
@@ -93,17 +103,17 @@ export async function loadShaders({ tileSlots = 128, readText = fetchText } = {}
     JFA_CLEAR: out.jfa_clear,
     JFA_FLOOD: out.jfa_flood,
     RENDER: out.render_compute,
-    GRADIENTS_TILED: common + gradientsTiledOverride(tileSlots),
-    ADAM: common + ADAM_OVERRIDE,
+    GRADIENTS_TILED: withTileSlots(out.gradients_tiled, tileSlots),
+    ADAM: out.adam,
     CLEAR_BUFFER_U32: out.clear_buffer_u32,
     CLEAR_BUFFER_I32: out.clear_buffer_i32,
-    TAU_EXTRACT: common + TAU_EXTRACT_OVERRIDE,
+    TAU_EXTRACT: out.tau_extract,
     TAU_DIFFUSE: out.tau_diffuse,
-    TAU_WRITEBACK: common + TAU_WRITEBACK_OVERRIDE,
+    TAU_WRITEBACK: out.tau_writeback,
     HILBERT: out.hilbert,
     RADIX_SORT: out.radix_sort,
-    RENDER_HASHED: common + RENDER_HASHED_OVERRIDE,
-    RENDER_TAU_HEATMAP: common + RENDER_TAU_HEATMAP_OVERRIDE,
+    RENDER_HASHED: out.render_hashed,
+    RENDER_TAU_HEATMAP: out.render_tau_heatmap,
     tileSlots,
   };
   return _cache;

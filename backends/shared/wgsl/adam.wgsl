@@ -1,53 +1,42 @@
+// Adam step over the interleaved f32-bit `grads` buffer (layout in
+// gradients_tiled.wgsl); clears each site's gradients after use.
+
 @group(0) @binding(0) var<storage, read_write> sites : array<Site>;
 @group(0) @binding(1) var<storage, read_write> adam : array<f32>;
-@group(0) @binding(2) var<storage, read_write> grad_pos_x : array<atomic<i32>>;
-@group(0) @binding(3) var<storage, read_write> grad_pos_y : array<atomic<i32>>;
-@group(0) @binding(4) var<storage, read_write> grad_log_tau : array<atomic<i32>>;
-@group(0) @binding(5) var<storage, read_write> grad_radius_sq : array<atomic<i32>>;
-@group(0) @binding(6) var<storage, read_write> grad_color_r : array<atomic<i32>>;
-@group(0) @binding(7) var<storage, read_write> grad_color_g : array<atomic<i32>>;
-@group(0) @binding(8) var<storage, read_write> grad_color_b : array<atomic<i32>>;
-@group(0) @binding(9) var<storage, read_write> grad_dir_x : array<atomic<i32>>;
-@group(0) @binding(10) var<storage, read_write> grad_dir_y : array<atomic<i32>>;
-@group(0) @binding(11) var<storage, read_write> grad_log_aniso : array<atomic<i32>>;
-@group(0) @binding(12) var<uniform> params : AdamParams;
+@group(0) @binding(2) var<storage, read_write> grads : array<atomic<u32>>;
+@group(0) @binding(3) var<uniform> params : AdamParams;
+
+fn loadGrad(i : u32) -> f32 { return bitcast<f32>(atomicLoad(&grads[i])); }
 
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   let idx = gid.x;
+  // Dispatch rounds up to 256 threads and the sites buffer is sized exactly to
+  // the site count, so the tail threads must not touch sites/adam/grads.
+  if (idx >= arrayLength(&sites)) { return; }
+  let base_g = idx * 10u;
   let norm = 1.0 / f32(params.width * params.height);
-  let scale = K_GRAD_QUANT_SCALE_INV * norm;
-  let g_pos = vec2<f32>(f32(atomicLoad(&grad_pos_x[idx])),
-                        f32(atomicLoad(&grad_pos_y[idx]))) * scale;
-  let g_log_tau = f32(atomicLoad(&grad_log_tau[idx])) * scale;
-  let g_radius_sq = f32(atomicLoad(&grad_radius_sq[idx])) * scale;
-  let g_color = vec3<f32>(f32(atomicLoad(&grad_color_r[idx])),
-                          f32(atomicLoad(&grad_color_g[idx])),
-                          f32(atomicLoad(&grad_color_b[idx]))) * scale;
-  let g_dir = vec2<f32>(f32(atomicLoad(&grad_dir_x[idx])),
-                        f32(atomicLoad(&grad_dir_y[idx]))) * scale;
-  var g_log_aniso = f32(atomicLoad(&grad_log_aniso[idx])) * scale;
+  let scale = norm;
+  let g_pos = vec2<f32>(loadGrad(base_g + 0u),
+                        loadGrad(base_g + 1u)) * scale;
+  let g_log_tau = loadGrad(base_g + 2u) * scale;
+  let g_radius_sq = loadGrad(base_g + 3u) * scale;
+  let g_color = vec3<f32>(loadGrad(base_g + 4u),
+                          loadGrad(base_g + 5u),
+                          loadGrad(base_g + 6u)) * scale;
+  let g_dir = vec2<f32>(loadGrad(base_g + 7u),
+                        loadGrad(base_g + 8u)) * scale;
+  var g_log_aniso = loadGrad(base_g + 9u) * scale;
   var safe_g_dir = g_dir;
   if (is_bad2(safe_g_dir)) { safe_g_dir = vec2<f32>(0.0, 0.0); }
   if (is_bad(g_log_aniso)) { g_log_aniso = 0.0; }
 
-  if (sites[idx].position.x < 0.0) {
-    return;
-  }
+  if (sites[idx].position.x < 0.0) { return; }
   if (is_bad(sites[idx].position.x) || is_bad(sites[idx].position.y) || is_bad(sites[idx].log_tau) ||
       is_bad(sites[idx].radius_sq) || is_bad3(site_color(sites[idx])) || is_bad(sites[idx].log_aniso) ||
       is_bad(g_pos.x) || is_bad(g_pos.y) || is_bad(g_log_tau) || is_bad(g_radius_sq) ||
       is_bad3(g_color) || is_bad(safe_g_dir.x) || is_bad(safe_g_dir.y) || is_bad(g_log_aniso)) {
-    atomicStore(&grad_pos_x[idx], 0);
-    atomicStore(&grad_pos_y[idx], 0);
-    atomicStore(&grad_log_tau[idx], 0);
-    atomicStore(&grad_radius_sq[idx], 0);
-    atomicStore(&grad_color_r[idx], 0);
-    atomicStore(&grad_color_g[idx], 0);
-    atomicStore(&grad_color_b[idx], 0);
-    atomicStore(&grad_dir_x[idx], 0);
-    atomicStore(&grad_dir_y[idx], 0);
-    atomicStore(&grad_log_aniso[idx], 0);
+    for (var c = 0u; c < 10u; c = c + 1u) { atomicStore(&grads[base_g + c], 0u); }
     return;
   }
 
@@ -75,7 +64,8 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   let m_hat_pos = m_pos * b1t_corr;
   let v_hat_pos = v_pos_scalar * b2t_corr;
   let step_pos = params.lr_pos * m_hat_pos / (sqrt(v_hat_pos) + params.eps);
-  sites[idx].position = clamp(sites[idx].position - step_pos, vec2<f32>(0.0), vec2<f32>(f32(params.width - 1u), f32(params.height - 1u)));
+  sites[idx].position = clamp(sites[idx].position - step_pos,
+    vec2<f32>(0.0), vec2<f32>(f32(params.width - 1u), f32(params.height - 1u)));
   v_pos = vec2<f32>(v_pos_scalar, v_pos_scalar);
 
   m_log_tau = params.beta1 * m_log_tau + (1.0 - params.beta1) * g_log_tau;
@@ -110,7 +100,6 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   let m_hat_dir = m_dir * b1t_corr;
   let v_hat_dir = v_dir_scalar * b2t_corr;
   let step_dir = params.lr_dir * m_hat_dir / (sqrt(v_hat_dir) + params.eps);
-
   var new_dir = curr_dir - step_dir;
   new_dir = safe_dir(new_dir);
   sites[idx].aniso_dir_x = new_dir.x;
@@ -123,8 +112,6 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   let v_hat_aniso = v_log_aniso * b2t_corr;
   let step_aniso = params.lr_aniso * m_hat_aniso / (sqrt(v_hat_aniso) + params.eps);
   sites[idx].log_aniso = sites[idx].log_aniso - step_aniso;
-
-  // Clamp to prevent extreme anisotropy
   sites[idx].log_aniso = clamp(sites[idx].log_aniso, -2.0, 2.0);
 
   adam[base + 0u] = m_pos.x;
@@ -148,14 +135,5 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   adam[base + 18u] = m_log_aniso;
   adam[base + 19u] = v_log_aniso;
 
-  atomicStore(&grad_pos_x[idx], 0);
-  atomicStore(&grad_pos_y[idx], 0);
-  atomicStore(&grad_log_tau[idx], 0);
-  atomicStore(&grad_radius_sq[idx], 0);
-  atomicStore(&grad_color_r[idx], 0);
-  atomicStore(&grad_color_g[idx], 0);
-  atomicStore(&grad_color_b[idx], 0);
-  atomicStore(&grad_dir_x[idx], 0);
-  atomicStore(&grad_dir_y[idx], 0);
-  atomicStore(&grad_log_aniso[idx], 0);
+  for (var c = 0u; c < 10u; c = c + 1u) { atomicStore(&grads[base_g + c], 0u); }
 }

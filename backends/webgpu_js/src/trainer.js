@@ -22,7 +22,7 @@ import {
   updateHilbertParamsBuffer,
   packJumpStep,
   hilbertBitsForSize,
-} from "./params.js?v=adam-bounds-20261016b";
+} from "./params.js?v=shared-wgsl-20261017";
 
 import {
   createSitesBuffer,
@@ -34,7 +34,7 @@ import {
   createHilbertBuffers,
   createDummyStorageBuffer,
   readSites,
-} from "./buffers.js?v=adam-bounds-20261016b";
+} from "./buffers.js?v=shared-wgsl-20261017";
 
 import {
   createRgba32FloatTexture,
@@ -42,7 +42,7 @@ import {
   writeFloat32ToRgba32FloatTexture,
   readRgba32FloatTexture,
   whiteMaskRgba32Float,
-} from "./textures.js?v=adam-bounds-20261016b";
+} from "./textures.js?v=shared-wgsl-20261017";
 
 import {
   InitGradientEncoder,
@@ -59,9 +59,9 @@ import {
   TauEncoder,
   ClearBufferEncoder,
   HilbertEncoder,
-} from "./encoders.js?v=adam-bounds-20261016b";
+} from "./encoders.js?v=shared-wgsl-20261017";
 
-import { RadixSortUInt2 } from "./radix_sort.js?v=adam-bounds-20261016b";
+import { RadixSortUInt2 } from "./radix_sort.js?v=shared-wgsl-20261017";
 
 const MAX_PREVIEW_IMAGE_READBACKS = 2;
 // Direction/anisotropy start learning here. Previously derived from the prune
