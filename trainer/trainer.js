@@ -120,7 +120,7 @@ export function buildArgs(config, overrides = {}) {
     candInjectCount: Number(pick("candInjectCount", "CAND_INJECT_COUNT", 16)),
     logFreq: Math.max(1, Number(pick("logFreq", null, 50))),
     viewerFreq: Math.max(1, Number(pick("viewerFreq", null, 50))),
-    lrMult: Number(pick("lrMult", "LR_MULT", 1)),
+    lrMult: Number(pick("lrMult", "LR_MULT", 3)),
     lrPosBase: Number(pick("lrPosBase", "LR_POS_BASE", 0.05)),
     lrTauBase: Number(pick("lrTauBase", "LR_TAU_BASE", 0.01)),
     lrRadiusBase: Number(pick("lrRadiusBase", "LR_RADIUS_BASE", 0.02)),
@@ -153,7 +153,7 @@ export function buildArgs(config, overrides = {}) {
   };
   args.decayIters = Math.max(0, Math.floor(Number(overrides.iters !== undefined && overrides.decayIters === undefined
     ? overrides.iters - args.warmupIters
-    : pick("decayIters", "DECAY_ITERS", 3000))));
+    : pick("decayIters", "DECAY_ITERS", 500))));
   args.iters = args.warmupIters + args.decayIters;
   if (!Number.isFinite(args.initLogTau) || !Number.isFinite(args.initRadius)) {
     throw new Error("training_config.json missing INIT_LOG_TAU / INIT_RADIUS (required).");

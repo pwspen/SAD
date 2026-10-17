@@ -5,7 +5,7 @@
 
 import { loadShaders, tileSlotsForLimit } from "../trainer/shader_loader.js?v=shared-wgsl-20261017";
 import { requestTrainingDevice } from "../trainer/device.js?v=shared-wgsl-20261017";
-import { Trainer, buildArgs, GRAD_GROUPS } from "../trainer/trainer.js?v=shared-wgsl-20261017";
+import { Trainer, buildArgs, GRAD_GROUPS, lrSchedule } from "../trainer/trainer.js?v=lr-default-20261017";
 import { loadImageToFloat32, loadMaskRgba32Float, whiteMaskRgba32Float } from "../trainer/textures.js?v=shared-wgsl-20261017";
 import { loadSitesFromFile, serializeSitesTxt, triggerDownload, floatImageToRgba8, computeBpp, BITS_PER_SITE } from "../trainer/io.js?v=shared-wgsl-20261017";
 import { SITE_FLOATS } from "../trainer/params.js?v=shared-wgsl-20261017";
@@ -79,6 +79,8 @@ const state = {
   psnrIters: 0,
   bppRuns: [],           // [{ sites, bpp, points: [{ it, psnr }] }] per run on this target; last is current
   gradHistory: [],       // [{ it, stats }] per-param |grad| mean/max from log ticks
+  lrHistory: [],         // [{ it, lr }] LR multiplier (schedule × LR mult) from log ticks
+  lrPlan: null,          // { warmupIters, decayIters, lrMult } of the current run
   bandHistory: [],       // [{ it, snr: [dB per band] }] from every render
   targetAnalysis: null,  // viewer-side target luma / pyramid / spectrum (see targetAnalysis())
   spectra: null,         // spectra of the latest render (see currentSpectra())
@@ -243,6 +245,10 @@ const VIEWS = {
   grad:       { label: "|gradient| vs iteration (log)", kind: "plot", source: "train", on: ["log", "run"],
                 draw: drawGradPlot, hit: hitGrad,
                 note: "Per-parameter-group |gradient| over sites, reported by the trainer at each log tick." },
+  lr:         { label: "LR multiplier vs iteration", kind: "plot", source: "train", on: ["log", "run"],
+                draw: drawLrPlot, hit: hitLr,
+                note: "LR multiplier (warmup / cosine-decay schedule × LR mult) the trainer applied to every base " +
+                      "LR at each log tick. Dashed: the run's full planned schedule." },
   bandSnr:    { label: "Band SNR vs iteration", kind: "plot", source: "derived", on: ["render", "run"],
                 draw: drawBandSnrPlot, hit: hitBandSnr,
                 note: "Per luma Laplacian band: 10·log₁₀(Σ L_k(target)² / Σ L_k(recon − target)²), mask-weighted. " +
@@ -284,8 +290,8 @@ const LAYOUTS = {
   },
   plots: {
     label: "Plots",
-    areas: `"psnr bpp"
-            "grad grad"`,
+    areas: `"psnr bpp  lr"
+            "grad grad grad"`,
   },
   spectral: {
     label: "Spectral",
@@ -988,7 +994,7 @@ function attachPlotHover(view, card, canvas) {
 
 function iterRange() {
   const last = Math.max(state.psnrHistory.at(-1)?.it ?? 0, state.gradHistory.at(-1)?.it ?? 0,
-                        state.bandHistory.at(-1)?.it ?? 0);
+                        state.bandHistory.at(-1)?.it ?? 0, state.lrHistory.at(-1)?.it ?? 0);
   return { min: 0, max: Math.max(1, state.psnrIters, last) };
 }
 
@@ -1143,6 +1149,51 @@ function drawGradPlot(view) {
 
 function hitGrad(g, mx) {
   return nearestX(g, state.gradHistory, (d) => d.it, mx);
+}
+
+// ---- LR multiplier vs iteration ----
+
+function drawLrPlot(view) {
+  const p = beginPlot(view);
+  if (!p) return;
+  const data = state.lrHistory;
+  const plan = state.lrPlan;
+  const xr = iterRange();
+  // The planned schedule, sampled ~1 point per 2 px of plot width.
+  const planned = [];
+  if (plan) {
+    const n = Math.max(2, Math.floor((p.w - PLOT_PAD.left - PLOT_PAD.right) / 2));
+    const total = plan.warmupIters + plan.decayIters;
+    for (let i = 0; i <= n; i += 1) {
+      const it = Math.round((i / n) * Math.max(0, total - 1));
+      planned.push([it, plan.lrMult * lrSchedule(it, plan.warmupIters, plan.decayIters)]);
+    }
+  }
+  let hi = 0;
+  for (const [, v] of planned) hi = Math.max(hi, v);
+  for (const d of data) hi = Math.max(hi, d.lr);
+  const yr = { min: 0, max: hi > 0 ? niceTicks(0, hi * 1.08, 4).at(-1) || hi * 1.08 : 1 };
+  if (yr.max < hi) yr.max = hi * 1.08;
+  const g = view.geom = plotAxes(plotBox(p), xr, yr);
+  drawAxes(p, g, { xTitle: "iteration", yTitle: "LR multiplier", xFmt: fmtIter, yFmt: (v) => String(Number(v.toPrecision(3))) });
+  if (planned.length) drawLine(p, g, planned, PSNR_LINE_COLOR, { dash: [5, 4], width: 1.5 });
+  if (!data.length) {
+    drawEmpty(p, g, state.running ? "Waiting for first log tick…" : "Train to see the LR schedule");
+    return;
+  }
+  drawLine(p, g, data.map((d) => [d.it, d.lr]), PSNR_LINE_COLOR);
+  const hover = view.hoverKey != null ? data[view.hoverKey] : null;
+  if (hover) drawCrosshair(p, g, hover.it);
+  const mark = hover || data[data.length - 1];
+  drawMarker(p, g, mark.it, mark.lr, PSNR_LINE_COLOR);
+  if (hover) {
+    drawTooltip(p, g, g.x(hover.it), g.y(hover.lr),
+      { rows: [{ cells: [`iter ${hover.it} · LR ×${hover.lr.toPrecision(3)}`] }] });
+  }
+}
+
+function hitLr(g, mx) {
+  return nearestX(g, state.lrHistory, (d) => d.it, mx);
 }
 
 // ---- Band SNR vs iteration ----
@@ -1725,6 +1776,8 @@ async function startTraining() {
   state.psnrIters = args.iters;
   state.gradHistory = [];
   state.bandHistory = [];
+  state.lrHistory = [];
+  state.lrPlan = { warmupIters: args.warmupIters, decayIters: args.decayIters, lrMult: args.lrMult };
   state.lastActiveSites = initSiteCount;
   state.bppRuns.push({ sites: initSiteCount, bpp: computeBpp(initSiteCount, width, height), points: [] });
   for (const view of Object.values(VIEWS)) view.hoverKey = null;
@@ -1756,6 +1809,7 @@ async function startTraining() {
           run.points.push({ it: info.it, psnr: info.psnr });
         }
         if (info.gradStats) state.gradHistory.push({ it: info.it, stats: info.gradStats });
+        if (Number.isFinite(info.lrScale)) state.lrHistory.push({ it: info.it, lr: info.lrScale });
         recordBandSnr(info.it);
         state.lastHashed = null;
         state.lastHeatmap = null;
