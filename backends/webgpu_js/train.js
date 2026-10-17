@@ -855,8 +855,10 @@ function positionOverlay() {
   const parent = ui.previewCanvas.parentElement;
   const prect = ui.previewCanvas.getBoundingClientRect();
   const crect = parent.getBoundingClientRect();
-  ui.overlayCanvas.style.left = `${prect.left - crect.left}px`;
-  ui.overlayCanvas.style.top = `${prect.top - crect.top}px`;
+  // Absolute offsets are relative to the parent's padding box, while
+  // getBoundingClientRect is its border box, so subtract the card border.
+  ui.overlayCanvas.style.left = `${prect.left - crect.left - parent.clientLeft}px`;
+  ui.overlayCanvas.style.top = `${prect.top - crect.top - parent.clientTop}px`;
   ui.overlayCanvas.style.width = `${prect.width}px`;
   ui.overlayCanvas.style.height = `${prect.height}px`;
 }
@@ -938,14 +940,20 @@ async function ensureRender(mode) {
 }
 
 function drawCentroids(ctx) {
-  if (!state.lastSites) return;
+  if (!state.lastSites || !state.lastRender) return;
+  const { rgba, width, height } = state.lastRender;
   ctx.save();
-  ctx.fillStyle = "rgba(255, 196, 64, 0.82)";
   for (let i = 0; i < state.lastSiteCount; i += 1) {
     const base = i * SITE_FLOATS;
     const x = state.lastSites[base + 0];
     const y = state.lastSites[base + 1];
     if (x < 0) continue;
+    // Fill with the inverse of the rendered pixel under the dot so it stands out.
+    const px = Math.min(width - 1, Math.max(0, Math.floor(x)));
+    const py = Math.min(height - 1, Math.max(0, Math.floor(y)));
+    const p = (py * width + px) * 4;
+    const inv = (v) => 255 - Math.round(Math.max(0, Math.min(1, Number.isFinite(v) ? v : 0)) * 255);
+    ctx.fillStyle = `rgb(${inv(rgba[p])}, ${inv(rgba[p + 1])}, ${inv(rgba[p + 2])})`;
     ctx.beginPath();
     ctx.arc(x, y, 1.4, 0, Math.PI * 2);
     ctx.fill();

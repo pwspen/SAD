@@ -263,6 +263,13 @@
         display: block;
         flex: none;
       }
+      /* Centroid dots toggle on/off every second so the render underneath is visible. */
+      #overlayCanvas {
+        animation: overlay-blink 2s step-end infinite;
+      }
+      @keyframes overlay-blink {
+        50% { visibility: hidden; }
+      }
       .canvas-card.wide {
         grid-column: 1 / -1;
         width: 100%;
