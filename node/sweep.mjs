@@ -12,7 +12,7 @@ import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 
 import { Trainer, buildArgs } from "../trainer/trainer.js";
-import { parseSitesTxt, serializeSitesTxt, computePsnr } from "../trainer/io.js";
+import { parseSitesTxt, serializeSitesTxt, computePsnr, computeBpp, BITS_PER_SITE } from "../trainer/io.js";
 import {
   createHeadlessDevice,
   loadShadersFromDisk,
@@ -163,7 +163,8 @@ async function runOne(ctx, run) {
   const trainer = new Trainer(device, shaders, args, {
     onLog: (info) => {
       if (info.type === "iter") {
-        curve.push({ it: info.it, psnr: info.psnr, itsPerSec: info.itsPerSec, grads: info.gradStats?.groups });
+        curve.push({ it: info.it, psnr: info.psnr, bpp: computeBpp(info.activeSites, info.width, info.height),
+          itsPerSec: info.itsPerSec, grads: info.gradStats?.groups });
         if (cli.verbose) {
           console.error(`  [${name}] iter ${info.it} | ${info.psnr.toFixed(2)} dB | ${info.itsPerSec.toFixed(1)} it/s`);
         }
@@ -199,6 +200,7 @@ async function runOne(ctx, run) {
     return {
       name, ...run, startedAt, status: "ok",
       finalPsnr, bestPsnr: final.bestPsnr, sites: final.count,
+      bpp: computeBpp(final.count, final.width, final.height), bitsPerSite: BITS_PER_SITE,
       trainSeconds, itPerSecond: args.iters / Math.max(trainSeconds, 1e-6),
       args, curve,
     };
@@ -249,7 +251,7 @@ async function main() {
       const tag = `[${results.length}/${runs.length}] ${res.name}`;
       await appendFile(outPath, JSON.stringify(res) + "\n");
       if (res.status === "ok") {
-        console.error(`${tag} | final ${res.finalPsnr.toFixed(2)} dB | best ${res.bestPsnr.toFixed(2)} dB | ` +
+        console.error(`${tag} | final ${res.finalPsnr.toFixed(2)} dB @ ${res.bpp.toFixed(3)} bpp | best ${res.bestPsnr.toFixed(2)} dB | ` +
           `${res.itPerSecond.toFixed(1)} it/s | ${res.trainSeconds.toFixed(1)}s`);
       } else {
         console.error(`${tag} | FAILED: ${res.error.split("\n")[0]}`);
@@ -264,7 +266,7 @@ async function main() {
   const totalIters = ok.reduce((s, r) => s + r.args.iters, 0);
   console.error(`\nDone | ${ok.length}/${runs.length} ok | ${wallSeconds.toFixed(1)}s wall | ` +
     `${(totalIters / Math.max(wallSeconds, 1e-6)).toFixed(1)} it/s aggregate`);
-  for (const r of ok.slice(0, 10)) console.error(`  ${r.finalPsnr.toFixed(2)} dB  ${r.name}`);
+  for (const r of ok.slice(0, 10)) console.error(`  ${r.finalPsnr.toFixed(2)} dB  ${r.bpp.toFixed(3)} bpp  ${r.name}`);
 
   device.destroy();
   process.exit(ok.length === runs.length ? 0 : 1);

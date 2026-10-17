@@ -98,6 +98,14 @@ function formatNumber(v) {
   return s.includes("e") ? s : s.replace(/\.?0+$/, "").replace(/^$/, "0");
 }
 
+// Fixed per-site storage cost used for the raw rate metric (bits per pixel).
+// A stand-in for real quantization + entropy coding.
+export const BITS_PER_SITE = 128;
+
+export function computeBpp(siteCount, width, height) {
+  return (siteCount * BITS_PER_SITE) / Math.max(1, width * height);
+}
+
 // Compute PSNR between two Float32Array RGBA buffers (length W*H*4). Mask is
 // optional; only pixels with mask[i] > 0 contribute. Returns dB, with 100.0 as
 // a sentinel when MSE is 0.

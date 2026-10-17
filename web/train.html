@@ -237,7 +237,7 @@
         flex: 1;
         min-height: 0;
         display: grid;
-        grid-template-columns: repeat(4, 1fr);
+        grid-template-columns: repeat(5, 1fr);
         grid-auto-rows: max-content; /* cards are overflow:hidden, so rows would otherwise shrink */
         gap: 12px;
         padding: 12px;
@@ -281,6 +281,7 @@
         height: 320px;
       }
       .canvas-card canvas#psnrCanvas,
+      .canvas-card canvas#bppCanvas,
       .canvas-card canvas#gradCanvas {
         width: 100%;
         height: 100%;
@@ -481,6 +482,10 @@
           <div class="canvas-card">
             <span class="card-label">PSNR vs iteration</span>
             <canvas id="psnrCanvas"></canvas>
+          </div>
+          <div class="canvas-card">
+            <span class="card-label">PSNR vs bpp</span>
+            <canvas id="bppCanvas"></canvas>
           </div>
           <div class="canvas-card wide">
             <span class="card-label">|gradient| vs iteration (log)</span>

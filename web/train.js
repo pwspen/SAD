@@ -7,7 +7,7 @@ import { loadShaders, tileSlotsForLimit } from "../trainer/shader_loader.js?v=sh
 import { requestTrainingDevice } from "../trainer/device.js?v=shared-wgsl-20261017";
 import { Trainer, buildArgs, GRAD_GROUPS } from "../trainer/trainer.js?v=shared-wgsl-20261017";
 import { loadImageToFloat32, loadMaskRgba32Float, whiteMaskRgba32Float } from "../trainer/textures.js?v=shared-wgsl-20261017";
-import { loadSitesFromFile, serializeSitesTxt, triggerDownload, floatImageToRgba8 } from "../trainer/io.js?v=shared-wgsl-20261017";
+import { loadSitesFromFile, serializeSitesTxt, triggerDownload, floatImageToRgba8, computeBpp, BITS_PER_SITE } from "../trainer/io.js?v=shared-wgsl-20261017";
 import { SITE_FLOATS } from "../trainer/params.js?v=shared-wgsl-20261017";
 
 const CONFIG_URL = "../training_config.json";
@@ -73,6 +73,8 @@ const state = {
   psnrHistory: [],       // [{ it, psnr }] from log ticks, plotted in the PSNR card
   psnrIters: 0,
   psnrHover: null,       // index into psnrHistory under the cursor
+  bppRuns: [],           // [{ sites, bpp, points: [{ it, psnr }] }] per run on this target; last is current
+  bppHover: null,        // { run, point } under the cursor
   gradHistory: [],       // [{ it, stats }] per-param |grad| mean/max from log ticks
   gradHover: null,       // index into gradHistory under the cursor
 };
@@ -103,6 +105,7 @@ const ui = {
   targetCanvas: document.getElementById("targetCanvas"),
   residualCanvas: document.getElementById("residualCanvas"),
   psnrCanvas: document.getElementById("psnrCanvas"),
+  bppCanvas: document.getElementById("bppCanvas"),
   gradCanvas: document.getElementById("gradCanvas"),
   metricRow: document.getElementById("metricRow"),
   progressFill: document.getElementById("progressFill"),
@@ -193,6 +196,7 @@ function updateCanvasLayout(width = state.targetImage?.width, height = state.tar
   fitCanvasToCard(ui.residualCanvas, width || ui.residualCanvas.width, height || ui.residualCanvas.height);
   positionOverlay();
   drawPsnrPlot();
+  drawBppPlot();
   drawGradPlot();
 }
 
@@ -376,6 +380,225 @@ function handlePsnrHover(ev) {
   if (state.psnrHover !== best) {
     state.psnrHover = best;
     drawPsnrPlot();
+  }
+}
+
+// ---- PSNR vs bpp plot (log x) ----
+// Raw rate: active sites × BITS_PER_SITE / pixels. Runs on the current target
+// accumulate: earlier runs show as their final point (joined in bpp order, an
+// RD curve); the current run shows its log-tick trail at its fixed bpp.
+
+const BPP_PAST_COLOR = "#66666e";
+
+function logTicks(min, max) {
+  const ticks = [];
+  for (let e = Math.floor(Math.log10(min)); e <= Math.ceil(Math.log10(max)); e++) {
+    for (const m of [1, 2, 5]) {
+      const v = m * 10 ** e;
+      if (v >= min * (1 - 1e-9) && v <= max * (1 + 1e-9)) ticks.push(v);
+    }
+  }
+  return ticks;
+}
+
+function fmtBpp(v) {
+  return v >= 10 ? v.toFixed(0) : v >= 1 ? v.toFixed(1) : String(Number(v.toPrecision(2)));
+}
+
+// Plotted points: { x: bpp, y: psnr, run, point, current }.
+function bppPlotPoints() {
+  const runs = state.bppRuns;
+  const pts = [];
+  runs.forEach((r, ri) => {
+    const current = ri === runs.length - 1;
+    if (current) {
+      r.points.forEach((p, pi) => pts.push({ x: r.bpp, y: p.psnr, run: ri, point: pi, current }));
+    } else if (r.points.length) {
+      const pi = r.points.length - 1;
+      pts.push({ x: r.bpp, y: r.points[pi].psnr, run: ri, point: pi, current });
+    }
+  });
+  return pts;
+}
+
+function bppPlotGeometry(pts) {
+  const canvas = ui.bppCanvas;
+  const w = canvas.clientWidth;
+  const h = canvas.clientHeight;
+  let xMin = Infinity, xMax = -Infinity, yMin = Infinity, yMax = -Infinity;
+  for (const r of state.bppRuns) {
+    xMin = Math.min(xMin, r.bpp);
+    xMax = Math.max(xMax, r.bpp);
+  }
+  for (const p of pts) {
+    yMin = Math.min(yMin, p.y);
+    yMax = Math.max(yMax, p.y);
+  }
+  if (!(xMin > 0)) { xMin = 0.1; xMax = 10; }
+  // At least a decade of x range, centred on the data.
+  const span = Math.max(1, Math.log10(xMax / xMin) * 1.2);
+  const mid = (Math.log10(xMin) + Math.log10(xMax)) / 2;
+  const lx0 = mid - span / 2, lx1 = mid + span / 2;
+  if (!Number.isFinite(yMin)) { yMin = 0; yMax = 40; }
+  const yPad = Math.max(0.5, (yMax - yMin) * 0.08);
+  yMin = Math.floor(yMin - yPad);
+  yMax = Math.ceil(yMax + yPad);
+  const plotW = Math.max(1, w - PSNR_PAD.left - PSNR_PAD.right);
+  const plotH = Math.max(1, h - PSNR_PAD.top - PSNR_PAD.bottom);
+  return {
+    w, h, xMin: 10 ** lx0, xMax: 10 ** lx1, yMin, yMax,
+    x: (v) => PSNR_PAD.left + ((Math.log10(v) - lx0) / (lx1 - lx0)) * plotW,
+    y: (v) => PSNR_PAD.top + (1 - (v - yMin) / (yMax - yMin)) * plotH,
+  };
+}
+
+function drawBppPlot() {
+  const canvas = ui.bppCanvas;
+  if (!canvas) return;
+  const w = canvas.clientWidth;
+  const h = canvas.clientHeight;
+  if (w <= 0 || h <= 0) return;
+  const dpr = window.devicePixelRatio || 1;
+  if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) {
+    canvas.width = Math.round(w * dpr);
+    canvas.height = Math.round(h * dpr);
+  }
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+
+  const css = getComputedStyle(document.documentElement);
+  const lineCol = css.getPropertyValue("--line").trim() || "#e6e6df";
+  const dimCol = css.getPropertyValue("--text-dim").trim() || "#66666e";
+  const softCol = css.getPropertyValue("--text-soft").trim() || "#9a9aa2";
+  const textCol = css.getPropertyValue("--text").trim() || "#1d1d1f";
+  const surface = css.getPropertyValue("--canvas-bg").trim() || "#f1f1ec";
+
+  const pts = bppPlotPoints();
+  const g = bppPlotGeometry(pts);
+  const left = PSNR_PAD.left, right = w - PSNR_PAD.right;
+  const top = PSNR_PAD.top, bottom = h - PSNR_PAD.bottom;
+
+  ctx.font = "10.5px Inter, system-ui, -apple-system, sans-serif";
+  ctx.lineWidth = 1;
+
+  // Horizontal grid + y labels
+  ctx.textAlign = "right";
+  ctx.textBaseline = "middle";
+  for (const v of niceTicks(g.yMin, g.yMax, Math.max(2, Math.floor((bottom - top) / 48)))) {
+    const y = Math.round(g.y(v)) + 0.5;
+    ctx.strokeStyle = lineCol;
+    ctx.beginPath(); ctx.moveTo(left, y); ctx.lineTo(right, y); ctx.stroke();
+    ctx.fillStyle = softCol;
+    ctx.fillText(String(Math.round(v * 10) / 10), left - 6, y);
+  }
+
+  // Baseline + log x labels (thin out 2/5 ticks when crowded)
+  ctx.strokeStyle = softCol;
+  ctx.beginPath(); ctx.moveTo(left, bottom + 0.5); ctx.lineTo(right, bottom + 0.5); ctx.stroke();
+  ctx.textAlign = "center";
+  ctx.textBaseline = "top";
+  ctx.fillStyle = softCol;
+  let xt = logTicks(g.xMin, g.xMax);
+  if (xt.length > Math.max(2, Math.floor((right - left) / 40))) {
+    xt = xt.filter((v) => Math.abs(Math.log10(v) - Math.round(Math.log10(v))) < 1e-9);
+  }
+  for (const v of xt) ctx.fillText(fmtBpp(v), g.x(v), bottom + 6);
+
+  // Axis titles
+  ctx.fillStyle = dimCol;
+  ctx.fillText(`bpp (${BITS_PER_SITE} bits/site)`, (left + right) / 2, bottom + 20);
+  ctx.save();
+  ctx.translate(12, (top + bottom) / 2);
+  ctx.rotate(-Math.PI / 2);
+  ctx.textBaseline = "middle";
+  ctx.fillText("PSNR (dB)", 0, 0);
+  ctx.restore();
+
+  if (!pts.length) {
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillStyle = softCol;
+    ctx.fillText(state.running ? "Waiting for first log tick…" : "Train to see PSNR vs bpp", (left + right) / 2, (top + bottom) / 2);
+    return;
+  }
+
+  const drawMarker = (p, color, r = 4) => {
+    ctx.beginPath();
+    ctx.arc(g.x(p.x), g.y(p.y), r, 0, Math.PI * 2);
+    ctx.fillStyle = color;
+    ctx.fill();
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = surface;
+    ctx.stroke();
+  };
+
+  // Earlier runs: final points joined in bpp order
+  const past = pts.filter((p) => !p.current).sort((a, b) => a.x - b.x);
+  if (past.length > 1) {
+    ctx.strokeStyle = BPP_PAST_COLOR;
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    past.forEach((p, i) => (i === 0 ? ctx.moveTo(g.x(p.x), g.y(p.y)) : ctx.lineTo(g.x(p.x), g.y(p.y))));
+    ctx.stroke();
+  }
+  for (const p of past) drawMarker(p, BPP_PAST_COLOR, 3.5);
+
+  // Current run: vertical trail of log ticks, latest marked
+  const cur = pts.filter((p) => p.current);
+  if (cur.length) {
+    ctx.strokeStyle = PSNR_LINE_COLOR;
+    ctx.lineWidth = 2;
+    ctx.lineCap = "round";
+    const cx = g.x(cur[0].x);
+    const ys = cur.map((p) => g.y(p.y));
+    ctx.beginPath(); ctx.moveTo(cx, Math.min(...ys)); ctx.lineTo(cx, Math.max(...ys)); ctx.stroke();
+    drawMarker(cur[cur.length - 1], PSNR_LINE_COLOR);
+  }
+
+  const hover = state.bppHover &&
+    pts.find((p) => p.run === state.bppHover.run && p.point === state.bppHover.point);
+  if (!hover) return;
+
+  drawMarker(hover, hover.current ? PSNR_LINE_COLOR : BPP_PAST_COLOR, 5);
+  const run = state.bppRuns[hover.run];
+  const label = `${run.sites} sites · ${fmtBpp(hover.x)} bpp · ${hover.y.toFixed(2)} dB`;
+  ctx.font = "11px Inter, system-ui, -apple-system, sans-serif";
+  const tw = ctx.measureText(label).width + 14;
+  const th = 22;
+  const hx = g.x(hover.x);
+  let tx = hx + 10;
+  if (tx + tw > right) tx = hx - 10 - tw;
+  tx = Math.max(4, Math.min(w - tw - 4, tx));
+  const ty = Math.max(top, Math.min(bottom - th, g.y(hover.y) - th - 8));
+  ctx.fillStyle = "rgba(255, 255, 255, 0.94)";
+  ctx.strokeStyle = lineCol;
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.roundRect(tx, ty, tw, th, 5);
+  ctx.fill();
+  ctx.stroke();
+  ctx.fillStyle = textCol;
+  ctx.textAlign = "left";
+  ctx.textBaseline = "middle";
+  ctx.fillText(label, tx + 7, ty + th / 2);
+}
+
+function handleBppHover(ev) {
+  const pts = bppPlotPoints();
+  if (!pts.length) return;
+  const rect = ui.bppCanvas.getBoundingClientRect();
+  const mx = ev.clientX - rect.left, my = ev.clientY - rect.top;
+  const g = bppPlotGeometry(pts);
+  let best = null, bestDist = Infinity;
+  for (const p of pts) {
+    const d = Math.hypot(g.x(p.x) - mx, g.y(p.y) - my);
+    if (d < bestDist) { bestDist = d; best = p; }
+  }
+  const next = bestDist < 40 ? { run: best.run, point: best.point } : null;
+  if (next?.run !== state.bppHover?.run || next?.point !== state.bppHover?.point) {
+    state.bppHover = next;
+    drawBppPlot();
   }
 }
 
@@ -747,6 +970,9 @@ async function setTarget(file, name, token = ++state.targetToken) {
     const scaled = img.sourceWidth && img.sourceHeight &&
       (img.sourceWidth !== img.width || img.sourceHeight !== img.height);
     state.targetImage = img;
+    state.bppRuns = [];
+    state.bppHover = null;
+    drawBppPlot();
     drawTarget();
     // Blank the preview canvas to same size so layout matches immediately.
     ui.previewCanvas.width = img.width;
@@ -860,7 +1086,10 @@ async function startTraining() {
   state.psnrHover = null;
   state.gradHistory = [];
   state.gradHover = null;
+  state.bppRuns.push({ sites: initSiteCount, bpp: computeBpp(initSiteCount, width, height), points: [] });
+  state.bppHover = null;
   drawPsnrPlot();
+  drawBppPlot();
   drawGradPlot();
 
   appendLog(`Target: ${width}×${height} | sites: ${initSiteCount} | iters: ${args.warmupIters} warmup + ${args.decayIters} decay | lr ×${args.lrMult} | log: ${args.logFreq} | view: ${args.viewerFreq}`);
@@ -883,6 +1112,11 @@ async function startTraining() {
         if (Number.isFinite(info.psnr)) {
           state.psnrHistory.push({ it: info.it, psnr: info.psnr });
           drawPsnrPlot();
+          const run = state.bppRuns[state.bppRuns.length - 1];
+          run.sites = info.activeSites;
+          run.bpp = computeBpp(info.activeSites, info.width, info.height);
+          run.points.push({ it: info.it, psnr: info.psnr });
+          drawBppPlot();
         }
         if (info.gradStats) {
           state.gradHistory.push({ it: info.it, stats: info.gradStats });
@@ -1180,6 +1414,11 @@ async function main() {
     state.psnrHover = null;
     drawPsnrPlot();
   });
+  ui.bppCanvas.addEventListener("mousemove", handleBppHover);
+  ui.bppCanvas.addEventListener("mouseleave", () => {
+    state.bppHover = null;
+    drawBppPlot();
+  });
   ui.gradCanvas.addEventListener("mousemove", handleGradHover);
   ui.gradCanvas.addEventListener("mouseleave", () => {
     state.gradHover = null;
@@ -1191,11 +1430,13 @@ async function main() {
       else {
         positionOverlay();
         drawPsnrPlot();
+        drawBppPlot();
         drawGradPlot();
       }
     });
   });
   drawPsnrPlot();
+  drawBppPlot();
   drawGradPlot();
 }
 
