@@ -91,6 +91,7 @@ const ui = {
   previewCanvas: document.getElementById("previewCanvas"),
   overlayCanvas: document.getElementById("overlayCanvas"),
   targetCanvas: document.getElementById("targetCanvas"),
+  residualCanvas: document.getElementById("residualCanvas"),
   psnrCanvas: document.getElementById("psnrCanvas"),
   gradCanvas: document.getElementById("gradCanvas"),
   metricRow: document.getElementById("metricRow"),
@@ -170,7 +171,8 @@ function fitCanvasToCard(canvas, width = canvas.width, height = canvas.height) {
 }
 
 function updateCanvasLayout(width = state.targetImage?.width, height = state.targetImage?.height) {
-  const cards = [ui.targetCanvas.parentElement, ui.previewCanvas.parentElement];
+  const cards = [ui.targetCanvas.parentElement, ui.previewCanvas.parentElement,
+    ui.residualCanvas.parentElement];
   for (const card of cards) {
     card.style.removeProperty("aspect-ratio");
     card.style.removeProperty("width");
@@ -178,6 +180,7 @@ function updateCanvasLayout(width = state.targetImage?.width, height = state.tar
   }
   fitCanvasToCard(ui.targetCanvas, width || ui.targetCanvas.width, height || ui.targetCanvas.height);
   fitCanvasToCard(ui.previewCanvas, width || ui.previewCanvas.width, height || ui.previewCanvas.height);
+  fitCanvasToCard(ui.residualCanvas, width || ui.residualCanvas.width, height || ui.residualCanvas.height);
   positionOverlay();
   drawPsnrPlot();
   drawGradPlot();
@@ -620,6 +623,58 @@ function handleGradHover(ev) {
   }
 }
 
+// ---- Residual heatmap ----
+
+// Mean |recon - target| over RGB, mapped through a magma-like ramp on a fixed
+// [0, RESIDUAL_MAX] scale so frames stay comparable as training progresses.
+const RESIDUAL_MAX = 0.25;
+const RESIDUAL_STOPS = [
+  [0.00, [0, 0, 4]],
+  [0.25, [81, 18, 124]],
+  [0.50, [183, 55, 121]],
+  [0.75, [252, 137, 97]],
+  [1.00, [252, 253, 191]],
+];
+const RESIDUAL_LUT = (() => {
+  const lut = new Uint8Array(256 * 3);
+  for (let i = 0; i < 256; i += 1) {
+    const t = i / 255;
+    let k = 1;
+    while (k < RESIDUAL_STOPS.length - 1 && RESIDUAL_STOPS[k][0] < t) k += 1;
+    const [t0, c0] = RESIDUAL_STOPS[k - 1];
+    const [t1, c1] = RESIDUAL_STOPS[k];
+    const f = (t - t0) / (t1 - t0);
+    for (let c = 0; c < 3; c += 1) lut[i * 3 + c] = Math.round(c0[c] + (c1[c] - c0[c]) * f);
+  }
+  return lut;
+})();
+
+function drawResidual() {
+  const target = state.targetImage;
+  const render = state.lastRender;
+  if (!target || !render || render.width !== target.width || render.height !== target.height) return;
+  const { width, height } = render;
+  const a = render.rgba;
+  const b = target.data;
+  const out = new Uint8ClampedArray(width * height * 4);
+  const scale = 255 / (3 * RESIDUAL_MAX);
+  for (let p = 0, i = 0; p < width * height; p += 1, i += 4) {
+    const err = Math.abs(a[i] - b[i]) + Math.abs(a[i + 1] - b[i + 1]) + Math.abs(a[i + 2] - b[i + 2]);
+    const idx = Math.min(255, Math.round(err * scale)) * 3;
+    out[i] = RESIDUAL_LUT[idx];
+    out[i + 1] = RESIDUAL_LUT[idx + 1];
+    out[i + 2] = RESIDUAL_LUT[idx + 2];
+    out[i + 3] = 255;
+  }
+  const canvas = ui.residualCanvas;
+  if (canvas.width !== width || canvas.height !== height) {
+    canvas.width = width;
+    canvas.height = height;
+  }
+  fitCanvasToCard(canvas, width, height);
+  canvas.getContext("2d").putImageData(new ImageData(out, width, height), 0, 0);
+}
+
 function drawTarget() {
   if (!state.targetImage) return;
   const { data, width, height } = state.targetImage;
@@ -689,6 +744,11 @@ async function setTarget(file, name, token = ++state.targetToken) {
     const ctx = ui.previewCanvas.getContext("2d");
     ctx.fillStyle = "#0a0a0f";
     ctx.fillRect(0, 0, img.width, img.height);
+    ui.residualCanvas.width = img.width;
+    ui.residualCanvas.height = img.height;
+    const rctx = ui.residualCanvas.getContext("2d");
+    rctx.fillStyle = "#000004";
+    rctx.fillRect(0, 0, img.width, img.height);
     ui.overlayCanvas.width = img.width;
     ui.overlayCanvas.height = img.height;
     fitCanvasToCard(ui.previewCanvas, img.width, img.height);
@@ -942,6 +1002,7 @@ function drawCentroidOverlay() {
 
 async function drawView() {
   if (!state.lastRender) return;
+  drawResidual();
   const mode = ui.viewMode.value;
   const { rgba, width, height } = state.lastRender;
   ui.previewLabel.textContent = {
