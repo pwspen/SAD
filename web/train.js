@@ -12,6 +12,10 @@ import { SITE_FLOATS } from "../trainer/params.js?v=shared-wgsl-20261017";
 
 const CONFIG_URL = "../training_config.json";
 const DEMO_MAX_IMAGE_SIDE = 2048;
+// Kodak set lives outside this repo; the default resolves under the
+// kodak-bench server (which serves the parent dir). Override with ?kodak=<dir>.
+const KODAK_DIR = new URLSearchParams(location.search).get("kodak") || "../../comp/data/kodak/";
+const KODAK_COUNT = 24;
 
 // Fields that live in the advanced panel. The target image is in the top bar;
 // init-sites / mask are pickers inside the panel (not listed here).
@@ -41,6 +45,7 @@ const state = {
   shaders: null,
   config: null,
   targetImage: null,     // { data, width, height }
+  targetToken: 0,        // bumped per target load so stale loads are dropped
   maskData: null,        // { mask, rgba, maskSum } or null
   initSites: null,       // { data, width, height, count } or null
   running: false,
@@ -63,6 +68,9 @@ const ui = {
   status: document.getElementById("status"),
   imageInput: document.getElementById("imageInput"),
   imageLabel: document.getElementById("imageLabel"),
+  kodakSelect: document.getElementById("kodakSelect"),
+  kodakPrev: document.getElementById("kodakPrev"),
+  kodakNext: document.getElementById("kodakNext"),
   maskInput: document.getElementById("maskInput"),
   maskLabel: document.getElementById("maskLabel"),
   initSitesInput: document.getElementById("initSitesInput"),
@@ -619,11 +627,55 @@ function drawTarget() {
 async function handleImageInput(ev) {
   const file = ev.target.files[0];
   if (!file) return;
+  ui.kodakSelect.value = "";
+  await setTarget(file, file.name);
+}
+
+function kodakName(i) {
+  return `kodim${String(i).padStart(2, "0")}.png`;
+}
+
+async function loadKodak(i) {
+  if (state.running) return;
+  const name = kodakName(i);
+  // Fast flicks overlap loads; only the latest one may land.
+  const token = ++state.targetToken;
+  ui.kodakSelect.value = String(i);
+  // Clear so re-picking the same local file after a Kodak image still fires change.
+  ui.imageInput.value = "";
+  setStatus(`Loading ${name}…`);
+  ui.imageLabel.textContent = name;
+  try {
+    const res = await fetch(new URL(name, new URL(KODAK_DIR, location.href)));
+    if (!res.ok) throw new Error(`${name}: HTTP ${res.status}`);
+    const blob = await res.blob();
+    if (token !== state.targetToken) return;
+    await setTarget(blob, name, token);
+  } catch (err) {
+    setStatus(`Failed: ${err.message}`);
+    console.error(err);
+  }
+}
+
+function stepKodak(delta) {
+  const cur = Number(ui.kodakSelect.value) || (delta > 0 ? 0 : 1);
+  const next = ((cur - 1 + delta + KODAK_COUNT) % KODAK_COUNT) + 1;
+  loadKodak(next);
+}
+
+function setKodakEnabled(enabled) {
+  ui.kodakSelect.disabled = !enabled;
+  ui.kodakPrev.disabled = !enabled;
+  ui.kodakNext.disabled = !enabled;
+}
+
+async function setTarget(file, name, token = ++state.targetToken) {
   const maxDim = DEMO_MAX_IMAGE_SIDE;
-  setStatus(`Loading ${file.name}…`);
-  ui.imageLabel.textContent = file.name;
+  setStatus(`Loading ${name}…`);
+  ui.imageLabel.textContent = name;
   try {
     const img = await loadImageToFloat32(file, maxDim);
+    if (token !== state.targetToken) return;
     const scaled = img.sourceWidth && img.sourceHeight &&
       (img.sourceWidth !== img.width || img.sourceHeight !== img.height);
     state.targetImage = img;
@@ -707,6 +759,7 @@ async function startTraining() {
   ui.savePopover.classList.add("hidden");
   ui.startBtn.disabled = true;
   ui.stopBtn.disabled = false;
+  setKodakEnabled(false);
   state.running = true;
   state.abortCtrl = new AbortController();
   state.lastHashed = null;
@@ -822,6 +875,7 @@ async function startTraining() {
     state.running = false;
     ui.startBtn.disabled = false;
     ui.stopBtn.disabled = true;
+    setKodakEnabled(true);
   }
 }
 
@@ -1014,6 +1068,22 @@ async function main() {
   }
 
   ui.imageInput.addEventListener("change", handleImageInput);
+  for (let i = 1; i <= KODAK_COUNT; i += 1) {
+    ui.kodakSelect.add(new Option(kodakName(i).replace(".png", ""), String(i)));
+  }
+  ui.kodakSelect.addEventListener("change", () => {
+    if (ui.kodakSelect.value) loadKodak(Number(ui.kodakSelect.value));
+  });
+  ui.kodakPrev.addEventListener("click", () => stepKodak(-1));
+  ui.kodakNext.addEventListener("click", () => stepKodak(1));
+  document.addEventListener("keydown", (ev) => {
+    if (ev.key !== "ArrowLeft" && ev.key !== "ArrowRight") return;
+    if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
+    const tag = ev.target.tagName;
+    if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA") return;
+    ev.preventDefault();
+    stepKodak(ev.key === "ArrowRight" ? 1 : -1);
+  });
   ui.maskInput.addEventListener("change", handleMaskInput);
   ui.initSitesInput.addEventListener("change", handleInitSitesInput);
   ui.startBtn.addEventListener("click", startTraining);
