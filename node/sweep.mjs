@@ -29,8 +29,9 @@ const HELP = `Usage: node sweep.mjs --image <png> [options]
 
 Grid (cartesian product of all --set / --grid axes):
   --set key=v1,v2,...   Sweep a trainer arg (camelCase, e.g. sites, iters,
-                        lrPosBase, candFreq) or a training_config.json key
-                        (UPPER_CASE, e.g. INIT_LOG_TAU). Repeatable.
+                        lrPosBase, candFreq, colorSpace) or a
+                        training_config.json key (UPPER_CASE, e.g.
+                        INIT_LOG_TAU). Repeatable.
   --grid <json>         {"key": [values], ...} for a cartesian grid, or
                         [{"key": value, ...}, ...] for an explicit run list.
   --repeat <n>          Run each grid point n times (default 1).
@@ -86,6 +87,8 @@ function parseValue(raw) {
   const s = String(raw).trim();
   if (s === "true") return true;
   if (s === "false") return false;
+  // Bare names are string args (e.g. colorSpace=logchroma).
+  if (/^[A-Za-z][A-Za-z0-9_-]*$/.test(s)) return s;
   const n = Number(s);
   if (s === "" || Number.isNaN(n)) throw new Error(`Not a number: "${raw}"`);
   return n;

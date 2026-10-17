@@ -5,6 +5,7 @@ struct Site {
   position : vec2<f32>,
   log_tau : f32,
   radius_sq : f32,
+  // Color params in COLOR_SPACE (plain RGB by default); read via site_color().
   color_r : f32,
   color_g : f32,
   color_b : f32,
@@ -18,8 +19,51 @@ struct PackedCandidateSite {
   data : vec4<u32>,
 }
 
-fn site_color(site : Site) -> vec3<f32> {
+// Site color parameterization; see trainer/color_spaces.js, which must agree
+// with the three functions below. color_r/g/b hold params in this space and
+// site_color() decodes them to RGB. The trainer rewrites this line per run.
+// 0 = RGB, 1 = log intensity + chroma (mean log RGB, log R/G, log B/G).
+const COLOR_SPACE : u32 = 0u;
+const LOG_CHROMA_EPS : f32 = 0.00392156863; // 1/255
+
+fn decode_color(p : vec3<f32>) -> vec3<f32> {
+  switch COLOR_SPACE {
+    case 1u: {
+      let lg = p.x - (p.y + p.z) / 3.0;
+      return exp(vec3<f32>(lg + p.y, lg, lg + p.z)) - LOG_CHROMA_EPS;
+    }
+    default: { return p; }
+  }
+}
+
+fn encode_color(rgb : vec3<f32>) -> vec3<f32> {
+  switch COLOR_SPACE {
+    case 1u: {
+      let l = log(max(rgb, vec3<f32>(0.0)) + LOG_CHROMA_EPS);
+      return vec3<f32>((l.x + l.y + l.z) / 3.0, l.x - l.y, l.z - l.y);
+    }
+    default: { return rgb; }
+  }
+}
+
+// dLoss/dparams from dLoss/dRGB at params p (vector-Jacobian product).
+fn color_vjp(p : vec3<f32>, g_rgb : vec3<f32>) -> vec3<f32> {
+  switch COLOR_SPACE {
+    case 1u: {
+      let lg = p.x - (p.y + p.z) / 3.0;
+      let u = g_rgb * exp(vec3<f32>(lg + p.y, lg, lg + p.z));
+      return vec3<f32>(u.x + u.y + u.z, (2.0 * u.x - u.y - u.z) / 3.0, (2.0 * u.z - u.y - u.x) / 3.0);
+    }
+    default: { return g_rgb; }
+  }
+}
+
+fn site_color_params(site : Site) -> vec3<f32> {
   return vec3<f32>(site.color_r, site.color_g, site.color_b);
+}
+
+fn site_color(site : Site) -> vec3<f32> {
+  return decode_color(site_color_params(site));
 }
 
 fn site_aniso_dir(site : Site) -> vec2<f32> {

@@ -21,9 +21,10 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
                         loadGrad(base_g + 1u)) * scale;
   let g_log_tau = loadGrad(base_g + 2u) * scale;
   let g_radius_sq = loadGrad(base_g + 3u) * scale;
-  let g_color = vec3<f32>(loadGrad(base_g + 4u),
-                          loadGrad(base_g + 5u),
-                          loadGrad(base_g + 6u)) * scale;
+  // Accumulated against RGB; mapped to the site's color params below.
+  let g_rgb = vec3<f32>(loadGrad(base_g + 4u),
+                        loadGrad(base_g + 5u),
+                        loadGrad(base_g + 6u)) * scale;
   let g_dir = vec2<f32>(loadGrad(base_g + 7u),
                         loadGrad(base_g + 8u)) * scale;
   var g_log_aniso = loadGrad(base_g + 9u) * scale;
@@ -35,10 +36,12 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   if (is_bad(sites[idx].position.x) || is_bad(sites[idx].position.y) || is_bad(sites[idx].log_tau) ||
       is_bad(sites[idx].radius_sq) || is_bad3(site_color(sites[idx])) || is_bad(sites[idx].log_aniso) ||
       is_bad(g_pos.x) || is_bad(g_pos.y) || is_bad(g_log_tau) || is_bad(g_radius_sq) ||
-      is_bad3(g_color) || is_bad(safe_g_dir.x) || is_bad(safe_g_dir.y) || is_bad(g_log_aniso)) {
+      is_bad3(g_rgb) || is_bad(safe_g_dir.x) || is_bad(safe_g_dir.y) || is_bad(g_log_aniso)) {
     for (var c = 0u; c < 10u; c = c + 1u) { atomicStore(&grads[base_g + c], 0u); }
     return;
   }
+  let col_params = site_color_params(sites[idx]);
+  let g_color = color_vjp(col_params, g_rgb);
 
   let base = idx * 24u;
   var m_pos = vec2<f32>(adam[base + 0u], adam[base + 1u]);
@@ -87,7 +90,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   let m_hat_col = m_color * b1t_corr;
   let v_hat_col = v_color * b2t_corr;
   let step_col = params.lr_color * m_hat_col / (sqrt(v_hat_col) + params.eps);
-  let new_col = site_color(sites[idx]) - step_col;
+  let new_col = col_params - step_col;
   sites[idx].color_r = new_col.x;
   sites[idx].color_g = new_col.y;
   sites[idx].color_b = new_col.z;

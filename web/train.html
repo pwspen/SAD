@@ -176,7 +176,7 @@
         flex: 1;
         min-width: 0;
       }
-      .row input[type="number"], .row input[type="text"] {
+      .row input[type="number"], .row input[type="text"], .row select {
         width: 110px;
         font: inherit;
         font-size: 12px;
@@ -187,7 +187,8 @@
         border-radius: 6px;
         text-align: right;
       }
-      .row input[type="number"]:focus, .row input[type="text"]:focus {
+      .row select { text-align: left; }
+      .row input[type="number"]:focus, .row input[type="text"]:focus, .row select:focus {
         outline: none;
         border-color: var(--accent);
         box-shadow: 0 0 0 3px var(--focus);
@@ -523,6 +524,9 @@
         <div class="row"><label>inject count</label><input id="p-candInjectCount" type="number" /></div>
         <div class="row"><label>hilbert window</label><input id="p-candHilbertWindow" type="number" /></div>
         <div class="row"><label>hilbert probes</label><input id="p-candHilbertProbes" type="number" /></div>
+
+        <h3>Color</h3>
+        <div class="row"><label>space</label><select id="p-colorSpace" aria-label="Site color space"></select></div>
 
         <h3>Learning rates</h3>
         <div class="row"><label>LR mult</label><input id="p-lrMult" type="number" step="0.1" /></div>

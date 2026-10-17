@@ -68,6 +68,12 @@ import {
 } from "./encoders.js?v=shared-wgsl-20261017";
 
 import { RadixSortUInt2 } from "./radix_sort.js?v=shared-wgsl-20261017";
+import {
+  colorSpaceFor,
+  specializeShaders,
+  encodeSiteColors,
+  decodeSiteColors,
+} from "./color_spaces.js?v=color-space-20261017";
 
 const MAX_PREVIEW_IMAGE_READBACKS = 2;
 // Direction/anisotropy start learning here. Previously derived from the prune
@@ -121,6 +127,9 @@ export function buildArgs(config, overrides = {}) {
     logFreq: Math.max(1, Number(pick("logFreq", null, 50))),
     viewerFreq: Math.max(1, Number(pick("viewerFreq", null, 50))),
     lrMult: Number(pick("lrMult", "LR_MULT", 3)),
+    // Site color parameterization (a key of COLOR_SPACES in color_spaces.js).
+    // Sites stay RGB outside the trainer; only the optimized params change.
+    colorSpace: String(pick("colorSpace", "COLOR_SPACE", "rgb")),
     lrPosBase: Number(pick("lrPosBase", "LR_POS_BASE", 0.05)),
     lrTauBase: Number(pick("lrTauBase", "LR_TAU_BASE", 0.01)),
     lrRadiusBase: Number(pick("lrRadiusBase", "LR_RADIUS_BASE", 0.02)),
@@ -155,6 +164,7 @@ export function buildArgs(config, overrides = {}) {
     ? overrides.iters - args.warmupIters
     : pick("decayIters", "DECAY_ITERS", 500))));
   args.iters = args.warmupIters + args.decayIters;
+  colorSpaceFor(args.colorSpace); // fail early on an unknown name
   if (!Number.isFinite(args.initLogTau) || !Number.isFinite(args.initRadius)) {
     throw new Error("training_config.json missing INIT_LOG_TAU / INIT_RADIUS (required).");
   }
@@ -170,6 +180,8 @@ async function yieldToBrowser() {
 export class Trainer {
   constructor(device, shaders, args, { onLog = null, signal = null } = {}) {
     this.device = device;
+    this.colorSpace = colorSpaceFor(args.colorSpace);
+    shaders = specializeShaders(shaders, this.colorSpace);
     this.shaders = shaders;
     this.args = args;
     this.onLog = onLog;
@@ -314,7 +326,8 @@ export class Trainer {
       const src = initSites.byteLength <= maxBytes
         ? initSites
         : new Float32Array(initSites.buffer, initSites.byteOffset, maxBytes / 4);
-      device.queue.writeBuffer(this.sitesBuf, 0, src);
+      device.queue.writeBuffer(this.sitesBuf, 0,
+        encodeSiteColors(src.slice(), initSiteCount, this.colorSpace));
       this.actualSites = initSiteCount;
       this.activeEstimate = 0;
       for (let i = 0; i < initSiteCount; i += 1) {
@@ -571,7 +584,7 @@ export class Trainer {
 
       if (shouldLog) {
         const rgba = await readRgba32FloatTexture(device, this.renderTex, this.width, this.height);
-        const sitesData = await readSites(device, this.sitesBuf, siteCount);
+        const sitesData = await this._readSitesRgb(siteCount);
         this._lastSitesCpu = sitesData;
         await gradStaging.mapAsync(GPUMapMode.READ);
         const gradStats = computeGradStats(new Float32Array(gradStaging.getMappedRange()),
@@ -681,7 +694,8 @@ export class Trainer {
 
   _finishPreviewSiteReadback(req) {
     return req.siteStaging.mapAsync(GPUMapMode.READ).then(async () => {
-      const sitesData = new Float32Array(req.siteStaging.getMappedRange()).slice();
+      const sitesData = decodeSiteColors(new Float32Array(req.siteStaging.getMappedRange()).slice(),
+        req.postSites, this.colorSpace);
       req.siteStaging.unmap();
       req.siteStaging.destroy();
       this._lastSitesCpu = sitesData;
@@ -813,9 +827,16 @@ export class Trainer {
 
   setLastSites(data) { this._lastSitesCpu = data; }
 
+  // Site readback with colors decoded to RGB, so nothing outside the trainer
+  // sees color-space params.
+  async _readSitesRgb(count) {
+    const data = await readSites(this.device, this.sitesBuf, count);
+    return decodeSiteColors(data, count, this.colorSpace);
+  }
+
   async finalize() {
     const rgba = await readRgba32FloatTexture(this.device, this.renderTex, this.width, this.height);
-    const sitesArray = await readSites(this.device, this.sitesBuf, this.actualSites);
+    const sitesArray = await this._readSitesRgb(this.actualSites);
     return {
       renderRgba: rgba,
       sites: sitesArray,

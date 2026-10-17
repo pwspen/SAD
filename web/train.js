@@ -9,6 +9,7 @@ import { Trainer, buildArgs, GRAD_GROUPS, lrSchedule } from "../trainer/trainer.
 import { loadImageToFloat32, loadMaskRgba32Float, whiteMaskRgba32Float } from "../trainer/textures.js?v=shared-wgsl-20261017";
 import { loadSitesFromFile, serializeSitesTxt, triggerDownload, floatImageToRgba8, computeBpp, BITS_PER_SITE } from "../trainer/io.js?v=shared-wgsl-20261017";
 import { SITE_FLOATS } from "../trainer/params.js?v=shared-wgsl-20261017";
+import { COLOR_SPACES } from "../trainer/color_spaces.js?v=color-space-20261017";
 import {
   luma, maskWeights, laplacianBands, maskLevels, bandEnergies, IMPORTANCE, importanceMap,
   spectralPlan, windowedSpectrum, spectrumDiff, radialStats, frcCrossing, logPowerImage,
@@ -54,6 +55,7 @@ const UI_FIELDS = [
   ["flowPyrCell", "p-flowPyrCell"],
   ["flowPyrLevels", "p-flowPyrLevels"],
   ["flowPyrGamma", "p-flowPyrGamma"],
+  ["colorSpace", "p-colorSpace"],
 ];
 
 const state = {
@@ -77,7 +79,7 @@ const state = {
   lastActiveSites: 0,    // active sites at the last log tick (site-spacing reference lines)
   psnrHistory: [],       // [{ it, psnr }] from log ticks, plotted in the PSNR card
   psnrIters: 0,
-  bppRuns: [],           // [{ sites, bpp, points: [{ it, psnr }] }] per run on this target; last is current
+  bppRuns: [],           // [{ sites, bpp, colorSpace, points: [{ it, psnr }] }] per run on this target; last is current
   gradHistory: [],       // [{ it, stats }] per-param |grad| mean/max from log ticks
   lrHistory: [],         // [{ it, lr }] LR multiplier (schedule × LR mult) from log ticks
   lrPlan: null,          // { warmupIters, decayIters, lrMult } of the current run
@@ -131,6 +133,8 @@ function appendLog(line) {
 }
 
 function applyConfigToForm(config) {
+  const spaceSelect = document.getElementById("p-colorSpace");
+  spaceSelect.replaceChildren(...Object.entries(COLOR_SPACES).map(([key, space]) => new Option(space.label, key)));
   const defaults = buildArgs(config, {});
   for (const [key, elId] of UI_FIELDS) {
     const el = document.getElementById(elId);
@@ -148,6 +152,7 @@ function readFormArgs() {
     const el = document.getElementById(elId);
     if (!el) continue;
     if (el.type === "checkbox") overrides[key] = el.checked;
+    else if (el.tagName === "SELECT") overrides[key] = el.value;
     else if (el.value === "") continue;
     else overrides[key] = Number(el.value);
   }
@@ -1029,9 +1034,16 @@ function hitPsnr(g, mx) {
 // ---- PSNR vs bpp (log x) ----
 // Raw rate: active sites × BITS_PER_SITE / pixels. Runs on the current target
 // accumulate: earlier runs show as their final point (joined in bpp order, an
-// RD curve); the current run shows its log-tick trail at its fixed bpp.
+// RD curve per site color space); the current run shows its log-tick trail at
+// its fixed bpp.
 
 const BPP_PAST_COLOR = "#66666e";
+
+// RGB keeps the neutral past-run color; other spaces take series hues.
+function colorSpaceColor(key) {
+  const i = Object.keys(COLOR_SPACES).indexOf(key);
+  return i <= 0 ? BPP_PAST_COLOR : SERIES_COLORS[(i - 1) % SERIES_COLORS.length];
+}
 
 // Plotted points: { x: bpp, y: psnr, run, point, current }.
 function bppPlotPoints() {
@@ -1061,17 +1073,26 @@ function drawBppPlot(view) {
   const span = Math.max(1, Math.log10(xMax / xMin) * 1.2);
   const mid = (Math.log10(xMin) + Math.log10(xMax)) / 2;
   const xr = { min: 10 ** (mid - span / 2), max: 10 ** (mid + span / 2), log: true };
-  const g = view.geom = plotAxes(plotBox(p), xr, linRange(lo, hi, [0, 40]));
+  // Color-space legend only once runs in more than one space are on the plot.
+  const spaces = [...new Set(state.bppRuns.map((r) => r.colorSpace))];
+  const top = spaces.length > 1
+    ? drawLegend(p, spaces.map((key) => ({ label: COLOR_SPACES[key].label, color: colorSpaceColor(key) }))) + 10
+    : undefined;
+  const g = view.geom = plotAxes(plotBox(p, top), xr, linRange(lo, hi, [0, 40]));
   drawAxes(p, g, { xTitle: `bpp (${BITS_PER_SITE} bits/site)`, yTitle: "PSNR (dB)", xFmt: fmtSig, xSpacing: 40 });
   if (!pts.length) {
     drawEmpty(p, g, state.running ? "Waiting for first log tick…" : "Train to see PSNR vs bpp");
     return;
   }
 
-  // Earlier runs: final points joined in bpp order
-  const past = pts.filter((pt) => !pt.current).sort((a, b) => a.x - b.x);
-  if (past.length > 1) drawLine(p, g, past.map((pt) => [pt.x, pt.y]), BPP_PAST_COLOR, { width: 1.5 });
-  for (const pt of past) drawMarker(p, g, pt.x, pt.y, BPP_PAST_COLOR, 3.5);
+  // Earlier runs: final points joined in bpp order, one curve per color space
+  for (const space of spaces) {
+    const color = colorSpaceColor(space);
+    const past = pts.filter((pt) => !pt.current && state.bppRuns[pt.run].colorSpace === space)
+      .sort((a, b) => a.x - b.x);
+    if (past.length > 1) drawLine(p, g, past.map((pt) => [pt.x, pt.y]), color, { width: 1.5 });
+    for (const pt of past) drawMarker(p, g, pt.x, pt.y, color, 3.5);
+  }
 
   // Current run: vertical trail of log ticks, latest marked
   const cur = pts.filter((pt) => pt.current);
@@ -1084,10 +1105,11 @@ function drawBppPlot(view) {
 
   const hover = view.hoverKey && pts.find((pt) => `${pt.run}:${pt.point}` === view.hoverKey);
   if (!hover) return;
-  drawMarker(p, g, hover.x, hover.y, hover.current ? PSNR_LINE_COLOR : BPP_PAST_COLOR, 5);
   const run = state.bppRuns[hover.run];
-  drawTooltip(p, g, g.x(hover.x), g.y(hover.y),
-    { rows: [{ cells: [`${run.sites} sites · ${fmtSig(hover.x)} bpp · ${hover.y.toFixed(2)} dB`] }] });
+  drawMarker(p, g, hover.x, hover.y, hover.current ? PSNR_LINE_COLOR : colorSpaceColor(run.colorSpace), 5);
+  drawTooltip(p, g, g.x(hover.x), g.y(hover.y), {
+    rows: [{ cells: [`${run.sites} sites · ${fmtSig(hover.x)} bpp · ${hover.y.toFixed(2)} dB · ${COLOR_SPACES[run.colorSpace].label}`] }],
+  });
 }
 
 function hitBpp(g, mx, my) {
@@ -1821,11 +1843,13 @@ async function startTraining() {
   state.lrHistory = [];
   state.lrPlan = { warmupIters: args.warmupIters, decayIters: args.decayIters, lrMult: args.lrMult };
   state.lastActiveSites = initSiteCount;
-  state.bppRuns.push({ sites: initSiteCount, bpp: computeBpp(initSiteCount, width, height), points: [] });
+  state.bppRuns.push({
+    sites: initSiteCount, bpp: computeBpp(initSiteCount, width, height), colorSpace: args.colorSpace, points: [],
+  });
   for (const view of Object.values(VIEWS)) view.hoverKey = null;
   await refreshViews("run");
 
-  appendLog(`Target: ${width}×${height} | sites: ${initSiteCount} | iters: ${args.warmupIters} warmup + ${args.decayIters} decay | lr ×${args.lrMult} | log: ${args.logFreq} | view: ${args.viewerFreq}`);
+  appendLog(`Target: ${width}×${height} | sites: ${initSiteCount} | iters: ${args.warmupIters} warmup + ${args.decayIters} decay | lr ×${args.lrMult} | color: ${COLOR_SPACES[args.colorSpace].label} | log: ${args.logFreq} | view: ${args.viewerFreq}`);
   updateProgress(0, args.iters, "Preparing…");
 
   const trainer = new Trainer(state.device, state.shaders, args, {

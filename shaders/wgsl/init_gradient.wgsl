@@ -64,9 +64,10 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   s.position = acceptedPos;
   s.log_tau = params.initLogTau + pow(acceptedGradient, 0.25) * 2.0;
   s.radius_sq = params.initRadius;
-  s.color_r = acceptedColor.r;
-  s.color_g = acceptedColor.g;
-  s.color_b = acceptedColor.b;
+  let colorParams = encode_color(acceptedColor);
+  s.color_r = colorParams.x;
+  s.color_g = colorParams.y;
+  s.color_b = colorParams.z;
   s.aniso_dir_x = 1.0;
   s.aniso_dir_y = 0.0;
   s.log_aniso = 0.0;
