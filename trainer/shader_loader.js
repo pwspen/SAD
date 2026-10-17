@@ -47,6 +47,11 @@ const SHADER_FILES = [
   "radix_sort",
   "render_hashed",
   "render_tau_heatmap",
+  "lloyd_accum",
+  "flow_step",
+  "pyr_count",
+  "pyr_base",
+  "pyr_reduce",
 ];
 
 let _cache = null;
@@ -114,6 +119,11 @@ export async function loadShaders({ tileSlots = 128, readText = fetchText } = {}
     RADIX_SORT: out.radix_sort,
     RENDER_HASHED: out.render_hashed,
     RENDER_TAU_HEATMAP: out.render_tau_heatmap,
+    LLOYD_ACCUM: out.lloyd_accum,
+    FLOW_STEP: out.flow_step,
+    PYR_COUNT: out.pyr_count,
+    PYR_BASE: out.pyr_base,
+    PYR_REDUCE: out.pyr_reduce,
     tileSlots,
   };
   return _cache;

@@ -40,6 +40,16 @@ const UI_FIELDS = [
   ["lrColorBase", "p-lrColorBase"],
   ["lrDirBase", "p-lrDirBase"],
   ["lrAnisoBase", "p-lrAnisoBase"],
+  ["flowStrength", "p-flowStrength"],
+  ["flowStartIter", "p-flowStartIter"],
+  ["flowEndIter", "p-flowEndIter"],
+  ["flowMaxStep", "p-flowMaxStep"],
+  ["flowEmaAlpha", "p-flowEmaAlpha"],
+  ["flowGeoMix", "p-flowGeoMix"],
+  ["flowPyrStrength", "p-flowPyrStrength"],
+  ["flowPyrCell", "p-flowPyrCell"],
+  ["flowPyrLevels", "p-flowPyrLevels"],
+  ["flowPyrGamma", "p-flowPyrGamma"],
 ];
 
 const state = {

@@ -417,3 +417,86 @@ export class HilbertEncoder {
     dispatch1D(encoder, this.writePipeline, bg, Math.ceil(siteCount / 256));
   }
 }
+
+// Residual-driven site flow: lloyd_accum gathers error-weighted centroid moments
+// per site (and updates the per-pixel error EMA); flow_step moves sites toward
+// them after Adam and clears the moments.
+export class FlowEncoder {
+  constructor(device, shaders) {
+    this.device = device;
+    this.accumPipeline = makePipeline(device, shaders.LLOYD_ACCUM);
+    this.stepPipeline = makePipeline(device, shaders.FLOW_STEP);
+    this._views = new Map();
+    this._bgs = new Map();
+  }
+  encodeAccum(encoder, sitesBuffer, flowParams, cand0, cand1, targetTex, maskTex,
+              errEmaBuffer, flowBuffer, width, height) {
+    const entries = [
+      { binding: 0, resource: { buffer: sitesBuffer } },
+      { binding: 1, resource: { buffer: flowParams } },
+      { binding: 2, resource: getTextureView(this._views, cand0) },
+      { binding: 3, resource: getTextureView(this._views, cand1) },
+      { binding: 4, resource: getTextureView(this._views, targetTex) },
+      { binding: 5, resource: getTextureView(this._views, maskTex) },
+      { binding: 6, resource: { buffer: errEmaBuffer } },
+      { binding: 7, resource: { buffer: flowBuffer } },
+    ];
+    const layout = this.accumPipeline.getBindGroupLayout(0);
+    const bg = getBindGroup(this.device, this._bgs, layout, entries);
+    dispatch2D(encoder, this.accumPipeline, bg,
+      Math.ceil(width / 16), Math.ceil(height / 16));
+  }
+  encodeStep(encoder, sitesBuffer, flowBuffer, flowParams, pyrCells, pyrParams, siteCount) {
+    const entries = [
+      { binding: 0, resource: { buffer: sitesBuffer } },
+      { binding: 1, resource: { buffer: flowBuffer } },
+      { binding: 2, resource: { buffer: flowParams } },
+      { binding: 3, resource: { buffer: pyrCells } },
+      { binding: 4, resource: { buffer: pyrParams } },
+    ];
+    const layout = this.stepPipeline.getBindGroupLayout(0);
+    const bg = getBindGroup(this.device, this._bgs, layout, entries);
+    dispatch1D(encoder, this.stepPipeline, bg, Math.ceil(siteCount / 256));
+  }
+}
+
+// Residual-flow pyramid build: bin sites into level-0 cells, sum the error EMA
+// per level-0 cell, then 2x2-reduce up to 1x1. `pyrParams[l]` is level l's
+// uniform (identical apart from `level`).
+export class PyramidEncoder {
+  constructor(device, shaders) {
+    this.device = device;
+    this.countPipeline = makePipeline(device, shaders.PYR_COUNT);
+    this.basePipeline = makePipeline(device, shaders.PYR_BASE);
+    this.reducePipeline = makePipeline(device, shaders.PYR_REDUCE);
+  }
+  encode(encoder, sitesBuffer, errEmaBuffer, cnt0Buffer, cellsBuffer, pyrParams, levels, siteCount) {
+    encoder.clearBuffer(cnt0Buffer);
+    const dev = this.device;
+    let layout = this.countPipeline.getBindGroupLayout(0);
+    let bg = dev.createBindGroup({ layout, entries: [
+      { binding: 0, resource: { buffer: sitesBuffer } },
+      { binding: 1, resource: { buffer: cnt0Buffer } },
+      { binding: 2, resource: { buffer: pyrParams[0] } },
+    ] });
+    dispatch1D(encoder, this.countPipeline, bg, Math.ceil(siteCount / 256));
+
+    layout = this.basePipeline.getBindGroupLayout(0);
+    bg = dev.createBindGroup({ layout, entries: [
+      { binding: 0, resource: { buffer: errEmaBuffer } },
+      { binding: 1, resource: { buffer: cnt0Buffer } },
+      { binding: 2, resource: { buffer: cellsBuffer } },
+      { binding: 3, resource: { buffer: pyrParams[0] } },
+    ] });
+    dispatch2D(encoder, this.basePipeline, bg, Math.ceil(levels[0].w / 8), Math.ceil(levels[0].h / 8));
+
+    layout = this.reducePipeline.getBindGroupLayout(0);
+    for (let l = 1; l < levels.length; l += 1) {
+      bg = dev.createBindGroup({ layout, entries: [
+        { binding: 0, resource: { buffer: cellsBuffer } },
+        { binding: 1, resource: { buffer: pyrParams[l] } },
+      ] });
+      dispatch2D(encoder, this.reducePipeline, bg, Math.ceil(levels[l].w / 8), Math.ceil(levels[l].h / 8));
+    }
+  }
+}

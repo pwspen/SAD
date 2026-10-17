@@ -20,6 +20,10 @@ import {
   updateTauParamsBuffer,
   createHilbertParamsBuffer,
   updateHilbertParamsBuffer,
+  createFlowParamsBuffer,
+  updateFlowParamsBuffer,
+  createPyrParamsBuffer,
+  pyramidLevels,
   packJumpStep,
   hilbertBitsForSize,
 } from "./params.js?v=shared-wgsl-20261017";
@@ -59,6 +63,8 @@ import {
   TauEncoder,
   ClearBufferEncoder,
   HilbertEncoder,
+  FlowEncoder,
+  PyramidEncoder,
 } from "./encoders.js?v=shared-wgsl-20261017";
 
 import { RadixSortUInt2 } from "./radix_sort.js?v=shared-wgsl-20261017";
@@ -75,6 +81,14 @@ export function lrSchedule(it, warmupIters, decayIters) {
   if (it < warmupIters) return (it + 1) / warmupIters;
   const t = Math.min(1, (it - warmupIters) / Math.max(1, decayIters));
   return 0.5 * (1 + Math.cos(Math.PI * t));
+}
+
+// Residual-flow strength multiplier at step `it`: 0 before `startIter`, then a
+// linear ramp from 1 down to 0 at `endIter`, so the end of training is pure
+// gradient descent on the loss.
+export function flowSchedule(it, startIter, endIter) {
+  if (it < startIter || it >= endIter) return 0;
+  return 1 - (it - startIter) / Math.max(1, endIter - startIter);
 }
 
 // Collect default args from a training_config.json-style object + user
@@ -119,6 +133,23 @@ export function buildArgs(config, overrides = {}) {
     beta2: Number(pick("beta2", "BETA2", 0.999)),
     eps: Number(pick("eps", "EPS", 1e-8)),
     maxDim: Number(pick("maxDim", "MAX_DIM", 2048)),
+    // Residual-driven site flow (error-weighted Lloyd). flowStrength is the
+    // fraction of the way to the cell's error centroid moved per step; 0 = off.
+    flowStrength: Number(pick("flowStrength", "FLOW_STRENGTH", 0)),
+    flowStartIter: Number(pick("flowStartIter", "FLOW_START_ITER", 200)),
+    flowEndIter: Number(pick("flowEndIter", "FLOW_END_ITER", 2000)),
+    flowMaxStep: Number(pick("flowMaxStep", "FLOW_MAX_STEP", 1.0)),
+    flowEmaAlpha: Number(pick("flowEmaAlpha", "FLOW_EMA_ALPHA", 0.1)),
+    // 0 = weighted Lloyd (error centroid); 1 = pure residual pull (error
+    // centroid minus geometric centroid, so uniform error doesn't move sites).
+    flowGeoMix: Number(pick("flowGeoMix", "FLOW_GEO_MIX", 0)),
+    // Multi-scale pull toward regions with more error per site than average
+    // (see flow_step.wgsl); 0 = off. flowPyrCell is the finest cell size in px.
+    flowPyrStrength: Number(pick("flowPyrStrength", "FLOW_PYR_STRENGTH", 0)),
+    flowPyrCell: Math.max(1, Math.floor(Number(pick("flowPyrCell", "FLOW_PYR_CELL", 8)))),
+    flowPyrLevels: Math.max(0, Math.floor(Number(pick("flowPyrLevels", "FLOW_PYR_LEVELS", 0)))),
+    // Target density exponent: the pyramid equalizes err^gamma per site.
+    flowPyrGamma: Number(pick("flowPyrGamma", "FLOW_PYR_GAMMA", 1)),
   };
   args.decayIters = Math.max(0, Math.floor(Number(overrides.iters !== undefined && overrides.decayIters === undefined
     ? overrides.iters - args.warmupIters
@@ -163,6 +194,11 @@ export class Trainer {
     this.tauEnc = new TauEncoder(device, shaders);
     this.clearI32Enc = new ClearBufferEncoder(device, shaders, { useI32: true });
     this.hilbertEnc = this.usesHilbert ? new HilbertEncoder(device, shaders) : null;
+    this.usesFlow = (args.flowStrength > 0 || args.flowPyrStrength > 0) &&
+      args.flowEndIter > args.flowStartIter;
+    this.usesPyr = this.usesFlow && args.flowPyrStrength > 0;
+    this.flowEnc = this.usesFlow ? new FlowEncoder(device, shaders) : null;
+    this.pyrEnc = this.usesPyr ? new PyramidEncoder(device, shaders) : null;
   }
 
   async prepare({ width, height, targetRgba32f, maskRgba32f, maskSum, initSites, initSiteCount }) {
@@ -231,6 +267,28 @@ export class Trainer {
     this.countParams = createClearParamsBuffer(device, initSiteCount);
     this.gradCountParams = createClearParamsBuffer(device, initSiteCount * 10);
     this.tauParams = createTauParamsBuffer(device, initSiteCount, TAU_DIFFUSE_LAMBDA, this.candDownscale);
+
+    // Residual flow: per-pixel error EMA + per-site centroid moments (6 f32).
+    // WebGPU zero-initializes both; flow_step re-zeroes the moments after use.
+    if (this.usesFlow) {
+      this.errEmaBuf = device.createBuffer({ size: width * height * 4, usage: GPUBufferUsage.STORAGE });
+      this.flowBuf = createAtomicU32Buffer(device, this.bufferCapacity * 6);
+      this.flowParams = createFlowParamsBuffer(device, this._flowParamsArgs(initSiteCount, 0));
+      // Pyramid (only allocated at full size when the pyramid term is on;
+      // flow_step always binds it).
+      const pyr = this.usesPyr
+        ? pyramidLevels(width, height, args.flowPyrCell)
+        : { levels: [{ w: 1, h: 1, offset: 0, cell: Math.max(width, height) }], totalCells: 1 };
+      this.pyrLevels = pyr.levels;
+      this.pyrCnt0 = device.createBuffer({
+        size: pyr.levels[0].w * pyr.levels[0].h * 4,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      });
+      this.pyrCells = device.createBuffer({ size: pyr.totalCells * 8, usage: GPUBufferUsage.STORAGE });
+      this.pyrParams = pyr.levels.map((_, level) => createPyrParamsBuffer(device, {
+        levels: pyr.levels, level, siteCount: initSiteCount, width, height, gamma: args.flowPyrGamma,
+      }));
+    }
 
     // Hilbert resources
     this.dummyHilbertBuf = createDummyStorageBuffer(device);
@@ -331,6 +389,21 @@ export class Trainer {
     };
   }
 
+  _flowParamsArgs(siteCount, scale) {
+    return {
+      siteCount,
+      width: this.width,
+      height: this.height,
+      geoMix: this.args.flowGeoMix,
+      invScaleSq: this.invScaleSq,
+      emaAlpha: this.args.flowEmaAlpha,
+      strength: this.args.flowStrength * scale,
+      maxStep: this.args.flowMaxStep,
+      pyrStrength: this.args.flowPyrStrength * scale,
+      pyrLevels: this.args.flowPyrLevels,
+    };
+  }
+
   _log(msg) { if (this.onLog) this.onLog({ type: "msg", message: msg }); }
 
   _hilbertOrderBuf() {
@@ -397,6 +470,11 @@ export class Trainer {
       const lambda = TAU_DIFFUSE_LAMBDA * (0.1 + 0.9 * blend);
       updateTauParamsBuffer(queue, this.tauParams, siteCount, lambda, this.candDownscale);
 
+      const flowScale = this.usesFlow ? flowSchedule(it, args.flowStartIter, args.flowEndIter) : 0;
+      if (flowScale > 0) {
+        updateFlowParamsBuffer(queue, this.flowParams, this._flowParamsArgs(siteCount, flowScale));
+      }
+
       const shouldLog = (it % logFreq === 0) || (it === iters - 1);
       const shouldPreview = shouldLog || (it % viewerFreq === 0);
       if (shouldLog || shouldPreview) {
@@ -425,6 +503,13 @@ export class Trainer {
       this.gradsEnc.encode(encoder, this.sitesBuf, this.gradParams,
         this.cand0A, this.cand1A, this.targetTex, this.maskTex,
         this.grads, this.width, this.height);
+
+      // Residual flow moments, from the same pre-Adam sites as the gradients.
+      if (flowScale > 0) {
+        this.flowEnc.encodeAccum(encoder, this.sitesBuf, this.flowParams,
+          this.cand0A, this.cand1A, this.targetTex, this.maskTex,
+          this.errEmaBuf, this.flowBuf, this.width, this.height);
+      }
 
       // Tau diffusion
       if (TAU_DIFFUSE_PASSES > 0 && TAU_DIFFUSE_LAMBDA > 0) {
@@ -460,6 +545,17 @@ export class Trainer {
       this.adamEnc.encode(encoder, this.sitesBuf, this.adamBuf, this.grads,
         this.adamParams, siteCount);
 
+      // Residual flow step, added on top of the Adam position update. The
+      // pyramid bins the post-Adam positions it is about to move.
+      if (flowScale > 0) {
+        if (this.usesPyr) {
+          this.pyrEnc.encode(encoder, this.sitesBuf, this.errEmaBuf, this.pyrCnt0, this.pyrCells,
+            this.pyrParams, this.pyrLevels, siteCount);
+        }
+        this.flowEnc.encodeStep(encoder, this.sitesBuf, this.flowBuf, this.flowParams,
+          this.pyrCells, this.pyrParams[0], siteCount);
+      }
+
       // Preview/log renders. The log path does a blocking readback for PSNR.
       // Viewer ticks wait only for the small site readback so centroid overlays
       // stay on the requested cadence; full image readback stays asynchronous.
@@ -491,6 +587,7 @@ export class Trainer {
             type: "iter",
             it, iters,
             lrScale,
+            flowScale,
             psnr,
             gradStats,
             activeSites,
@@ -745,6 +842,8 @@ export class Trainer {
       this.renderParams, this.gradParams, this.adamParams,
       this.countParams, this.gradCountParams, this.tauParams,
       this.dummyHilbertBuf, this.hilbertParams, this._tauHeatBuf,
+      this.errEmaBuf, this.flowBuf, this.flowParams, this.pyrCnt0, this.pyrCells,
+      ...(this.pyrParams || []),
     ];
     if (this.hilbertRes) {
       owned.push(this.hilbertRes.pairs, this.hilbertRes.order, this.hilbertRes.pos);
