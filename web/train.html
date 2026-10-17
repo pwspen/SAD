@@ -281,12 +281,21 @@
         width: 100%;
         height: 100%;
         image-rendering: auto;
-        cursor: crosshair;
+      }
+      .canvas-card.hoverable canvas { cursor: crosshair; }
+      /* Viewer-computed cards get a dashed edge so they never read as model output. */
+      .canvas-card[data-source="derived"] {
+        border-style: dashed;
+        border-color: #c9c9c1;
       }
       .card-label {
         position: absolute;
         top: 10px;
         left: 12px;
+        display: flex;
+        align-items: center;
+        gap: 7px;
+        cursor: help;
         font-size: 10.5px;
         text-transform: uppercase;
         letter-spacing: 0.12em;
@@ -297,6 +306,23 @@
         backdrop-filter: blur(6px);
         border: 1px solid var(--line-soft);
       }
+      /* Where a card's data comes from (SOURCES in train.js); the label's
+         tooltip spells it out. */
+      .source-badge {
+        font-size: 9px;
+        font-weight: 600;
+        letter-spacing: 0.08em;
+        line-height: 1;
+        padding: 2px 5px;
+        border-radius: 3px;
+        border: 1px solid currentColor;
+        white-space: nowrap;
+        flex: none;
+      }
+      [data-source="model"] .source-badge { background: var(--text); border-color: var(--text); color: #ffffff; }
+      [data-source="train"] .source-badge { color: #1c5cab; }
+      [data-source="input"] .source-badge { color: var(--text-dim); }
+      [data-source="derived"] .source-badge { color: var(--text-dim); border-style: dashed; }
 
       .footer {
         flex: none;
@@ -468,6 +494,6 @@
       </section>
     </div>
 
-    <script type="module" src="train.js?v=shared-wgsl-20261017"></script>
+    <script type="module" src="train.js?v=spectral-20261017"></script>
   </body>
 </html>

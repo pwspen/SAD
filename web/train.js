@@ -9,6 +9,10 @@ import { Trainer, buildArgs, GRAD_GROUPS } from "../trainer/trainer.js?v=shared-
 import { loadImageToFloat32, loadMaskRgba32Float, whiteMaskRgba32Float } from "../trainer/textures.js?v=shared-wgsl-20261017";
 import { loadSitesFromFile, serializeSitesTxt, triggerDownload, floatImageToRgba8, computeBpp, BITS_PER_SITE } from "../trainer/io.js?v=shared-wgsl-20261017";
 import { SITE_FLOATS } from "../trainer/params.js?v=shared-wgsl-20261017";
+import {
+  luma, maskWeights, laplacianBands, maskLevels, bandEnergies, IMPORTANCE, importanceMap,
+  spectralPlan, windowedSpectrum, spectrumDiff, radialStats, frcCrossing, logPowerImage,
+} from "./analysis.js?v=spectral-20261017";
 
 const CONFIG_URL = "../training_config.json";
 const DEMO_MAX_IMAGE_SIDE = 2048;
@@ -70,13 +74,15 @@ const state = {
   lastSiteCount: 0,
   lastPsnr: null,        // persists between log ticks so preview updates don't blank the PSNR
   lastLrScale: null,     // schedule × LR mult at the last log tick
+  lastActiveSites: 0,    // active sites at the last log tick (site-spacing reference lines)
   psnrHistory: [],       // [{ it, psnr }] from log ticks, plotted in the PSNR card
   psnrIters: 0,
-  psnrHover: null,       // index into psnrHistory under the cursor
   bppRuns: [],           // [{ sites, bpp, points: [{ it, psnr }] }] per run on this target; last is current
-  bppHover: null,        // { run, point } under the cursor
   gradHistory: [],       // [{ it, stats }] per-param |grad| mean/max from log ticks
-  gradHover: null,       // index into gradHistory under the cursor
+  bandHistory: [],       // [{ it, snr: [dB per band] }] from every render
+  targetAnalysis: null,  // viewer-side target luma / pyramid / spectrum (see targetAnalysis())
+  spectra: null,         // spectra of the latest render (see currentSpectra())
+  importanceImage: null, // RGBA8 importance map for the current target + mask
 };
 
 const ui = {
@@ -179,23 +185,70 @@ function fitCanvasToCard(canvas, width = canvas.width, height = canvas.height) {
 // ---- Views & layouts ----
 // Every card in the viewer grid is a view. "image" views aspect-fit a canvas
 // at the target's resolution; "plot" views fill their card and redraw at
-// device resolution. `blank` is the fill shown before the first render
-// (views without one are drawn straight from the target). Only views named in
-// the active layout get a card; the others keep canvas = null and their draw
-// functions return early, so hidden views cost nothing.
+// device resolution. `blank` is the fill shown before the first render.
+// Only views named in the active layout get a card; the others keep
+// canvas = null and their draw functions return early, so hidden views cost
+// nothing (band SNR history is the exception: it's recorded on every render).
+//
+// `source` says where a view's data comes from and is shown as a badge on its
+// card; `note` (shown on hover) says what exactly is drawn. `on` lists the
+// events that redraw the view:
+//   target – a new target or mask      render – a new reconstruction
+//   log    – a log tick's metrics      run    – a run starting
+// Plot views also redraw on resize and hover; a plot with `hit` is hoverable.
+const SOURCES = {
+  input:   { badge: "Input",    desc: "Input: what you loaded." },
+  model:   { badge: "Model",    desc: "Model: rendered from the model's current state by the trainer (GPU)." },
+  train:   { badge: "Training", desc: "Training: reported by the trainer while it optimizes." },
+  derived: { badge: "Viz only", desc: "Viz only: computed in the viewer (CPU) for display. The optimizer never sees it." },
+};
+const VIEW_EVENTS = ["target", "render", "log", "run"];
+
 const VIEWS = {
-  target:     { label: "Target", kind: "image" },
-  preview:    { label: "Reconstruction + centroids", kind: "image", overlay: true, blank: "#0a0a0f" },
-  residual:   { label: "Residual |recon − target|", kind: "image", blank: "#000004" },
-  importance: { label: "Importance (Laplacian bands)", kind: "image" },
-  siteIds:    { label: "Site IDs", kind: "image", blank: "#0a0a0f" },
-  tau:        { label: "Tau heatmap", kind: "image", blank: "#0a0a0f" },
-  psnr:       { label: "PSNR vs iteration", kind: "plot", draw: drawPsnrPlot, hover: handlePsnrHover,
-                leave: () => { state.psnrHover = null; drawPsnrPlot(); } },
-  bpp:        { label: "PSNR vs bpp", kind: "plot", draw: drawBppPlot, hover: handleBppHover,
-                leave: () => { state.bppHover = null; drawBppPlot(); } },
-  grad:       { label: "|gradient| vs iteration (log)", kind: "plot", draw: drawGradPlot, hover: handleGradHover,
-                leave: () => { state.gradHover = null; drawGradPlot(); } },
+  target:     { label: "Target", kind: "image", source: "input", on: ["target"], draw: drawTarget,
+                note: `The target image, downscaled to at most ${DEMO_MAX_IMAGE_SIDE} px per side.` },
+  preview:    { label: "Reconstruction + centroids", kind: "image", source: "model", overlay: true, blank: "#0a0a0f",
+                on: ["render"], draw: drawPreview,
+                note: "The trainer's latest render, with site centroids blinking on top." },
+  residual:   { label: "Residual |recon − target|", kind: "image", source: "derived", blank: "#000004",
+                on: ["render"], draw: drawResidual,
+                note: "Mean |recon − target| over RGB on a fixed 0–0.25 scale. The residual-driven site flow " +
+                      "uses its own per-pixel error EMA on the GPU, not this image." },
+  importance: { label: "Importance (Laplacian bands)", kind: "image", source: "derived", on: ["target"], draw: drawImportance,
+                note: `Luma Laplacian band energy, mask · (ε + √Σ β_k L_k²)^γ with β = [${IMPORTANCE.bandWeights.join(", ")}]. ` +
+                      "Not used by the optimizer." },
+  siteIds:    { label: "Site IDs", kind: "image", source: "model", blank: "#0a0a0f", on: ["render"],
+                draw: () => drawGpuView("siteIds", "hashed"),
+                note: "Each pixel's winning site, hashed to a color (extra GPU render pass)." },
+  tau:        { label: "Tau heatmap", kind: "image", source: "model", blank: "#0a0a0f", on: ["render"],
+                draw: () => drawGpuView("tau", "heatmap"),
+                note: "Per-site tau as a heatmap (extra GPU render pass)." },
+  psnr:       { label: "PSNR vs iteration", kind: "plot", source: "train", on: ["log", "run"],
+                draw: drawPsnrPlot, hit: hitPsnr,
+                note: "Masked PSNR the trainer computes at each log tick." },
+  bpp:        { label: "PSNR vs bpp", kind: "plot", source: "derived", on: ["log", "run", "target"],
+                draw: drawBppPlot, hit: hitBpp,
+                note: `Estimated rate: active sites × ${BITS_PER_SITE} bits / pixels. The bits per site are an ` +
+                      "assumption, not a measured code length. PSNR comes from the trainer." },
+  grad:       { label: "|gradient| vs iteration (log)", kind: "plot", source: "train", on: ["log", "run"],
+                draw: drawGradPlot, hit: hitGrad,
+                note: "Per-parameter-group |gradient| over sites, reported by the trainer at each log tick." },
+  bandSnr:    { label: "Band SNR vs iteration", kind: "plot", source: "derived", on: ["render", "run"],
+                draw: drawBandSnrPlot, hit: hitBandSnr,
+                note: "Per luma Laplacian band: 10·log₁₀(Σ L_k(target)² / Σ L_k(recon − target)²), mask-weighted. " +
+                      "Recorded on every render, even while this card is hidden." },
+  spectrum:   { label: "Radial power spectrum (luma)", kind: "plot", source: "derived", on: ["render", "target"],
+                draw: drawSpectrumPlot, hit: hitSpectrum,
+                note: "Luma with the mean removed, times a 2D Hann window and the mask, zero-padded FFT; |F|² " +
+                      "averaged over log-spaced rings. Dashed line: 1/(2·site spacing), spacing = √(mask area / sites)." },
+  agreement:  { label: "Spectral SNR & FRC", kind: "plot", source: "derived", on: ["render", "target"],
+                draw: drawAgreementPlot, hit: hitSpectrum,
+                note: "Per frequency ring: spectral SNR = 10·log₁₀(P_target / P_residual), and Fourier ring " +
+                      "correlation Σ Re(F_r·F_t*) / √(Σ|F_r|² Σ|F_t|²): 1 = matches, 0 = unrelated." },
+  spectrum2d: { label: "2D power spectrum", kind: "plot", source: "derived", on: ["render", "target"],
+                draw: drawSpectrum2d,
+                note: "log₁₀ |F|² with DC at the centre, on one shared scale set by the target. " +
+                      "Dashed ring: the site-spacing frequency." },
 };
 
 // Layouts are CSS grid-template-areas: one quoted string per row, one view id
@@ -223,6 +276,11 @@ const LAYOUTS = {
     label: "Plots",
     areas: `"psnr bpp"
             "grad grad"`,
+  },
+  spectral: {
+    label: "Spectral",
+    areas: `"spectrum  spectrum  spectrum2d spectrum2d"
+            "agreement agreement bandSnr    bandSnr"`,
   },
 };
 const DEFAULT_LAYOUT = "overview";
@@ -257,6 +315,8 @@ function buildCards(name) {
     view.card = null;
     view.canvas = null;
     view.overlayCanvas = null;
+    view.geom = null;
+    view.hoverKey = null;
   }
   const root = ui.canvases;
   root.replaceChildren();
@@ -265,12 +325,18 @@ function buildCards(name) {
   root.style.setProperty("--layout-rows", layout.rows || `repeat(${grid.length}, minmax(0, 1fr))`);
   for (const id of ids) {
     const view = VIEWS[id];
+    const source = SOURCES[view.source];
     const card = document.createElement("div");
     card.className = `canvas-card ${view.kind}`;
+    card.dataset.source = view.source;
     card.style.setProperty("--view", id);
     const label = document.createElement("span");
     label.className = "card-label";
-    label.textContent = view.label;
+    label.title = view.note ? `${source.desc}\n\n${view.note}` : source.desc;
+    const badge = document.createElement("span");
+    badge.className = "source-badge";
+    badge.textContent = source.badge;
+    label.append(badge, document.createTextNode(view.label));
     const canvas = document.createElement("canvas");
     card.append(label, canvas);
     if (view.overlay) {
@@ -278,8 +344,7 @@ function buildCards(name) {
       view.overlayCanvas.className = "overlay-canvas";
       card.append(view.overlayCanvas);
     }
-    if (view.hover) canvas.addEventListener("mousemove", view.hover);
-    if (view.leave) canvas.addEventListener("mouseleave", view.leave);
+    if (view.hit) attachPlotHover(view, card, canvas);
     root.append(card);
     view.card = card;
     view.canvas = canvas;
@@ -298,19 +363,22 @@ async function setLayout(name) {
   ui.layoutSelect.value = name;
   try { localStorage.setItem(LAYOUT_STORAGE_KEY, name); } catch {}
   // Fresh canvases are empty: repaint everything we have.
-  if (state.targetImage) {
-    const { width, height } = state.targetImage;
-    blankRenderViews(width, height);
-    drawTarget();
-    drawImportance();
-  } else {
-    updateCanvasLayout();
-  }
-  await drawView();
+  if (state.targetImage) blankRenderViews(state.targetImage.width, state.targetImage.height);
+  await refreshViews(...VIEW_EVENTS);
+  updateCanvasLayout();
 }
 
 function savedLayout() {
   try { return localStorage.getItem(LAYOUT_STORAGE_KEY) || DEFAULT_LAYOUT; } catch { return DEFAULT_LAYOUT; }
+}
+
+// Redraws the views in the layout that listen for any of `events`, in VIEWS
+// order. GPU-backed views await their render pass.
+async function refreshViews(...events) {
+  for (const view of Object.values(VIEWS)) {
+    if (!view.canvas || !view.on.some((e) => events.includes(e))) continue;
+    await view.draw(view);
+  }
 }
 
 // Fills render-driven image views with their placeholder at the target size so
@@ -335,15 +403,107 @@ function updateCanvasLayout(width = state.targetImage?.width, height = state.tar
   for (const view of Object.values(VIEWS)) {
     if (!view.canvas) continue;
     if (view.kind === "image") fitCanvasToCard(view.canvas, width || view.canvas.width, height || view.canvas.height);
-    else view.draw();
+    else view.draw(view);
   }
   positionOverlay();
 }
 
-// ---- PSNR vs iteration plot ----
+// Builds a 256-entry RGB lookup from [t, [r, g, b]] stops.
+function rampLut(stops) {
+  const lut = new Uint8Array(256 * 3);
+  for (let i = 0; i < 256; i += 1) {
+    const t = i / 255;
+    let k = 1;
+    while (k < stops.length - 1 && stops[k][0] < t) k += 1;
+    const [t0, c0] = stops[k - 1];
+    const [t1, c1] = stops[k];
+    const f = (t - t0) / (t1 - t0);
+    for (let c = 0; c < 3; c += 1) lut[i * 3 + c] = Math.round(c0[c] + (c1[c] - c0[c]) * f);
+  }
+  return lut;
+}
 
-const PSNR_PAD = { left: 46, right: 16, top: 42, bottom: 34 };
+// ---- Plot kit ----
+// Shared drawing for every plot view: a DPR-sized canvas, linear or log axes
+// over a box, a recessive grid, series lines, markers, a legend and a table
+// tooltip. A plot's draw() stores its axes in view.geom; the hover handler
+// passes them to view.hit(geom, mx, my), which returns a primitive key (or
+// null) that draw() reads back from view.hoverKey.
+
+const PLOT_FONT = "10.5px Inter, system-ui, -apple-system, sans-serif";
+const TIP_FONT = "11px Inter, system-ui, -apple-system, sans-serif";
+const PLOT_PAD = { left: 46, right: 16, top: 42, bottom: 34 };
+const LEGEND_PAD = { left: 56, right: 16, bottom: 34 }; // plots whose top follows a legend
+// Categorical hues in fixed order, validated against --canvas-bg. The lighter
+// ones fall under 3:1, so every plot using them has a legend and a tooltip.
+const SERIES_COLORS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300"];
 const PSNR_LINE_COLOR = "#e0611a"; // darker accent: >= 3:1 against --canvas-bg
+const SIGNALS = [
+  { key: "target", label: "target", color: SERIES_COLORS[0] },
+  { key: "recon", label: "recon", color: SERIES_COLORS[1] },
+  { key: "residual", label: "residual", color: SERIES_COLORS[2] },
+];
+
+function beginPlot(view) {
+  const canvas = view.canvas;
+  if (!canvas) return null;
+  const w = canvas.clientWidth;
+  const h = canvas.clientHeight;
+  if (w <= 0 || h <= 0) return null;
+  const dpr = window.devicePixelRatio || 1;
+  if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) {
+    canvas.width = Math.round(w * dpr);
+    canvas.height = Math.round(h * dpr);
+  }
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+  ctx.font = PLOT_FONT;
+  ctx.lineWidth = 1;
+  const css = getComputedStyle(document.documentElement);
+  const v = (name, fallback) => css.getPropertyValue(name).trim() || fallback;
+  const col = {
+    line: v("--line", "#e6e6df"),
+    dim: v("--text-dim", "#66666e"),
+    soft: v("--text-soft", "#9a9aa2"),
+    text: v("--text", "#1d1d1f"),
+    surface: v("--canvas-bg", "#f1f1ec"),
+  };
+  return { ctx, w, h, col };
+}
+
+function plotBox(p, top = PLOT_PAD.top, pad = PLOT_PAD) {
+  return { left: pad.left, right: p.w - pad.right, top, bottom: p.h - pad.bottom };
+}
+
+// Axes over a pixel box; xr / yr are { min, max, log }. Log axes map log10.
+function plotAxes(box, xr, yr) {
+  const f = (r) => (r.log ? Math.log10 : (v) => v);
+  const fx = f(xr), fy = f(yr);
+  const x0 = fx(xr.min), x1 = fx(xr.max);
+  const y0 = fy(yr.min), y1 = fy(yr.max);
+  return {
+    ...box, xr, yr,
+    x: (v) => box.left + ((fx(v) - x0) / (x1 - x0 || 1)) * (box.right - box.left),
+    y: (v) => box.bottom - ((fy(v) - y0) / (y1 - y0 || 1)) * (box.bottom - box.top),
+    ok: (x, y) => Number.isFinite(x) && Number.isFinite(y) && (!xr.log || x > 0) && (!yr.log || y > 0),
+  };
+}
+
+// Linear range padded around [lo, hi] and rounded out to whole units.
+function linRange(lo, hi, fallback) {
+  if (!Number.isFinite(lo)) [lo, hi] = fallback;
+  const pad = Math.max(0.5, (hi - lo) * 0.08);
+  return { min: Math.floor(lo - pad), max: Math.ceil(hi + pad) };
+}
+
+// Log range rounded out to whole decades (at least one).
+function decadeRange(lo, hi, fallback) {
+  if (!(lo > 0) || !Number.isFinite(hi)) [lo, hi] = fallback;
+  const e0 = Math.floor(Math.log10(lo));
+  const e1 = Math.max(e0 + 1, Math.ceil(Math.log10(hi)));
+  return { min: 10 ** e0, max: 10 ** e1, log: true };
+}
 
 function niceTicks(min, max, count = 5) {
   const span = max - min;
@@ -357,179 +517,6 @@ function niceTicks(min, max, count = 5) {
   return ticks;
 }
 
-function psnrPlotGeometry() {
-  const canvas = VIEWS.psnr.canvas;
-  const w = canvas.clientWidth;
-  const h = canvas.clientHeight;
-  const data = state.psnrHistory;
-  const xMax = Math.max(1, state.psnrIters, data.length ? data[data.length - 1].it : 0);
-  let yMin = Infinity, yMax = -Infinity;
-  for (const p of data) {
-    yMin = Math.min(yMin, p.psnr);
-    yMax = Math.max(yMax, p.psnr);
-  }
-  if (!Number.isFinite(yMin)) { yMin = 0; yMax = 40; }
-  const yPad = Math.max(0.5, (yMax - yMin) * 0.08);
-  yMin = Math.floor(yMin - yPad);
-  yMax = Math.ceil(yMax + yPad);
-  const plotW = Math.max(1, w - PSNR_PAD.left - PSNR_PAD.right);
-  const plotH = Math.max(1, h - PSNR_PAD.top - PSNR_PAD.bottom);
-  return {
-    w, h, xMax, yMin, yMax,
-    x: (it) => PSNR_PAD.left + (it / xMax) * plotW,
-    y: (v) => PSNR_PAD.top + (1 - (v - yMin) / (yMax - yMin)) * plotH,
-  };
-}
-
-function drawPsnrPlot() {
-  const canvas = VIEWS.psnr.canvas;
-  if (!canvas) return;
-  const w = canvas.clientWidth;
-  const h = canvas.clientHeight;
-  if (w <= 0 || h <= 0) return;
-  const dpr = window.devicePixelRatio || 1;
-  if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) {
-    canvas.width = Math.round(w * dpr);
-    canvas.height = Math.round(h * dpr);
-  }
-  const ctx = canvas.getContext("2d");
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  ctx.clearRect(0, 0, w, h);
-
-  const css = getComputedStyle(document.documentElement);
-  const lineCol = css.getPropertyValue("--line").trim() || "#e6e6df";
-  const dimCol = css.getPropertyValue("--text-dim").trim() || "#66666e";
-  const softCol = css.getPropertyValue("--text-soft").trim() || "#9a9aa2";
-  const textCol = css.getPropertyValue("--text").trim() || "#1d1d1f";
-  const surface = css.getPropertyValue("--canvas-bg").trim() || "#f1f1ec";
-
-  const data = state.psnrHistory;
-  const g = psnrPlotGeometry();
-  const left = PSNR_PAD.left, right = w - PSNR_PAD.right;
-  const top = PSNR_PAD.top, bottom = h - PSNR_PAD.bottom;
-
-  ctx.font = "10.5px Inter, system-ui, -apple-system, sans-serif";
-  ctx.lineWidth = 1;
-
-  // Horizontal grid + y labels
-  ctx.textAlign = "right";
-  ctx.textBaseline = "middle";
-  for (const v of niceTicks(g.yMin, g.yMax, Math.max(2, Math.floor((bottom - top) / 48)))) {
-    const y = Math.round(g.y(v)) + 0.5;
-    ctx.strokeStyle = lineCol;
-    ctx.beginPath(); ctx.moveTo(left, y); ctx.lineTo(right, y); ctx.stroke();
-    ctx.fillStyle = softCol;
-    ctx.fillText(String(Math.round(v * 10) / 10), left - 6, y);
-  }
-
-  // Baseline + x labels
-  ctx.strokeStyle = softCol;
-  ctx.beginPath(); ctx.moveTo(left, bottom + 0.5); ctx.lineTo(right, bottom + 0.5); ctx.stroke();
-  ctx.textAlign = "center";
-  ctx.textBaseline = "top";
-  ctx.fillStyle = softCol;
-  for (const v of niceTicks(0, g.xMax, Math.max(2, Math.floor((right - left) / 70)))) {
-    ctx.fillText(v >= 10000 ? `${v / 1000}k` : String(v), g.x(v), bottom + 6);
-  }
-
-  // Axis titles
-  ctx.fillStyle = dimCol;
-  ctx.fillText("iteration", (left + right) / 2, bottom + 20);
-  ctx.save();
-  ctx.translate(12, (top + bottom) / 2);
-  ctx.rotate(-Math.PI / 2);
-  ctx.textBaseline = "middle";
-  ctx.fillText("PSNR (dB)", 0, 0);
-  ctx.restore();
-
-  if (!data.length) {
-    ctx.textAlign = "center";
-    ctx.textBaseline = "middle";
-    ctx.fillStyle = softCol;
-    ctx.fillText(state.running ? "Waiting for first log tick…" : "Train to see PSNR", (left + right) / 2, (top + bottom) / 2);
-    return;
-  }
-
-  // Series line
-  ctx.strokeStyle = PSNR_LINE_COLOR;
-  ctx.lineWidth = 2;
-  ctx.lineJoin = "round";
-  ctx.lineCap = "round";
-  ctx.beginPath();
-  data.forEach((p, i) => {
-    const x = g.x(p.it), y = g.y(p.psnr);
-    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
-  });
-  ctx.stroke();
-
-  const drawMarker = (p) => {
-    ctx.beginPath();
-    ctx.arc(g.x(p.it), g.y(p.psnr), 4, 0, Math.PI * 2);
-    ctx.fillStyle = PSNR_LINE_COLOR;
-    ctx.fill();
-    ctx.lineWidth = 2;
-    ctx.strokeStyle = surface;
-    ctx.stroke();
-  };
-
-  const hover = state.psnrHover != null ? data[state.psnrHover] : null;
-  if (!hover) {
-    drawMarker(data[data.length - 1]);
-    return;
-  }
-
-  // Crosshair + tooltip
-  const hx = Math.round(g.x(hover.it)) + 0.5;
-  ctx.strokeStyle = softCol;
-  ctx.lineWidth = 1;
-  ctx.setLineDash([3, 3]);
-  ctx.beginPath(); ctx.moveTo(hx, top); ctx.lineTo(hx, bottom); ctx.stroke();
-  ctx.setLineDash([]);
-  drawMarker(hover);
-
-  const label = `iter ${hover.it} · ${hover.psnr.toFixed(2)} dB`;
-  ctx.font = "11px Inter, system-ui, -apple-system, sans-serif";
-  const tw = ctx.measureText(label).width + 14;
-  const th = 22;
-  let tx = hx + 10;
-  if (tx + tw > right) tx = hx - 10 - tw;
-  const ty = Math.max(top, Math.min(bottom - th, g.y(hover.psnr) - th - 8));
-  ctx.fillStyle = "rgba(255, 255, 255, 0.94)";
-  ctx.strokeStyle = lineCol;
-  ctx.beginPath();
-  ctx.roundRect(tx, ty, tw, th, 5);
-  ctx.fill();
-  ctx.stroke();
-  ctx.fillStyle = textCol;
-  ctx.textAlign = "left";
-  ctx.textBaseline = "middle";
-  ctx.fillText(label, tx + 7, ty + th / 2);
-}
-
-function handlePsnrHover(ev) {
-  const data = state.psnrHistory;
-  if (!data.length) return;
-  const rect = VIEWS.psnr.canvas.getBoundingClientRect();
-  const mx = ev.clientX - rect.left;
-  const g = psnrPlotGeometry();
-  let best = 0, bestDist = Infinity;
-  for (let i = 0; i < data.length; i++) {
-    const d = Math.abs(g.x(data[i].it) - mx);
-    if (d < bestDist) { bestDist = d; best = i; }
-  }
-  if (state.psnrHover !== best) {
-    state.psnrHover = best;
-    drawPsnrPlot();
-  }
-}
-
-// ---- PSNR vs bpp plot (log x) ----
-// Raw rate: active sites × BITS_PER_SITE / pixels. Runs on the current target
-// accumulate: earlier runs show as their final point (joined in bpp order, an
-// RD curve); the current run shows its log-tick trail at its fixed bpp.
-
-const BPP_PAST_COLOR = "#66666e";
-
 function logTicks(min, max) {
   const ticks = [];
   for (let e = Math.floor(Math.log10(min)); e <= Math.ceil(Math.log10(max)); e++) {
@@ -541,9 +528,293 @@ function logTicks(min, max) {
   return ticks;
 }
 
-function fmtBpp(v) {
-  return v >= 10 ? v.toFixed(0) : v >= 1 ? v.toFixed(1) : String(Number(v.toPrecision(2)));
+const isDecade = (v) => Math.abs(Math.log10(v) - Math.round(Math.log10(v))) < 1e-9;
+
+// Ticks for a range spanning `px` pixels, about `spacing` px apart. Log axes
+// use 1-2-5 steps, thinned to decades when crowded.
+function axisTicks(r, px, spacing) {
+  const max = Math.max(2, Math.floor(px / spacing));
+  if (!r.log) return niceTicks(r.min, r.max, max);
+  const t = logTicks(r.min, r.max);
+  return t.length > max ? t.filter(isDecade) : t;
 }
+
+const fmtNum = (v) => String(Math.round(v * 10) / 10 || 0);
+const fmtIter = (v) => (v >= 10000 ? `${v / 1000}k` : String(Number(v.toPrecision(6))));
+const fmtSig = (v) => (v >= 10 ? v.toFixed(0) : v >= 1 ? v.toFixed(1) : String(Number(v.toPrecision(2))));
+const fmtExp = (v) => (v > 0 ? v.toExponential(2) : "0");
+const fmtLogTick = (v) => (isDecade(v) ? `1e${Math.round(Math.log10(v))}` : v.toExponential(0));
+
+// Grid + y labels, baseline + x labels, axis titles.
+function drawAxes(p, g, { xTitle, yTitle, xFmt = fmtNum, yFmt = fmtNum, xSpacing = 70, ySpacing = 48, xLabels = true } = {}) {
+  const { ctx, col } = p;
+  ctx.font = PLOT_FONT;
+  ctx.lineWidth = 1;
+  ctx.textAlign = "right";
+  ctx.textBaseline = "middle";
+  for (const v of axisTicks(g.yr, g.bottom - g.top, ySpacing)) {
+    const y = Math.round(g.y(v)) + 0.5;
+    ctx.strokeStyle = col.line;
+    ctx.beginPath(); ctx.moveTo(g.left, y); ctx.lineTo(g.right, y); ctx.stroke();
+    ctx.fillStyle = col.soft;
+    ctx.fillText(yFmt(v), g.left - 6, y);
+  }
+  ctx.strokeStyle = col.soft;
+  ctx.beginPath(); ctx.moveTo(g.left, g.bottom + 0.5); ctx.lineTo(g.right, g.bottom + 0.5); ctx.stroke();
+  ctx.textAlign = "center";
+  ctx.textBaseline = "top";
+  if (xLabels) {
+    ctx.fillStyle = col.soft;
+    for (const v of axisTicks(g.xr, g.right - g.left, xSpacing)) ctx.fillText(xFmt(v), g.x(v), g.bottom + 6);
+  }
+  ctx.fillStyle = col.dim;
+  if (xTitle) ctx.fillText(xTitle, (g.left + g.right) / 2, g.bottom + 20);
+  if (yTitle) {
+    ctx.save();
+    ctx.translate(12, (g.top + g.bottom) / 2);
+    ctx.rotate(-Math.PI / 2);
+    ctx.textBaseline = "middle";
+    ctx.fillText(yTitle, 0, 0);
+    ctx.restore();
+  }
+}
+
+function drawEmpty(p, g, msg) {
+  const { ctx, col } = p;
+  ctx.font = PLOT_FONT;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillStyle = col.soft;
+  ctx.fillText(msg, (g.left + g.right) / 2, (g.top + g.bottom) / 2);
+}
+
+// Polyline through [x, y] points; points the axes can't show break the line.
+function drawLine(p, g, pts, color, { dash = [], width = 2 } = {}) {
+  const { ctx } = p;
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.lineWidth = width;
+  ctx.lineJoin = "round";
+  ctx.lineCap = "round";
+  ctx.setLineDash(dash);
+  ctx.beginPath();
+  let pen = false;
+  for (const [x, y] of pts) {
+    if (!g.ok(x, y)) { pen = false; continue; }
+    if (pen) ctx.lineTo(g.x(x), g.y(y)); else ctx.moveTo(g.x(x), g.y(y));
+    pen = true;
+  }
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawMarker(p, g, x, y, color, r = 4) {
+  if (!g.ok(x, y)) return;
+  const { ctx, col } = p;
+  ctx.beginPath();
+  ctx.arc(g.x(x), g.y(y), r, 0, Math.PI * 2);
+  ctx.fillStyle = color;
+  ctx.fill();
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = col.surface;
+  ctx.stroke();
+}
+
+function drawCrosshair(p, g, x) {
+  const { ctx, col } = p;
+  const hx = Math.round(g.x(x)) + 0.5;
+  ctx.save();
+  ctx.strokeStyle = col.soft;
+  ctx.lineWidth = 1;
+  ctx.setLineDash([3, 3]);
+  ctx.beginPath(); ctx.moveTo(hx, g.top); ctx.lineTo(hx, g.bottom); ctx.stroke();
+  ctx.restore();
+}
+
+// Dashed reference line at x = v (or y = v) with an optional label.
+function drawRefLine(p, g, { x, y, label }) {
+  const { ctx, col } = p;
+  ctx.save();
+  ctx.strokeStyle = col.dim;
+  ctx.lineWidth = 1;
+  ctx.setLineDash([5, 4]);
+  ctx.font = PLOT_FONT;
+  ctx.fillStyle = col.dim;
+  ctx.beginPath();
+  if (x != null) {
+    if (!(x >= g.xr.min && x <= g.xr.max)) { ctx.restore(); return; }
+    const px = Math.round(g.x(x)) + 0.5;
+    ctx.moveTo(px, g.top); ctx.lineTo(px, g.bottom); ctx.stroke();
+    if (label) {
+      const right = px + 4 + ctx.measureText(label).width > g.right;
+      ctx.textAlign = right ? "right" : "left";
+      ctx.textBaseline = "top";
+      ctx.fillText(label, right ? px - 4 : px + 4, g.top + 2);
+    }
+  } else {
+    const py = Math.round(g.y(y)) + 0.5;
+    ctx.moveTo(g.left, py); ctx.lineTo(g.right, py); ctx.stroke();
+    if (label) {
+      ctx.textAlign = "right";
+      ctx.textBaseline = "bottom";
+      ctx.fillText(label, g.right - 2, py - 2);
+    }
+  }
+  ctx.restore();
+}
+
+// Legend wrapping under the card label; items are { label, color?, dash? }.
+// Returns the y just below it.
+function drawLegend(p, items, y0 = 46) {
+  const { ctx, col, w } = p;
+  ctx.font = PLOT_FONT;
+  const x0 = 12, rowH = 16, swatch = 18;
+  let x = x0, y = y0;
+  ctx.textAlign = "left";
+  ctx.textBaseline = "middle";
+  for (const it of items) {
+    const iw = swatch + 6 + ctx.measureText(it.label).width + 14;
+    if (x + iw > w - 12 && x > x0) { x = x0; y += rowH; }
+    ctx.save();
+    ctx.strokeStyle = it.color || col.dim;
+    ctx.lineWidth = 2;
+    ctx.setLineDash(it.dash || []);
+    ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x + swatch, y); ctx.stroke();
+    ctx.restore();
+    ctx.fillStyle = col.dim;
+    ctx.fillText(it.label, x + swatch + 6, y);
+    x += iw;
+  }
+  return y + 14;
+}
+
+// Table tooltip next to (ax, ay); ay = null pins it to the top of the plot.
+// tip = { header?: [cells], rows: [{ color?, cells }], footer?: string }. The
+// first column is left-aligned, the rest right-aligned.
+function drawTooltip(p, g, ax, ay, tip) {
+  const { ctx, col, w, h } = p;
+  ctx.font = TIP_FONT;
+  const lines = [...(tip.header ? [tip.header] : []), ...tip.rows.map((r) => r.cells)];
+  const ncol = Math.max(...lines.map((c) => c.length));
+  const colW = new Array(ncol).fill(0);
+  for (const cells of lines) cells.forEach((c, j) => { colW[j] = Math.max(colW[j], ctx.measureText(c).width); });
+  const rowH = 17, padX = 8, gap = 14;
+  const sw = tip.rows.some((r) => r.color) ? 18 : 0;
+  const tableW = colW.reduce((a, b) => a + b, 0) + gap * (ncol - 1);
+  const tw = Math.max(padX * 2 + sw + tableW, tip.footer ? padX * 2 + ctx.measureText(tip.footer).width : 0);
+  const th = rowH * (lines.length + (tip.footer ? 1 : 0)) + 8;
+  let tx = ax + 12;
+  if (tx + tw > g.right) tx = ax - 12 - tw;
+  tx = Math.max(4, Math.min(w - tw - 4, tx));
+  const want = ay == null ? g.top : ay - th - 8;
+  const ty = Math.max(4, Math.min(h - th - 4, Math.max(g.top, Math.min(g.bottom - th, want))));
+  ctx.fillStyle = "rgba(255, 255, 255, 0.96)";
+  ctx.strokeStyle = col.line;
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.roundRect(tx, ty, tw, th, 5);
+  ctx.fill();
+  ctx.stroke();
+
+  const xs = [];
+  let cx = tx + padX + sw;
+  colW.forEach((cw, j) => {
+    if (j === 0) { xs.push(cx); cx += cw; } else { cx += gap + cw; xs.push(cx); }
+  });
+  ctx.textBaseline = "middle";
+  const drawRow = (cells, y, color) => {
+    ctx.fillStyle = color;
+    cells.forEach((c, j) => {
+      ctx.textAlign = j === 0 ? "left" : "right";
+      ctx.fillText(c, xs[j], y);
+    });
+  };
+  let y = ty + 4 + rowH / 2;
+  if (tip.header) { drawRow(tip.header, y, col.dim); y += rowH; }
+  for (const r of tip.rows) {
+    if (r.color) {
+      ctx.fillStyle = r.color;
+      ctx.fillRect(tx + padX, y - 1, 12, 2.5);
+    }
+    drawRow(r.cells, y, col.text);
+    y += rowH;
+  }
+  if (tip.footer) {
+    ctx.fillStyle = col.dim;
+    ctx.textAlign = "left";
+    ctx.fillText(tip.footer, tx + padX, y);
+  }
+}
+
+// Index of the item whose x is nearest the cursor, or null when there are none.
+function nearestX(g, items, getX, mx) {
+  let best = null, bestDist = Infinity;
+  items.forEach((it, i) => {
+    const d = Math.abs(g.x(getX(it)) - mx);
+    if (d < bestDist) { bestDist = d; best = i; }
+  });
+  return best;
+}
+
+function attachPlotHover(view, card, canvas) {
+  card.classList.add("hoverable");
+  canvas.addEventListener("mousemove", (ev) => {
+    if (!view.geom) return;
+    const rect = canvas.getBoundingClientRect();
+    const key = view.hit(view.geom, ev.clientX - rect.left, ev.clientY - rect.top);
+    if (key !== view.hoverKey) {
+      view.hoverKey = key;
+      view.draw(view);
+    }
+  });
+  canvas.addEventListener("mouseleave", () => {
+    if (view.hoverKey == null) return;
+    view.hoverKey = null;
+    view.draw(view);
+  });
+}
+
+// ---- PSNR vs iteration ----
+
+function iterRange() {
+  const last = Math.max(state.psnrHistory.at(-1)?.it ?? 0, state.gradHistory.at(-1)?.it ?? 0,
+                        state.bandHistory.at(-1)?.it ?? 0);
+  return { min: 0, max: Math.max(1, state.psnrIters, last) };
+}
+
+function drawPsnrPlot(view) {
+  const p = beginPlot(view);
+  if (!p) return;
+  const data = state.psnrHistory;
+  let lo = Infinity, hi = -Infinity;
+  for (const d of data) { lo = Math.min(lo, d.psnr); hi = Math.max(hi, d.psnr); }
+  const g = view.geom = plotAxes(plotBox(p), iterRange(), linRange(lo, hi, [0, 40]));
+  drawAxes(p, g, { xTitle: "iteration", yTitle: "PSNR (dB)", xFmt: fmtIter });
+  if (!data.length) {
+    drawEmpty(p, g, state.running ? "Waiting for first log tick…" : "Train to see PSNR");
+    return;
+  }
+  drawLine(p, g, data.map((d) => [d.it, d.psnr]), PSNR_LINE_COLOR);
+  const hover = view.hoverKey != null ? data[view.hoverKey] : null;
+  if (hover) drawCrosshair(p, g, hover.it);
+  const mark = hover || data[data.length - 1];
+  drawMarker(p, g, mark.it, mark.psnr, PSNR_LINE_COLOR);
+  if (hover) {
+    drawTooltip(p, g, g.x(hover.it), g.y(hover.psnr),
+      { rows: [{ cells: [`iter ${hover.it} · ${hover.psnr.toFixed(2)} dB`] }] });
+  }
+}
+
+function hitPsnr(g, mx) {
+  return nearestX(g, state.psnrHistory, (d) => d.it, mx);
+}
+
+// ---- PSNR vs bpp (log x) ----
+// Raw rate: active sites × BITS_PER_SITE / pixels. Runs on the current target
+// accumulate: earlier runs show as their final point (joined in bpp order, an
+// RD curve); the current run shows its log-tick trail at its fixed bpp.
+
+const BPP_PAST_COLOR = "#66666e";
 
 // Plotted points: { x: bpp, y: psnr, run, point, current }.
 function bppPlotPoints() {
@@ -561,475 +832,473 @@ function bppPlotPoints() {
   return pts;
 }
 
-function bppPlotGeometry(pts) {
-  const canvas = VIEWS.bpp.canvas;
-  const w = canvas.clientWidth;
-  const h = canvas.clientHeight;
-  let xMin = Infinity, xMax = -Infinity, yMin = Infinity, yMax = -Infinity;
-  for (const r of state.bppRuns) {
-    xMin = Math.min(xMin, r.bpp);
-    xMax = Math.max(xMax, r.bpp);
-  }
-  for (const p of pts) {
-    yMin = Math.min(yMin, p.y);
-    yMax = Math.max(yMax, p.y);
-  }
+function drawBppPlot(view) {
+  const p = beginPlot(view);
+  if (!p) return;
+  const pts = bppPlotPoints();
+  let xMin = Infinity, xMax = -Infinity, lo = Infinity, hi = -Infinity;
+  for (const r of state.bppRuns) { xMin = Math.min(xMin, r.bpp); xMax = Math.max(xMax, r.bpp); }
+  for (const pt of pts) { lo = Math.min(lo, pt.y); hi = Math.max(hi, pt.y); }
   if (!(xMin > 0)) { xMin = 0.1; xMax = 10; }
   // At least a decade of x range, centred on the data.
   const span = Math.max(1, Math.log10(xMax / xMin) * 1.2);
   const mid = (Math.log10(xMin) + Math.log10(xMax)) / 2;
-  const lx0 = mid - span / 2, lx1 = mid + span / 2;
-  if (!Number.isFinite(yMin)) { yMin = 0; yMax = 40; }
-  const yPad = Math.max(0.5, (yMax - yMin) * 0.08);
-  yMin = Math.floor(yMin - yPad);
-  yMax = Math.ceil(yMax + yPad);
-  const plotW = Math.max(1, w - PSNR_PAD.left - PSNR_PAD.right);
-  const plotH = Math.max(1, h - PSNR_PAD.top - PSNR_PAD.bottom);
-  return {
-    w, h, xMin: 10 ** lx0, xMax: 10 ** lx1, yMin, yMax,
-    x: (v) => PSNR_PAD.left + ((Math.log10(v) - lx0) / (lx1 - lx0)) * plotW,
-    y: (v) => PSNR_PAD.top + (1 - (v - yMin) / (yMax - yMin)) * plotH,
-  };
-}
-
-function drawBppPlot() {
-  const canvas = VIEWS.bpp.canvas;
-  if (!canvas) return;
-  const w = canvas.clientWidth;
-  const h = canvas.clientHeight;
-  if (w <= 0 || h <= 0) return;
-  const dpr = window.devicePixelRatio || 1;
-  if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) {
-    canvas.width = Math.round(w * dpr);
-    canvas.height = Math.round(h * dpr);
-  }
-  const ctx = canvas.getContext("2d");
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  ctx.clearRect(0, 0, w, h);
-
-  const css = getComputedStyle(document.documentElement);
-  const lineCol = css.getPropertyValue("--line").trim() || "#e6e6df";
-  const dimCol = css.getPropertyValue("--text-dim").trim() || "#66666e";
-  const softCol = css.getPropertyValue("--text-soft").trim() || "#9a9aa2";
-  const textCol = css.getPropertyValue("--text").trim() || "#1d1d1f";
-  const surface = css.getPropertyValue("--canvas-bg").trim() || "#f1f1ec";
-
-  const pts = bppPlotPoints();
-  const g = bppPlotGeometry(pts);
-  const left = PSNR_PAD.left, right = w - PSNR_PAD.right;
-  const top = PSNR_PAD.top, bottom = h - PSNR_PAD.bottom;
-
-  ctx.font = "10.5px Inter, system-ui, -apple-system, sans-serif";
-  ctx.lineWidth = 1;
-
-  // Horizontal grid + y labels
-  ctx.textAlign = "right";
-  ctx.textBaseline = "middle";
-  for (const v of niceTicks(g.yMin, g.yMax, Math.max(2, Math.floor((bottom - top) / 48)))) {
-    const y = Math.round(g.y(v)) + 0.5;
-    ctx.strokeStyle = lineCol;
-    ctx.beginPath(); ctx.moveTo(left, y); ctx.lineTo(right, y); ctx.stroke();
-    ctx.fillStyle = softCol;
-    ctx.fillText(String(Math.round(v * 10) / 10), left - 6, y);
-  }
-
-  // Baseline + log x labels (thin out 2/5 ticks when crowded)
-  ctx.strokeStyle = softCol;
-  ctx.beginPath(); ctx.moveTo(left, bottom + 0.5); ctx.lineTo(right, bottom + 0.5); ctx.stroke();
-  ctx.textAlign = "center";
-  ctx.textBaseline = "top";
-  ctx.fillStyle = softCol;
-  let xt = logTicks(g.xMin, g.xMax);
-  if (xt.length > Math.max(2, Math.floor((right - left) / 40))) {
-    xt = xt.filter((v) => Math.abs(Math.log10(v) - Math.round(Math.log10(v))) < 1e-9);
-  }
-  for (const v of xt) ctx.fillText(fmtBpp(v), g.x(v), bottom + 6);
-
-  // Axis titles
-  ctx.fillStyle = dimCol;
-  ctx.fillText(`bpp (${BITS_PER_SITE} bits/site)`, (left + right) / 2, bottom + 20);
-  ctx.save();
-  ctx.translate(12, (top + bottom) / 2);
-  ctx.rotate(-Math.PI / 2);
-  ctx.textBaseline = "middle";
-  ctx.fillText("PSNR (dB)", 0, 0);
-  ctx.restore();
-
+  const xr = { min: 10 ** (mid - span / 2), max: 10 ** (mid + span / 2), log: true };
+  const g = view.geom = plotAxes(plotBox(p), xr, linRange(lo, hi, [0, 40]));
+  drawAxes(p, g, { xTitle: `bpp (${BITS_PER_SITE} bits/site)`, yTitle: "PSNR (dB)", xFmt: fmtSig, xSpacing: 40 });
   if (!pts.length) {
-    ctx.textAlign = "center";
-    ctx.textBaseline = "middle";
-    ctx.fillStyle = softCol;
-    ctx.fillText(state.running ? "Waiting for first log tick…" : "Train to see PSNR vs bpp", (left + right) / 2, (top + bottom) / 2);
+    drawEmpty(p, g, state.running ? "Waiting for first log tick…" : "Train to see PSNR vs bpp");
     return;
   }
 
-  const drawMarker = (p, color, r = 4) => {
-    ctx.beginPath();
-    ctx.arc(g.x(p.x), g.y(p.y), r, 0, Math.PI * 2);
-    ctx.fillStyle = color;
-    ctx.fill();
-    ctx.lineWidth = 2;
-    ctx.strokeStyle = surface;
-    ctx.stroke();
-  };
-
   // Earlier runs: final points joined in bpp order
-  const past = pts.filter((p) => !p.current).sort((a, b) => a.x - b.x);
-  if (past.length > 1) {
-    ctx.strokeStyle = BPP_PAST_COLOR;
-    ctx.lineWidth = 1.5;
-    ctx.beginPath();
-    past.forEach((p, i) => (i === 0 ? ctx.moveTo(g.x(p.x), g.y(p.y)) : ctx.lineTo(g.x(p.x), g.y(p.y))));
-    ctx.stroke();
-  }
-  for (const p of past) drawMarker(p, BPP_PAST_COLOR, 3.5);
+  const past = pts.filter((pt) => !pt.current).sort((a, b) => a.x - b.x);
+  if (past.length > 1) drawLine(p, g, past.map((pt) => [pt.x, pt.y]), BPP_PAST_COLOR, { width: 1.5 });
+  for (const pt of past) drawMarker(p, g, pt.x, pt.y, BPP_PAST_COLOR, 3.5);
 
   // Current run: vertical trail of log ticks, latest marked
-  const cur = pts.filter((p) => p.current);
+  const cur = pts.filter((pt) => pt.current);
   if (cur.length) {
-    ctx.strokeStyle = PSNR_LINE_COLOR;
-    ctx.lineWidth = 2;
-    ctx.lineCap = "round";
-    const cx = g.x(cur[0].x);
-    const ys = cur.map((p) => g.y(p.y));
-    ctx.beginPath(); ctx.moveTo(cx, Math.min(...ys)); ctx.lineTo(cx, Math.max(...ys)); ctx.stroke();
-    drawMarker(cur[cur.length - 1], PSNR_LINE_COLOR);
+    const ys = cur.map((pt) => pt.y);
+    drawLine(p, g, [[cur[0].x, Math.min(...ys)], [cur[0].x, Math.max(...ys)]], PSNR_LINE_COLOR);
+    const last = cur[cur.length - 1];
+    drawMarker(p, g, last.x, last.y, PSNR_LINE_COLOR);
   }
 
-  const hover = state.bppHover &&
-    pts.find((p) => p.run === state.bppHover.run && p.point === state.bppHover.point);
+  const hover = view.hoverKey && pts.find((pt) => `${pt.run}:${pt.point}` === view.hoverKey);
   if (!hover) return;
-
-  drawMarker(hover, hover.current ? PSNR_LINE_COLOR : BPP_PAST_COLOR, 5);
+  drawMarker(p, g, hover.x, hover.y, hover.current ? PSNR_LINE_COLOR : BPP_PAST_COLOR, 5);
   const run = state.bppRuns[hover.run];
-  const label = `${run.sites} sites · ${fmtBpp(hover.x)} bpp · ${hover.y.toFixed(2)} dB`;
-  ctx.font = "11px Inter, system-ui, -apple-system, sans-serif";
-  const tw = ctx.measureText(label).width + 14;
-  const th = 22;
-  const hx = g.x(hover.x);
-  let tx = hx + 10;
-  if (tx + tw > right) tx = hx - 10 - tw;
-  tx = Math.max(4, Math.min(w - tw - 4, tx));
-  const ty = Math.max(top, Math.min(bottom - th, g.y(hover.y) - th - 8));
-  ctx.fillStyle = "rgba(255, 255, 255, 0.94)";
-  ctx.strokeStyle = lineCol;
-  ctx.lineWidth = 1;
-  ctx.beginPath();
-  ctx.roundRect(tx, ty, tw, th, 5);
-  ctx.fill();
-  ctx.stroke();
-  ctx.fillStyle = textCol;
-  ctx.textAlign = "left";
-  ctx.textBaseline = "middle";
-  ctx.fillText(label, tx + 7, ty + th / 2);
+  drawTooltip(p, g, g.x(hover.x), g.y(hover.y),
+    { rows: [{ cells: [`${run.sites} sites · ${fmtSig(hover.x)} bpp · ${hover.y.toFixed(2)} dB`] }] });
 }
 
-function handleBppHover(ev) {
-  const pts = bppPlotPoints();
-  if (!pts.length) return;
-  const rect = VIEWS.bpp.canvas.getBoundingClientRect();
-  const mx = ev.clientX - rect.left, my = ev.clientY - rect.top;
-  const g = bppPlotGeometry(pts);
+function hitBpp(g, mx, my) {
   let best = null, bestDist = Infinity;
-  for (const p of pts) {
-    const d = Math.hypot(g.x(p.x) - mx, g.y(p.y) - my);
-    if (d < bestDist) { bestDist = d; best = p; }
+  for (const pt of bppPlotPoints()) {
+    const d = Math.hypot(g.x(pt.x) - mx, g.y(pt.y) - my);
+    if (d < bestDist) { bestDist = d; best = pt; }
   }
-  const next = bestDist < 40 ? { run: best.run, point: best.point } : null;
-  if (next?.run !== state.bppHover?.run || next?.point !== state.bppHover?.point) {
-    state.bppHover = next;
-    drawBppPlot();
-  }
+  return best && bestDist < 40 ? `${best.run}:${best.point}` : null;
 }
 
-// ---- |gradient| vs iteration plot (log y) ----
-// One hue per param group (fixed order, validated against --canvas-bg);
-// solid = max over sites, dashed = mean over sites with any nonzero grad.
+// ---- |gradient| vs iteration (log y) ----
+// One hue per param group (fixed order); solid = max over sites, dashed =
+// mean over sites with any nonzero grad.
 
-const GRAD_COLORS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300"];
-const GRAD_PAD = { left: 56, right: 16, bottom: 34 };
 const GRAD_MEAN_DASH = [6, 4];
 
-function fmtExp(v) {
-  return v > 0 ? v.toExponential(2) : "0";
-}
-
-function gradLegendLayout(ctx, w) {
-  // Legend wraps under the card label; returns item positions + bottom edge.
-  const items = GRAD_GROUPS.map((g, i) => ({ label: g.label, color: GRAD_COLORS[i] }));
-  items.push({ label: "max", line: [] }, { label: "mean", line: GRAD_MEAN_DASH });
-  const x0 = 12, rowH = 16, swatch = 18;
-  let x = x0, y = 34;
-  for (const it of items) {
-    const iw = swatch + 6 + ctx.measureText(it.label).width + 14;
-    if (x + iw > w - 12 && x > x0) { x = x0; y += rowH; }
-    it.x = x; it.y = y;
-    x += iw;
-  }
-  return { items, bottom: y + 14, swatch };
-}
-
-function gradPlotGeometry(top) {
-  const canvas = VIEWS.grad.canvas;
-  const w = canvas.clientWidth;
-  const h = canvas.clientHeight;
+function drawGradPlot(view) {
+  const p = beginPlot(view);
+  if (!p) return;
+  const items = GRAD_GROUPS.map((grp, i) => ({ label: grp.label, color: SERIES_COLORS[i] }));
+  items.push({ label: "max" }, { label: "mean", dash: GRAD_MEAN_DASH });
+  const top = drawLegend(p, items) + 10;
   const data = state.gradHistory;
-  const xMax = Math.max(1, state.psnrIters, data.length ? data[data.length - 1].it : 0);
   let lo = Infinity, hi = -Infinity;
-  for (const p of data) {
-    for (const g of GRAD_GROUPS) {
-      const s = p.stats.groups[g.key];
+  for (const d of data) {
+    for (const grp of GRAD_GROUPS) {
+      const s = d.stats.groups[grp.key];
       for (const v of [s.mean, s.max]) {
         if (v > 0) { lo = Math.min(lo, v); hi = Math.max(hi, v); }
       }
     }
   }
-  if (!Number.isFinite(lo)) { lo = 1e-8; hi = 1e-2; }
-  const yMin = Math.floor(Math.log10(lo));
-  const yMax = Math.max(yMin + 1, Math.ceil(Math.log10(hi)));
-  const plotW = Math.max(1, w - GRAD_PAD.left - GRAD_PAD.right);
-  const plotH = Math.max(1, h - top - GRAD_PAD.bottom);
-  return {
-    w, h, xMax, yMin, yMax, top,
-    x: (it) => GRAD_PAD.left + (it / xMax) * plotW,
-    y: (v) => top + (1 - (Math.log10(v) - yMin) / (yMax - yMin)) * plotH,
-  };
-}
-
-function drawGradPlot() {
-  const canvas = VIEWS.grad.canvas;
-  if (!canvas) return;
-  const w = canvas.clientWidth;
-  const h = canvas.clientHeight;
-  if (w <= 0 || h <= 0) return;
-  const dpr = window.devicePixelRatio || 1;
-  if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) {
-    canvas.width = Math.round(w * dpr);
-    canvas.height = Math.round(h * dpr);
-  }
-  const ctx = canvas.getContext("2d");
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  ctx.clearRect(0, 0, w, h);
-
-  const css = getComputedStyle(document.documentElement);
-  const lineCol = css.getPropertyValue("--line").trim() || "#e6e6df";
-  const dimCol = css.getPropertyValue("--text-dim").trim() || "#66666e";
-  const softCol = css.getPropertyValue("--text-soft").trim() || "#9a9aa2";
-  const textCol = css.getPropertyValue("--text").trim() || "#1d1d1f";
-  const surface = css.getPropertyValue("--canvas-bg").trim() || "#f1f1ec";
-
-  ctx.font = "10.5px Inter, system-ui, -apple-system, sans-serif";
-  ctx.lineWidth = 1;
-
-  // Legend
-  const legend = gradLegendLayout(ctx, w);
-  ctx.textAlign = "left";
-  ctx.textBaseline = "middle";
-  for (const it of legend.items) {
-    ctx.save();
-    ctx.strokeStyle = it.color || dimCol;
-    ctx.lineWidth = 2;
-    if (it.line) ctx.setLineDash(it.line);
-    ctx.beginPath(); ctx.moveTo(it.x, it.y); ctx.lineTo(it.x + legend.swatch, it.y); ctx.stroke();
-    ctx.restore();
-    ctx.fillStyle = dimCol;
-    ctx.fillText(it.label, it.x + legend.swatch + 6, it.y);
-  }
-
-  const top = legend.bottom + 10;
-  const data = state.gradHistory;
-  const g = gradPlotGeometry(top);
-  const left = GRAD_PAD.left, right = w - GRAD_PAD.right;
-  const bottom = h - GRAD_PAD.bottom;
-
-  // Decade grid + labels
-  ctx.textAlign = "right";
-  for (let e = g.yMin; e <= g.yMax; e += 1) {
-    const y = Math.round(g.y(10 ** e)) + 0.5;
-    ctx.strokeStyle = lineCol;
-    ctx.beginPath(); ctx.moveTo(left, y); ctx.lineTo(right, y); ctx.stroke();
-    ctx.fillStyle = softCol;
-    ctx.fillText(`1e${e}`, left - 6, y);
-  }
-
-  // Baseline + x labels
-  ctx.strokeStyle = softCol;
-  ctx.beginPath(); ctx.moveTo(left, bottom + 0.5); ctx.lineTo(right, bottom + 0.5); ctx.stroke();
-  ctx.textAlign = "center";
-  ctx.textBaseline = "top";
-  ctx.fillStyle = softCol;
-  for (const v of niceTicks(0, g.xMax, Math.max(2, Math.floor((right - left) / 70)))) {
-    ctx.fillText(v >= 10000 ? `${v / 1000}k` : String(v), g.x(v), bottom + 6);
-  }
-  ctx.fillStyle = dimCol;
-  ctx.fillText("iteration", (left + right) / 2, bottom + 20);
-  ctx.save();
-  ctx.translate(12, (top + bottom) / 2);
-  ctx.rotate(-Math.PI / 2);
-  ctx.textBaseline = "middle";
-  ctx.fillText("|grad|", 0, 0);
-  ctx.restore();
-
+  const g = view.geom = plotAxes(plotBox(p, top, LEGEND_PAD), iterRange(), decadeRange(lo, hi, [1e-8, 1e-2]));
+  drawAxes(p, g, { xTitle: "iteration", yTitle: "|grad|", xFmt: fmtIter, yFmt: fmtLogTick, ySpacing: 22 });
   if (!data.length) {
-    ctx.textAlign = "center";
-    ctx.textBaseline = "middle";
-    ctx.fillStyle = softCol;
-    ctx.fillText(state.running ? "Waiting for first log tick…" : "Train to see gradients", (left + right) / 2, (top + bottom) / 2);
+    drawEmpty(p, g, state.running ? "Waiting for first log tick…" : "Train to see gradients");
     return;
   }
-
-  // Series: gaps where a value is 0 (can't be drawn on a log axis)
-  const drawSeries = (key, field, color, dash) => {
-    ctx.save();
-    ctx.strokeStyle = color;
-    ctx.lineWidth = 2;
-    ctx.lineJoin = "round";
-    ctx.lineCap = "round";
-    ctx.setLineDash(dash);
-    ctx.beginPath();
-    let pen = false;
-    for (const p of data) {
-      const v = p.stats.groups[key][field];
-      if (!(v > 0)) { pen = false; continue; }
-      const x = g.x(p.it), y = g.y(v);
-      if (pen) ctx.lineTo(x, y); else ctx.moveTo(x, y);
-      pen = true;
-    }
-    ctx.stroke();
-    ctx.restore();
-  };
   GRAD_GROUPS.forEach((grp, i) => {
-    drawSeries(grp.key, "mean", GRAD_COLORS[i], GRAD_MEAN_DASH);
-    drawSeries(grp.key, "max", GRAD_COLORS[i], []);
+    drawLine(p, g, data.map((d) => [d.it, d.stats.groups[grp.key].mean]), SERIES_COLORS[i], { dash: GRAD_MEAN_DASH });
+    drawLine(p, g, data.map((d) => [d.it, d.stats.groups[grp.key].max]), SERIES_COLORS[i]);
   });
 
-  const hover = state.gradHover != null ? data[state.gradHover] : null;
+  const hover = view.hoverKey != null ? data[view.hoverKey] : null;
   if (!hover) return;
-
-  // Crosshair + markers + tooltip table
-  const hx = Math.round(g.x(hover.it)) + 0.5;
-  ctx.strokeStyle = softCol;
-  ctx.lineWidth = 1;
-  ctx.setLineDash([3, 3]);
-  ctx.beginPath(); ctx.moveTo(hx, top); ctx.lineTo(hx, bottom); ctx.stroke();
-  ctx.setLineDash([]);
+  drawCrosshair(p, g, hover.it);
   GRAD_GROUPS.forEach((grp, i) => {
-    for (const field of ["mean", "max"]) {
-      const v = hover.stats.groups[grp.key][field];
-      if (!(v > 0)) continue;
-      ctx.beginPath();
-      ctx.arc(hx, g.y(v), 4, 0, Math.PI * 2);
-      ctx.fillStyle = GRAD_COLORS[i];
-      ctx.fill();
-      ctx.lineWidth = 2;
-      ctx.strokeStyle = surface;
-      ctx.stroke();
-    }
+    for (const field of ["mean", "max"]) drawMarker(p, g, hover.it, hover.stats.groups[grp.key][field], SERIES_COLORS[i]);
   });
+  drawTooltip(p, g, g.x(hover.it), null, {
+    header: [`iter ${hover.it}`, "mean", "max"],
+    rows: GRAD_GROUPS.map((grp, i) => ({
+      color: SERIES_COLORS[i],
+      cells: [grp.label, fmtExp(hover.stats.groups[grp.key].mean), fmtExp(hover.stats.groups[grp.key].max)],
+    })),
+    footer: `${hover.stats.sites} sites with nonzero grad`,
+  });
+}
 
-  ctx.font = "11px Inter, system-ui, -apple-system, sans-serif";
-  const rows = GRAD_GROUPS.map((grp, i) => ({
-    color: GRAD_COLORS[i],
-    cells: [grp.label, fmtExp(hover.stats.groups[grp.key].mean), fmtExp(hover.stats.groups[grp.key].max)],
-  }));
-  const header = [`iter ${hover.it}`, "mean", "max"];
-  const footer = `${hover.stats.sites} sites with nonzero grad`;
-  const colW = [0, 0, 0];
-  for (const r of [header, ...rows.map((r) => r.cells)]) {
-    r.forEach((c, j) => { colW[j] = Math.max(colW[j], ctx.measureText(c).width); });
+function hitGrad(g, mx) {
+  return nearestX(g, state.gradHistory, (d) => d.it, mx);
+}
+
+// ---- Band SNR vs iteration ----
+// Laplacian band k of luma holds periods of roughly 2^(k+1)–2^(k+2) px.
+
+const BAND_LEVELS = IMPORTANCE.levels;
+const bandLabel = (k) => `L${k} · ${2 ** (k + 1)}–${2 ** (k + 2)} px`;
+
+function drawBandSnrPlot(view) {
+  const p = beginPlot(view);
+  if (!p) return;
+  const data = state.bandHistory;
+  const nb = data.length ? data[0].snr.length : BAND_LEVELS;
+  const items = Array.from({ length: nb }, (_, k) => ({ label: bandLabel(k), color: SERIES_COLORS[k] }));
+  const top = drawLegend(p, items) + 10;
+  let lo = Infinity, hi = -Infinity;
+  for (const d of data) for (const v of d.snr) if (Number.isFinite(v)) { lo = Math.min(lo, v); hi = Math.max(hi, v); }
+  const g = view.geom = plotAxes(plotBox(p, top, LEGEND_PAD), iterRange(), linRange(lo, hi, [0, 30]));
+  drawAxes(p, g, { xTitle: "iteration", yTitle: "band SNR (dB)", xFmt: fmtIter });
+  if (!data.length) {
+    drawEmpty(p, g, state.running ? "Waiting for first render…" : "Train to see band SNR");
+    return;
   }
-  const rowH = 17, padX = 8, sw = 12, gap = 14;
-  const tw = Math.max(padX * 2 + sw + 6 + colW[0] + gap + colW[1] + gap + colW[2],
-                      padX * 2 + ctx.measureText(footer).width);
-  const th = rowH * (rows.length + 2) + 8;
-  let tx = hx + 12;
-  if (tx + tw > right) tx = hx - 12 - tw;
-  const ty = Math.max(4, Math.min(h - th - 4, top));
-  ctx.fillStyle = "rgba(255, 255, 255, 0.96)";
-  ctx.strokeStyle = lineCol;
-  ctx.lineWidth = 1;
-  ctx.beginPath();
-  ctx.roundRect(tx, ty, tw, th, 5);
-  ctx.fill();
-  ctx.stroke();
+  for (let k = 0; k < nb; k += 1) drawLine(p, g, data.map((d) => [d.it, d.snr[k]]), SERIES_COLORS[k]);
+  const hover = view.hoverKey != null ? data[view.hoverKey] : null;
+  if (!hover) return;
+  drawCrosshair(p, g, hover.it);
+  hover.snr.forEach((v, k) => drawMarker(p, g, hover.it, v, SERIES_COLORS[k]));
+  drawTooltip(p, g, g.x(hover.it), null, {
+    header: [`iter ${hover.it}`, "SNR"],
+    rows: hover.snr.map((v, k) => ({ color: SERIES_COLORS[k], cells: [bandLabel(k), `${v.toFixed(1)} dB`] })),
+  });
+}
 
-  ctx.textBaseline = "middle";
-  const c0 = tx + padX + sw + 6;
-  const c1 = c0 + colW[0] + gap + colW[1];
-  const c2 = c1 + gap + colW[2];
-  const drawRow = (cells, y, col) => {
-    ctx.fillStyle = col;
-    ctx.textAlign = "left";
-    ctx.fillText(cells[0], c0, y);
-    ctx.textAlign = "right";
-    ctx.fillText(cells[1], c1, y);
-    ctx.fillText(cells[2], c2, y);
+function hitBandSnr(g, mx) {
+  return nearestX(g, state.bandHistory, (d) => d.it, mx);
+}
+
+// ---- Target / render analysis caches ----
+// Target-side work (luma, pyramid, spectrum) is cached per target + mask;
+// render-side spectra are cached per render. Both are dropped on a new target
+// or mask.
+
+function targetAnalysis() {
+  const t = state.targetImage;
+  if (!t) return null;
+  if (state.targetAnalysis) return state.targetAnalysis;
+  const { data, width, height } = t;
+  const mask = maskWeights(state.maskData?.rgba, width, height);
+  let maskArea = width * height;
+  if (mask) { maskArea = 0; for (const m of mask) maskArea += m; }
+  const y = luma(data, width, height);
+  const masks = maskLevels(mask, width, height, BAND_LEVELS);
+  state.targetAnalysis = {
+    width, height, mask, maskArea, luma: y, masks,
+    bandEnergy: bandEnergies(laplacianBands(y, width, height, BAND_LEVELS), masks),
+    plan: null, F: null, bins: null, tile: null, // spectrum, filled on first use
   };
-  let y = ty + 4 + rowH / 2;
-  drawRow(header, y, dimCol);
-  for (const r of rows) {
-    y += rowH;
-    ctx.fillStyle = r.color;
-    ctx.fillRect(tx + padX, y - 1, sw, 2.5);
-    drawRow(r.cells, y, textCol);
-  }
-  y += rowH;
-  ctx.fillStyle = dimCol;
-  ctx.textAlign = "left";
-  ctx.fillText(footer, tx + padX, y);
+  return state.targetAnalysis;
 }
 
-function handleGradHover(ev) {
-  const data = state.gradHistory;
-  if (!data.length) return;
-  const rect = VIEWS.grad.canvas.getBoundingClientRect();
-  const mx = ev.clientX - rect.left;
-  const g = gradPlotGeometry(0); // x mapping doesn't depend on top
-  let best = 0, bestDist = Infinity;
-  for (let i = 0; i < data.length; i++) {
-    const d = Math.abs(g.x(data[i].it) - mx);
-    if (d < bestDist) { bestDist = d; best = i; }
-  }
-  if (state.gradHover !== best) {
-    state.gradHover = best;
-    drawGradPlot();
-  }
+function invalidateAnalysis() {
+  state.targetAnalysis = null;
+  state.spectra = null;
+  state.importanceImage = null;
 }
 
-// ---- Residual heatmap ----
+function renderMatchesTarget(r = state.lastRender) {
+  const t = state.targetImage;
+  return Boolean(r && t && r.width === t.width && r.height === t.height);
+}
+
+// Records band SNR for the latest render. Runs on every render, whether or
+// not the band SNR card is in the layout, so its history has no gaps.
+function recordBandSnr(it) {
+  const ta = targetAnalysis();
+  const r = state.lastRender;
+  if (!ta || !renderMatchesTarget(r)) return;
+  const res = luma(r.rgba, r.width, r.height);
+  for (let p = 0; p < res.length; p += 1) res[p] -= ta.luma[p];
+  const e = bandEnergies(laplacianBands(res, r.width, r.height, BAND_LEVELS), ta.masks);
+  const snr = e.map((v, k) => 10 * Math.log10(ta.bandEnergy[k] / Math.max(v, 1e-30)));
+  const hist = state.bandHistory;
+  if (hist.length && hist[hist.length - 1].it === it) hist[hist.length - 1].snr = snr;
+  else hist.push({ it, snr });
+}
+
+// Spectra for the current target and (if it matches) the latest render:
+// { ta, bins, render } where bins carry target / recon / residual power,
+// spectral SNR and FRC, or only target power before the first render.
+function currentSpectra() {
+  const ta = targetAnalysis();
+  if (!ta) return null;
+  if (!ta.plan) {
+    ta.plan = spectralPlan(ta.width, ta.height, ta.mask);
+    ta.F = windowedSpectrum(ta.plan, ta.luma);
+    ta.bins = radialStats(ta.plan, ta.F, ta.F, ta.F);
+  }
+  const r = state.lastRender;
+  if (!renderMatchesTarget(r)) return { ta, bins: ta.bins, render: null };
+  if (state.spectra?.render === r && state.spectra.ta === ta) return state.spectra;
+  const Fr = windowedSpectrum(ta.plan, luma(r.rgba, r.width, r.height));
+  const Fe = spectrumDiff(Fr, ta.F);
+  const bins = radialStats(ta.plan, ta.F, Fr, Fe);
+  state.spectra = { ta, render: r, Fr, Fe, bins, frcHalf: frcCrossing(bins, 0.5), tiles: null };
+  return state.spectra;
+}
+
+// Frequency (cycles/px) at which the mean site spacing √(area / N) is two
+// samples: roughly the finest detail the current site count can place.
+function siteFrequency(ta) {
+  const n = state.lastActiveSites;
+  return n > 0 && ta.maskArea > 0 ? 0.5 * Math.sqrt(n / ta.maskArea) : null;
+}
+
+const fmtFreq = (f) => `${fmtSig(f)} c/px · ${fmtSig(1 / f)} px`;
+
+// ---- Radial power spectrum (log-log) ----
+
+function drawSpectrumPlot(view) {
+  const p = beginPlot(view);
+  if (!p) return;
+  const s = currentSpectra();
+  const signals = s?.render ? SIGNALS : SIGNALS.slice(0, 1);
+  const top = drawLegend(p, SIGNALS.map((sig) => ({ label: sig.label, color: sig.color }))) + 10;
+  const bins = s?.bins ?? [];
+  let lo = Infinity, hi = -Infinity;
+  for (const b of bins) for (const sig of signals) {
+    const v = b[sig.key];
+    if (v > 0) { lo = Math.min(lo, v); hi = Math.max(hi, v); }
+  }
+  const xr = { min: bins.length ? bins[0].f : 0.004, max: 0.5, log: true };
+  const g = view.geom = plotAxes(plotBox(p, top, LEGEND_PAD), xr, decadeRange(lo, hi, [1e-8, 1e-2]));
+  drawAxes(p, g, { xTitle: "frequency (cycles/px)", yTitle: "power", xFmt: fmtSig, yFmt: fmtLogTick,
+                   xSpacing: 44, ySpacing: 22 });
+  if (!s) {
+    drawEmpty(p, g, "Load a target to see its spectrum");
+    return;
+  }
+  const fSite = siteFrequency(s.ta);
+  if (fSite) drawRefLine(p, g, { x: fSite, label: "site spacing" });
+  // Target last, so the reference stays visible where recon overlaps it.
+  for (const sig of [...signals].reverse()) drawLine(p, g, bins.map((b) => [b.f, b[sig.key]]), sig.color);
+  const hover = view.hoverKey != null ? bins[view.hoverKey] : null;
+  if (!hover) return;
+  drawCrosshair(p, g, hover.f);
+  for (const sig of signals) drawMarker(p, g, hover.f, hover[sig.key], sig.color);
+  drawTooltip(p, g, g.x(hover.f), null, {
+    header: [fmtFreq(hover.f), "power"],
+    rows: signals.map((sig) => ({ color: sig.color, cells: [sig.label, fmtExp(hover[sig.key])] })),
+  });
+}
+
+// Shared by the spectrum and agreement plots: nearest frequency bin.
+function hitSpectrum(g, mx) {
+  const bins = currentSpectra()?.bins ?? [];
+  return nearestX(g, bins, (b) => b.f, mx);
+}
+
+// ---- Spectral SNR & FRC (two panels, one frequency axis) ----
+
+function drawAgreementPlot(view) {
+  const p = beginPlot(view);
+  if (!p) return;
+  const s = currentSpectra();
+  const bins = s?.render ? s.bins : [];
+  const box = plotBox(p);
+  const mid = (box.top + box.bottom) / 2;
+  const xr = { min: s?.bins.length ? s.bins[0].f : 0.004, max: 0.5, log: true };
+  let lo = Infinity, hi = -Infinity, frcLo = 0;
+  for (const b of bins) {
+    if (Number.isFinite(b.ssnr)) { lo = Math.min(lo, b.ssnr); hi = Math.max(hi, b.ssnr); }
+    frcLo = Math.min(frcLo, b.frc);
+  }
+  const gS = plotAxes({ ...box, bottom: mid - 10 }, xr, linRange(lo, hi, [0, 30]));
+  const gF = plotAxes({ ...box, top: mid + 14 }, xr, { min: Math.floor(frcLo * 10) / 10, max: 1 });
+  view.geom = gF;
+  drawAxes(p, gS, { yTitle: "SSNR (dB)", ySpacing: 30, xLabels: false });
+  drawAxes(p, gF, { xTitle: "frequency (cycles/px)", yTitle: "FRC", xFmt: fmtSig, xSpacing: 44, ySpacing: 30 });
+  if (!bins.length) {
+    drawEmpty(p, { ...box }, s ? "Train to compare with the target" : "Load a target and train");
+    return;
+  }
+  const fSite = siteFrequency(s.ta);
+  if (fSite) {
+    drawRefLine(p, gS, { x: fSite, label: "site spacing" });
+    drawRefLine(p, gF, { x: fSite });
+  }
+  drawRefLine(p, gS, { y: 0, label: "0 dB" });
+  drawRefLine(p, gF, { y: 0.5, label: s.frcHalf ? `FRC ½ at ${fmtFreq(s.frcHalf)}` : "0.5" });
+  drawLine(p, gS, bins.map((b) => [b.f, b.ssnr]), PSNR_LINE_COLOR);
+  drawLine(p, gF, bins.map((b) => [b.f, b.frc]), PSNR_LINE_COLOR);
+  const hover = view.hoverKey != null ? bins[view.hoverKey] : null;
+  if (!hover) return;
+  drawCrosshair(p, gS, hover.f);
+  drawCrosshair(p, gF, hover.f);
+  drawMarker(p, gS, hover.f, hover.ssnr, PSNR_LINE_COLOR);
+  drawMarker(p, gF, hover.f, hover.frc, PSNR_LINE_COLOR);
+  drawTooltip(p, { ...box }, gF.x(hover.f), null, {
+    header: [fmtFreq(hover.f)],
+    rows: [
+      { cells: ["spectral SNR", `${hover.ssnr.toFixed(1)} dB`] },
+      { cells: ["FRC", hover.frc.toFixed(3)] },
+    ],
+  });
+}
+
+// ---- 2D power spectra (target / recon / residual tiles) ----
+// Sequential single-hue ramp: low power recedes into the card, high is dark.
+
+const SPECTRUM_TILE = 256;
+const SPECTRUM_LUT = rampLut([
+  [0.00, [241, 241, 236]],
+  [0.20, [205, 226, 251]],
+  [0.40, [134, 182, 239]],
+  [0.60, [42, 120, 214]],
+  [0.80, [28, 92, 171]],
+  [1.00, [13, 54, 107]],
+]);
+
+function spectrumTileCanvas(logs, size, lo, hi) {
+  const out = new Uint8ClampedArray(size * size * 4);
+  const scale = 255 / Math.max(1e-6, hi - lo);
+  for (let p = 0, i = 0; p < logs.length; p += 1, i += 4) {
+    const idx = Math.max(0, Math.min(255, Math.round((logs[p] - lo) * scale))) * 3;
+    out[i] = SPECTRUM_LUT[idx];
+    out[i + 1] = SPECTRUM_LUT[idx + 1];
+    out[i + 2] = SPECTRUM_LUT[idx + 2];
+    out[i + 3] = 255;
+  }
+  const c = document.createElement("canvas");
+  c.width = size;
+  c.height = size;
+  c.getContext("2d").putImageData(new ImageData(out, size, size), 0, 0);
+  return c;
+}
+
+// The shared scale runs from the target's 1st to 99.9th percentile log power.
+function spectrumTiles(s) {
+  const ta = s.ta;
+  const size = Math.min(SPECTRUM_TILE, ta.plan.nx, ta.plan.ny);
+  if (!ta.tile) {
+    const logs = logPowerImage(ta.plan, ta.F, size);
+    const sorted = Float32Array.from(logs).sort();
+    const lo = sorted[Math.floor(0.01 * (sorted.length - 1))];
+    const hi = sorted[Math.floor(0.999 * (sorted.length - 1))];
+    ta.tile = { size, lo, hi, canvas: spectrumTileCanvas(logs, size, lo, hi) };
+  }
+  const tiles = { target: ta.tile.canvas, lo: ta.tile.lo, hi: ta.tile.hi };
+  if (s.render) {
+    if (!s.tiles) {
+      s.tiles = {
+        recon: spectrumTileCanvas(logPowerImage(ta.plan, s.Fr, size), size, ta.tile.lo, ta.tile.hi),
+        residual: spectrumTileCanvas(logPowerImage(ta.plan, s.Fe, size), size, ta.tile.lo, ta.tile.hi),
+      };
+    }
+    Object.assign(tiles, s.tiles);
+  }
+  return tiles;
+}
+
+function drawSpectrum2d(view) {
+  const p = beginPlot(view);
+  if (!p) return;
+  const { ctx, col, w, h } = p;
+  const s = currentSpectra();
+  const box = { left: 12, right: w - 12, top: PLOT_PAD.top, bottom: h - 40 };
+  if (!s) {
+    drawEmpty(p, box, "Load a target to see its spectrum");
+    return;
+  }
+  const tiles = spectrumTiles(s);
+  const gap = 12;
+  const side = Math.max(1, Math.min((box.right - box.left - 2 * gap) / 3, box.bottom - box.top));
+  const x0 = (w - (3 * side + 2 * gap)) / 2;
+  const fSite = siteFrequency(s.ta);
+  ctx.font = PLOT_FONT;
+  SIGNALS.forEach((sig, i) => {
+    const x = Math.round(x0 + i * (side + gap));
+    const y = Math.round(box.top);
+    const tile = tiles[sig.key];
+    if (tile) {
+      ctx.imageSmoothingEnabled = false;
+      ctx.drawImage(tile, x, y, side, side);
+    } else {
+      ctx.fillStyle = col.soft;
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillText("after first render", x + side / 2, y + side / 2);
+    }
+    ctx.strokeStyle = col.line;
+    ctx.lineWidth = 1;
+    ctx.strokeRect(x + 0.5, y + 0.5, side - 1, side - 1);
+    // Tiles span ±0.5 cycles/px, so frequency f sits f·side from the centre.
+    if (tile && fSite && fSite < 0.5) {
+      ctx.save();
+      ctx.strokeStyle = PSNR_LINE_COLOR;
+      ctx.setLineDash([4, 4]);
+      ctx.beginPath();
+      ctx.arc(x + side / 2, y + side / 2, fSite * side, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.restore();
+    }
+    ctx.fillStyle = col.dim;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "top";
+    ctx.fillText(sig.label, x + side / 2, y + side + 6);
+  });
+  ctx.fillStyle = col.soft;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "bottom";
+  ctx.fillText(`log₁₀ power, shared scale ${tiles.lo.toFixed(1)} … ${tiles.hi.toFixed(1)}` +
+               (fSite ? " · dashed ring: site spacing" : ""), w / 2, h - 8);
+}
+
+// ---- Image views ----
+
+function drawTarget() {
+  const canvas = VIEWS.target.canvas;
+  if (!canvas || !state.targetImage) return;
+  const { data, width, height } = state.targetImage;
+  drawToCanvas(canvas, data, width, height);
+}
+
+function drawPreview() {
+  if (!VIEWS.preview.canvas || !state.lastRender) return;
+  const { rgba, width, height } = state.lastRender;
+  drawToCanvas(VIEWS.preview.canvas, rgba, width, height);
+  drawCentroidOverlay();
+}
+
+// Site IDs and tau need an extra GPU pass each (cached per render).
+async function drawGpuView(id, mode) {
+  if (!VIEWS[id].canvas || !state.lastRender) return;
+  const img = await ensureRender(mode);
+  // The layout may have changed while the render was in flight.
+  if (img && VIEWS[id].canvas) drawToCanvas(VIEWS[id].canvas, img.rgba, img.width, img.height);
+}
+
+function putImage(canvas, out, width, height) {
+  if (canvas.width !== width || canvas.height !== height) {
+    canvas.width = width;
+    canvas.height = height;
+  }
+  fitCanvasToCard(canvas, width, height);
+  canvas.getContext("2d").putImageData(new ImageData(out, width, height), 0, 0);
+}
 
 // Mean |recon - target| over RGB, mapped through a magma-like ramp on a fixed
 // [0, RESIDUAL_MAX] scale so frames stay comparable as training progresses.
 const RESIDUAL_MAX = 0.25;
-const RESIDUAL_STOPS = [
+const RESIDUAL_LUT = rampLut([
   [0.00, [0, 0, 4]],
   [0.25, [81, 18, 124]],
   [0.50, [183, 55, 121]],
   [0.75, [252, 137, 97]],
   [1.00, [252, 253, 191]],
-];
-const RESIDUAL_LUT = (() => {
-  const lut = new Uint8Array(256 * 3);
-  for (let i = 0; i < 256; i += 1) {
-    const t = i / 255;
-    let k = 1;
-    while (k < RESIDUAL_STOPS.length - 1 && RESIDUAL_STOPS[k][0] < t) k += 1;
-    const [t0, c0] = RESIDUAL_STOPS[k - 1];
-    const [t1, c1] = RESIDUAL_STOPS[k];
-    const f = (t - t0) / (t1 - t0);
-    for (let c = 0; c < 3; c += 1) lut[i * 3 + c] = Math.round(c0[c] + (c1[c] - c0[c]) * f);
-  }
-  return lut;
-})();
+]);
 
 function drawResidual() {
   const canvas = VIEWS.residual.canvas;
-  const target = state.targetImage;
   const render = state.lastRender;
-  if (!canvas || !target || !render || render.width !== target.width || render.height !== target.height) return;
+  if (!canvas || !renderMatchesTarget(render)) return;
   const { width, height } = render;
   const a = render.rgba;
-  const b = target.data;
+  const b = state.targetImage.data;
   const out = new Uint8ClampedArray(width * height * 4);
   const scale = 255 / (3 * RESIDUAL_MAX);
   for (let p = 0, i = 0; p < width * height; p += 1, i += 4) {
@@ -1040,160 +1309,41 @@ function drawResidual() {
     out[i + 2] = RESIDUAL_LUT[idx + 2];
     out[i + 3] = 255;
   }
-  if (canvas.width !== width || canvas.height !== height) {
-    canvas.width = width;
-    canvas.height = height;
-  }
-  fitCanvasToCard(canvas, width, height);
-  canvas.getContext("2d").putImageData(new ImageData(out, width, height), 0, 0);
+  putImage(canvas, out, width, height);
 }
 
-function drawTarget() {
-  if (!state.targetImage) return;
-  const { data, width, height } = state.targetImage;
-  updateCanvasLayout(width, height);
-  if (VIEWS.target.canvas) drawToCanvas(VIEWS.target.canvas, data, width, height);
-}
-
-// Multi-scale importance map (visualization only — not used by the optimizer).
-// Luma Laplacian pyramid L_k = G_k − up(G_{k+1}); each band's energy L_k² is
-// upsampled to full res and combined as
-//   w = mask · (ε + sqrt(Σ_k β_k · up(L_k²)))^γ
-// so smooth large-scale structure (coarse bands) counts as well as fine edges.
-const IMPORTANCE_LEVELS = 6;
-const IMPORTANCE_BAND_WEIGHTS = [0.5, 1, 1, 1, 1, 1]; // β_k, finest band first
-const IMPORTANCE_GAMMA = 1.0;
-const IMPORTANCE_EPS = 1e-3;
+// Multi-scale importance map (see IMPORTANCE in analysis.js), cached per
+// target + mask.
 const IMPORTANCE_DISPLAY_PCT = 0.995; // map this percentile to the top of the ramp
-const IMPORTANCE_STOPS = [ // viridis-like, to keep it distinct from the residual card
+const IMPORTANCE_LUT = rampLut([ // viridis-like, to keep it distinct from the residual card
   [0.00, [68, 1, 84]],
   [0.25, [59, 82, 139]],
   [0.50, [33, 145, 140]],
   [0.75, [94, 201, 98]],
   [1.00, [253, 231, 37]],
-];
-const IMPORTANCE_LUT = (() => {
-  const lut = new Uint8Array(256 * 3);
-  for (let i = 0; i < 256; i += 1) {
-    const t = i / 255;
-    let k = 1;
-    while (k < IMPORTANCE_STOPS.length - 1 && IMPORTANCE_STOPS[k][0] < t) k += 1;
-    const [t0, c0] = IMPORTANCE_STOPS[k - 1];
-    const [t1, c1] = IMPORTANCE_STOPS[k];
-    const f = (t - t0) / (t1 - t0);
-    for (let c = 0; c < 3; c += 1) lut[i * 3 + c] = Math.round(c0[c] + (c1[c] - c0[c]) * f);
-  }
-  return lut;
-})();
-
-// Separable [1 4 6 4 1]/16 blur followed by 2× decimation (clamped edges).
-function pyrDown(src, w, h) {
-  const k = [1 / 16, 4 / 16, 6 / 16, 4 / 16, 1 / 16];
-  const dw = Math.ceil(w / 2);
-  const dh = Math.ceil(h / 2);
-  const tmp = new Float32Array(dw * h);
-  for (let y = 0; y < h; y += 1) {
-    for (let dx = 0; dx < dw; dx += 1) {
-      const x = dx * 2;
-      let s = 0;
-      for (let t = -2; t <= 2; t += 1) {
-        const xx = Math.min(w - 1, Math.max(0, x + t));
-        s += k[t + 2] * src[y * w + xx];
-      }
-      tmp[y * dw + dx] = s;
-    }
-  }
-  const out = new Float32Array(dw * dh);
-  for (let dy = 0; dy < dh; dy += 1) {
-    const y = dy * 2;
-    for (let dx = 0; dx < dw; dx += 1) {
-      let s = 0;
-      for (let t = -2; t <= 2; t += 1) {
-        const yy = Math.min(h - 1, Math.max(0, y + t));
-        s += k[t + 2] * tmp[yy * dw + dx];
-      }
-      out[dy * dw + dx] = s;
-    }
-  }
-  return { data: out, width: dw, height: dh };
-}
-
-// Bilinear resample of a (sw×sh) grid onto (w×h), pixel-center aligned.
-function upsampleBilinear(src, sw, sh, w, h) {
-  const out = new Float32Array(w * h);
-  const sx = sw / w;
-  const sy = sh / h;
-  for (let y = 0; y < h; y += 1) {
-    const fy = Math.min(sh - 1, Math.max(0, (y + 0.5) * sy - 0.5));
-    const y0 = Math.floor(fy);
-    const y1 = Math.min(sh - 1, y0 + 1);
-    const ty = fy - y0;
-    for (let x = 0; x < w; x += 1) {
-      const fx = Math.min(sw - 1, Math.max(0, (x + 0.5) * sx - 0.5));
-      const x0 = Math.floor(fx);
-      const x1 = Math.min(sw - 1, x0 + 1);
-      const tx = fx - x0;
-      const a = src[y0 * sw + x0] + (src[y0 * sw + x1] - src[y0 * sw + x0]) * tx;
-      const b = src[y1 * sw + x0] + (src[y1 * sw + x1] - src[y1 * sw + x0]) * tx;
-      out[y * w + x] = a + (b - a) * ty;
-    }
-  }
-  return out;
-}
-
-function computeImportanceMap(rgbaF, width, height, maskRgba) {
-  const n = width * height;
-  let level = { data: new Float32Array(n), width, height };
-  for (let p = 0, i = 0; p < n; p += 1, i += 4) {
-    level.data[p] = 0.299 * rgbaF[i] + 0.587 * rgbaF[i + 1] + 0.114 * rgbaF[i + 2];
-  }
-  const energy = new Float32Array(n);
-  for (let k = 0; k < IMPORTANCE_LEVELS; k += 1) {
-    if (level.width < 2 || level.height < 2) break;
-    const next = pyrDown(level.data, level.width, level.height);
-    const up = upsampleBilinear(next.data, next.width, next.height, level.width, level.height);
-    const band = new Float32Array(level.width * level.height);
-    for (let p = 0; p < band.length; p += 1) {
-      const l = level.data[p] - up[p];
-      band[p] = l * l;
-    }
-    const full = k === 0 ? band : upsampleBilinear(band, level.width, level.height, width, height);
-    const beta = IMPORTANCE_BAND_WEIGHTS[k] ?? 1;
-    for (let p = 0; p < n; p += 1) energy[p] += beta * full[p];
-    level = next;
-  }
-  const out = new Float32Array(n);
-  for (let p = 0; p < n; p += 1) {
-    const m = maskRgba ? maskRgba[p * 4] : 1;
-    out[p] = m * Math.pow(IMPORTANCE_EPS + Math.sqrt(energy[p]), IMPORTANCE_GAMMA);
-  }
-  return out;
-}
+]);
 
 function drawImportance() {
   const canvas = VIEWS.importance.canvas;
   const target = state.targetImage;
   if (!canvas || !target) return;
   const { data, width, height } = target;
-  const n = width * height;
-  const maskRgba = state.maskData?.rgba?.length === n * 4 ? state.maskData.rgba : null;
-  const w = computeImportanceMap(data, width, height, maskRgba);
-  const sorted = Float32Array.from(w).sort();
-  const top = sorted[Math.min(n - 1, Math.floor(IMPORTANCE_DISPLAY_PCT * n))] || 1;
-  const out = new Uint8ClampedArray(n * 4);
-  for (let p = 0, i = 0; p < n; p += 1, i += 4) {
-    const idx = Math.min(255, Math.round((w[p] / top) * 255)) * 3;
-    out[i] = IMPORTANCE_LUT[idx];
-    out[i + 1] = IMPORTANCE_LUT[idx + 1];
-    out[i + 2] = IMPORTANCE_LUT[idx + 2];
-    out[i + 3] = 255;
+  if (!state.importanceImage) {
+    const n = width * height;
+    const w = importanceMap(data, width, height, maskWeights(state.maskData?.rgba, width, height));
+    const sorted = Float32Array.from(w).sort();
+    const top = sorted[Math.min(n - 1, Math.floor(IMPORTANCE_DISPLAY_PCT * n))] || 1;
+    const out = new Uint8ClampedArray(n * 4);
+    for (let p = 0, i = 0; p < n; p += 1, i += 4) {
+      const idx = Math.min(255, Math.round((w[p] / top) * 255)) * 3;
+      out[i] = IMPORTANCE_LUT[idx];
+      out[i + 1] = IMPORTANCE_LUT[idx + 1];
+      out[i + 2] = IMPORTANCE_LUT[idx + 2];
+      out[i + 3] = 255;
+    }
+    state.importanceImage = out;
   }
-  if (canvas.width !== width || canvas.height !== height) {
-    canvas.width = width;
-    canvas.height = height;
-  }
-  fitCanvasToCard(canvas, width, height);
-  canvas.getContext("2d").putImageData(new ImageData(out, width, height), 0, 0);
+  putImage(canvas, state.importanceImage, width, height);
 }
 
 async function handleImageInput(ev) {
@@ -1252,11 +1402,15 @@ async function setTarget(file, name, token = ++state.targetToken) {
       (img.sourceWidth !== img.width || img.sourceHeight !== img.height);
     state.targetImage = img;
     state.bppRuns = [];
-    state.bppHover = null;
-    drawBppPlot();
-    drawTarget();
-    drawImportance();
+    // A render of the previous target says nothing about this one.
+    state.lastRender = null;
+    state.lastSites = null;
+    state.lastHashed = null;
+    state.lastHeatmap = null;
+    ui.saveBtn.disabled = true;
+    invalidateAnalysis();
     blankRenderViews(img.width, img.height);
+    await refreshViews("target", "render");
     updateCanvasLayout(img.width, img.height);
     setStatus(scaled
       ? `Target ${img.width}×${img.height} (downscaled from ${img.sourceWidth}×${img.sourceHeight})`
@@ -1275,7 +1429,8 @@ async function handleMaskInput(ev) {
     state.maskData = await loadMaskRgba32Float(file, state.targetImage.width, state.targetImage.height);
     ui.maskLabel.textContent = file.name;
     appendLog(`Mask loaded (sum=${state.maskData.maskSum}).`);
-    drawImportance();
+    invalidateAnalysis();
+    await refreshViews("target", "render");
   } catch (err) {
     appendLog(`Mask load failed: ${err.message}`);
   }
@@ -1353,14 +1508,12 @@ async function startTraining() {
   state.psnrHistory = [];
   state.lastLrScale = null;
   state.psnrIters = args.iters;
-  state.psnrHover = null;
   state.gradHistory = [];
-  state.gradHover = null;
+  state.bandHistory = [];
+  state.lastActiveSites = initSiteCount;
   state.bppRuns.push({ sites: initSiteCount, bpp: computeBpp(initSiteCount, width, height), points: [] });
-  state.bppHover = null;
-  drawPsnrPlot();
-  drawBppPlot();
-  drawGradPlot();
+  for (const view of Object.values(VIEWS)) view.hoverKey = null;
+  await refreshViews("run");
 
   appendLog(`Target: ${width}×${height} | sites: ${initSiteCount} | iters: ${args.warmupIters} warmup + ${args.decayIters} decay | lr ×${args.lrMult} | log: ${args.logFreq} | view: ${args.viewerFreq}`);
   updateProgress(0, args.iters, "Preparing…");
@@ -1379,25 +1532,22 @@ async function startTraining() {
         state.lastSiteCount = info.totalSites;
         state.lastPsnr = info.psnr;
         state.lastLrScale = info.lrScale;
+        state.lastActiveSites = info.activeSites;
         if (Number.isFinite(info.psnr)) {
           state.psnrHistory.push({ it: info.it, psnr: info.psnr });
-          drawPsnrPlot();
           const run = state.bppRuns[state.bppRuns.length - 1];
           run.sites = info.activeSites;
           run.bpp = computeBpp(info.activeSites, info.width, info.height);
           run.points.push({ it: info.it, psnr: info.psnr });
-          drawBppPlot();
         }
-        if (info.gradStats) {
-          state.gradHistory.push({ it: info.it, stats: info.gradStats });
-          drawGradPlot();
-        }
+        if (info.gradStats) state.gradHistory.push({ it: info.it, stats: info.gradStats });
+        recordBandSnr(info.it);
         state.lastHashed = null;
         state.lastHeatmap = null;
         updateProgress(info.it + 1, info.iters,
           `log iter ${info.it + 1}/${info.iters} · ${info.itsPerSec.toFixed(1)} it/s · ${info.elapsedSec.toFixed(1)}s`);
         renderMetrics(info);
-        await drawView();
+        await refreshViews("log", "render");
       } else if (info.type === "preview") {
         // Full image preview. Site overlays arrive through a separate lighter
         // event so they are not blocked by full-image readback.
@@ -1406,12 +1556,13 @@ async function startTraining() {
           state.lastSites = info.sitesData;
           state.lastSiteCount = info.totalSites;
         }
+        recordBandSnr(info.it);
         state.lastHashed = null;
         state.lastHeatmap = null;
         updateProgress(info.it + 1, info.iters,
           `image iter ${info.it + 1}/${info.iters} · ${info.itsPerSec.toFixed(1)} it/s · ${info.elapsedSec.toFixed(1)}s`);
         renderMetrics(info);
-        await drawView();
+        await refreshViews("render");
       } else if (info.type === "sites") {
         state.lastSites = info.sitesData;
         state.lastSiteCount = info.totalSites;
@@ -1442,7 +1593,8 @@ async function startTraining() {
     state.lastSiteCount = final.count;
     state.lastHashed = null;
     state.lastHeatmap = null;
-    await drawView();
+    recordBandSnr(args.iters);
+    await refreshViews("render");
     appendLog(`Done. Best PSNR: ${final.bestPsnr.toFixed(2)} dB | time: ${final.trainSeconds.toFixed(2)} s | active: ${final.count}`);
     updateProgress(args.iters, args.iters,
       `done · best ${final.bestPsnr.toFixed(2)} dB · ${final.trainSeconds.toFixed(1)}s`);
@@ -1515,24 +1667,6 @@ function drawCentroidOverlay() {
   if (!state.lastRender || !state.lastSites) return;
   const ctx = prepareOverlay(state.lastRender.width, state.lastRender.height);
   drawCentroids(ctx);
-}
-
-// Redraws every view that depends on the latest render. Site IDs and tau need
-// an extra GPU pass each, so they only run when their view is in the layout.
-async function drawView() {
-  if (!state.lastRender) return;
-  drawResidual();
-  const { rgba, width, height } = state.lastRender;
-  if (VIEWS.preview.canvas) {
-    drawToCanvas(VIEWS.preview.canvas, rgba, width, height);
-    drawCentroidOverlay();
-  }
-  for (const [id, mode] of [["siteIds", "hashed"], ["tau", "heatmap"]]) {
-    if (!VIEWS[id].canvas) continue;
-    const img = await ensureRender(mode);
-    // The layout may have changed while the render was in flight.
-    if (img && VIEWS[id].canvas) drawToCanvas(VIEWS[id].canvas, img.rgba, img.width, img.height);
-  }
 }
 
 async function ensureRender(mode) {

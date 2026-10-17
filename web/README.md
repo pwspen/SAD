@@ -30,6 +30,7 @@ All pages read hyperparameters from `training_config.json`.
 - Edit hyperparameters in the left panel (values are pre-filled from `training_config.json`).
 - The site count is fixed for the whole run: the JS trainer has no densify/prune (and so no target-bpp). Defaults: `iters` 10000, `sites` 1000, `log-freq` 50, `viewer-freq` 50.
 - Click **Train**. `viewer-freq` controls visual refreshes, while `log-freq` controls PSNR log lines (`Iter N | PSNR: X dB | Active: a/t | it/s | seconds`).
+- Each viewer card carries a badge for where its data comes from: **Input**, **Model** (rendered by the trainer), **Training** (metrics the trainer reports) or **Viz only** (computed in the viewer by `analysis.js`; dashed card edge). Hover a card's label for exactly what it shows. The **Spectral** layout has the radial power spectrum, spectral SNR / FRC, 2D spectra and per-band SNR.
 - **Export PNG** / **Export sites.txt** produce the same formats the Python and Metal trainers write.
 
 ## Benchmark (`bench.html`)
