@@ -20,7 +20,8 @@ const KODAK_COUNT = 24;
 // Fields that live in the advanced panel. The target image is in the top bar;
 // init-sites / mask are pickers inside the panel (not listed here).
 const UI_FIELDS = [
-  ["iters", "p-iters"],
+  ["warmupIters", "p-warmupIters"],
+  ["decayIters", "p-decayIters"],
   ["sites", "p-sites"],
   ["logFreq", "p-logFreq"],
   ["viewerFreq", "p-viewerFreq"],
@@ -32,6 +33,7 @@ const UI_FIELDS = [
   ["candInjectCount", "p-candInjectCount"],
   ["candHilbertWindow", "p-candHilbertWindow"],
   ["candHilbertProbes", "p-candHilbertProbes"],
+  ["lrMult", "p-lrMult"],
   ["lrPosBase", "p-lrPosBase"],
   ["lrTauBase", "p-lrTauBase"],
   ["lrRadiusBase", "p-lrRadiusBase"],
@@ -57,6 +59,7 @@ const state = {
   lastSites: null,
   lastSiteCount: 0,
   lastPsnr: null,        // persists between log ticks so preview updates don't blank the PSNR
+  lastLrScale: null,     // schedule × LR mult at the last log tick
   psnrHistory: [],       // [{ it, psnr }] from log ticks, plotted in the PSNR card
   psnrIters: 0,
   psnrHover: null,       // index into psnrHistory under the cursor
@@ -782,6 +785,7 @@ async function startTraining() {
   const initSiteCount = init ? init.count : args.sites;
 
   state.psnrHistory = [];
+  state.lastLrScale = null;
   state.psnrIters = args.iters;
   state.psnrHover = null;
   state.gradHistory = [];
@@ -789,7 +793,7 @@ async function startTraining() {
   drawPsnrPlot();
   drawGradPlot();
 
-  appendLog(`Target: ${width}×${height} | sites: ${initSiteCount} | iters: ${args.iters} | log: ${args.logFreq} | view: ${args.viewerFreq}`);
+  appendLog(`Target: ${width}×${height} | sites: ${initSiteCount} | iters: ${args.warmupIters} warmup + ${args.decayIters} decay | lr ×${args.lrMult} | log: ${args.logFreq} | view: ${args.viewerFreq}`);
   updateProgress(0, args.iters, "Preparing…");
 
   const trainer = new Trainer(state.device, state.shaders, args, {
@@ -805,6 +809,7 @@ async function startTraining() {
         state.lastSites = info.sitesData;
         state.lastSiteCount = info.totalSites;
         state.lastPsnr = info.psnr;
+        state.lastLrScale = info.lrScale;
         if (Number.isFinite(info.psnr)) {
           state.psnrHistory.push({ it: info.it, psnr: info.psnr });
           drawPsnrPlot();
@@ -887,6 +892,7 @@ function renderMetrics(info) {
   ui.metricRow.innerHTML =
     `<span>iter <strong>${info.it + 1}/${info.iters}</strong></span>` +
     `<span>PSNR <strong>${psnrText}</strong></span>` +
+    (state.lastLrScale != null ? `<span>lr <strong>×${state.lastLrScale.toPrecision(3)}</strong></span>` : "") +
     `<span>active <strong>${info.activeSites}</strong>/${info.totalSites}</span>` +
     `<span><strong>${info.itsPerSec.toFixed(1)}</strong> it/s</span>`;
 }

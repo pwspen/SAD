@@ -69,6 +69,14 @@ const MAX_PREVIEW_IMAGE_READBACKS = 2;
 const ANI_START_ITER = 50;
 const MAX_PREVIEW_SITE_READBACKS = 8;
 
+// Linear warmup to 1 over `warmupIters`, then cosine decay to 0 over
+// `decayIters`. Returns the multiplier applied to every base LR at step `it`.
+export function lrSchedule(it, warmupIters, decayIters) {
+  if (it < warmupIters) return (it + 1) / warmupIters;
+  const t = Math.min(1, (it - warmupIters) / Math.max(1, decayIters));
+  return 0.5 * (1 + Math.cos(Math.PI * t));
+}
+
 // Collect default args from a training_config.json-style object + user
 // overrides. Overrides use the argument name (e.g. "iters") and take precedence
 // over the matching config-style key (e.g. "DEFAULT_ITERS").
@@ -84,7 +92,9 @@ export function buildArgs(config, overrides = {}) {
   const args = {
     // WebGPU-specific defaults; training_config.json's DEFAULT_ITERS/SITES are
     // tuned for the other backends' densify/prune schedule, which JS doesn't run.
-    iters: Number(pick("iters", null, 10000)),
+    // Total iters = warmupIters + decayIters; an explicit "iters" override
+    // (e.g. from sweeps) sets the total and shortens the decay phase to fit.
+    warmupIters: Math.max(0, Math.floor(Number(pick("warmupIters", "WARMUP_ITERS", 100)))),
     sites: Number(pick("sites", null, 1000)),
     candFreq: Number(pick("candFreq", "CAND_UPDATE_FREQ", 1)),
     candHilbertWindow: Number(pick("candHilbertWindow", "CAND_HILBERT_WINDOW", 0)),
@@ -96,6 +106,7 @@ export function buildArgs(config, overrides = {}) {
     candInjectCount: Number(pick("candInjectCount", "CAND_INJECT_COUNT", 16)),
     logFreq: Math.max(1, Number(pick("logFreq", null, 50))),
     viewerFreq: Math.max(1, Number(pick("viewerFreq", null, 50))),
+    lrMult: Number(pick("lrMult", "LR_MULT", 1)),
     lrPosBase: Number(pick("lrPosBase", "LR_POS_BASE", 0.05)),
     lrTauBase: Number(pick("lrTauBase", "LR_TAU_BASE", 0.01)),
     lrRadiusBase: Number(pick("lrRadiusBase", "LR_RADIUS_BASE", 0.02)),
@@ -109,6 +120,10 @@ export function buildArgs(config, overrides = {}) {
     eps: Number(pick("eps", "EPS", 1e-8)),
     maxDim: Number(pick("maxDim", "MAX_DIM", 2048)),
   };
+  args.decayIters = Math.max(0, Math.floor(Number(overrides.iters !== undefined && overrides.decayIters === undefined
+    ? overrides.iters - args.warmupIters
+    : pick("decayIters", "DECAY_ITERS", 10000))));
+  args.iters = args.warmupIters + args.decayIters;
   if (!Number.isFinite(args.initLogTau) || !Number.isFinite(args.initRadius)) {
     throw new Error("training_config.json missing INIT_LOG_TAU / INIT_RADIUS (required).");
   }
@@ -371,11 +386,12 @@ export class Trainer {
         }
       }
 
-      const lrDir = it >= this.aniStartIter ? args.lrDirBase : 0;
-      const lrAniso = it >= this.aniStartIter ? args.lrAnisoBase : 0;
+      const lrScale = args.lrMult * lrSchedule(it, args.warmupIters, args.decayIters);
+      const lrDir = it >= this.aniStartIter ? args.lrDirBase * lrScale : 0;
+      const lrAniso = it >= this.aniStartIter ? args.lrAnisoBase * lrScale : 0;
       updateAdamParamsBuffer(queue, this.adamParams,
-        args.lrPosBase, args.lrTauBase, args.lrRadiusBase, args.lrColorBase,
-        lrDir, lrAniso, args.beta1, args.beta2, args.eps, it + 1, this.width, this.height);
+        args.lrPosBase * lrScale, args.lrTauBase * lrScale, args.lrRadiusBase * lrScale,
+        args.lrColorBase * lrScale, lrDir, lrAniso, args.beta1, args.beta2, args.eps, it + 1, this.width, this.height);
 
       const blend = it / Math.max(1, iters);
       const lambda = TAU_DIFFUSE_LAMBDA * (0.1 + 0.9 * blend);
@@ -474,6 +490,7 @@ export class Trainer {
           this.onLog({
             type: "iter",
             it, iters,
+            lrScale,
             psnr,
             gradStats,
             activeSites,
