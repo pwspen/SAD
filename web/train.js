@@ -101,6 +101,7 @@ const ui = {
   initLabel: document.getElementById("initLabel"),
   startBtn: document.getElementById("startBtn"),
   stopBtn: document.getElementById("stopBtn"),
+  loopToggle: document.getElementById("loopToggle"),
   toggleParamsBtn: document.getElementById("toggleParamsBtn"),
   saveBtn: document.getElementById("saveBtn"),
   savePopover: document.getElementById("savePopover"),
@@ -1695,8 +1696,13 @@ async function startTraining() {
   setKodakEnabled(false);
   state.running = true;
   state.abortCtrl = new AbortController();
+  const signal = state.abortCtrl.signal;
   state.lastHashed = null;
   state.lastHeatmap = null;
+  // The previous run's trainer only served site-ID / tau renders of its last
+  // state; free its GPU buffers so repeated (or looped) runs don't pile up.
+  state.trainer?.destroy();
+  state.trainer = null;
 
   const args = readFormArgs();
   const { width, height } = state.targetImage;
@@ -1728,7 +1734,7 @@ async function startTraining() {
   updateProgress(0, args.iters, "Preparing…");
 
   const trainer = new Trainer(state.device, state.shaders, args, {
-    signal: state.abortCtrl.signal,
+    signal,
     onLog: async (info) => {
       if (info.type === "msg") {
         appendLog(info.message);
@@ -1786,6 +1792,7 @@ async function startTraining() {
   });
   state.trainer = trainer;
 
+  let completed = false;
   try {
     await trainer.prepare({
       width, height,
@@ -1808,6 +1815,7 @@ async function startTraining() {
     updateProgress(args.iters, args.iters,
       `done · best ${final.bestPsnr.toFixed(2)} dB · ${final.trainSeconds.toFixed(1)}s`);
     ui.saveBtn.disabled = false;
+    completed = !signal.aborted;
   } catch (err) {
     appendLog(`Error: ${err.message}`);
     console.error(err);
@@ -1816,6 +1824,12 @@ async function startTraining() {
     ui.startBtn.disabled = false;
     ui.stopBtn.disabled = true;
     setKodakEnabled(true);
+  }
+  // Loop mode: a run that finished on its own starts over from iteration 0
+  // (with the form's current settings). Stop or an error ends the loop.
+  if (completed && ui.loopToggle.checked) {
+    appendLog("Loop: starting again from iteration 0.");
+    setTimeout(startTraining, 0);
   }
 }
 
