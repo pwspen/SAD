@@ -122,7 +122,7 @@ export function buildArgs(config, overrides = {}) {
   };
   args.decayIters = Math.max(0, Math.floor(Number(overrides.iters !== undefined && overrides.decayIters === undefined
     ? overrides.iters - args.warmupIters
-    : pick("decayIters", "DECAY_ITERS", 10000))));
+    : pick("decayIters", "DECAY_ITERS", 3000))));
   args.iters = args.warmupIters + args.decayIters;
   if (!Number.isFinite(args.initLogTau) || !Number.isFinite(args.initRadius)) {
     throw new Error("training_config.json missing INIT_LOG_TAU / INIT_RADIUS (required).");
