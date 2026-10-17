@@ -223,6 +223,9 @@
         border-color: var(--accent);
         box-shadow: 0 0 0 3px var(--focus);
       }
+      .view-toolbar .btn { padding: 5px 10px; }
+      .layout-edit-tools { display: flex; gap: 6px; }
+      .layout-edit-tools.hidden { display: none; }
       .metric-row {
         display: flex;
         gap: 14px;
@@ -283,6 +286,58 @@
         image-rendering: auto;
       }
       .canvas-card.hoverable canvas { cursor: crosshair; }
+
+      /* Layout edit mode (train.js: attachEditControls / emptyCell). */
+      .canvases.editing .card-label {
+        cursor: grab;
+        max-width: calc(100% - 56px); /* clear the remove button */
+        overflow: hidden;
+        white-space: nowrap;
+      }
+      .canvases.drag-active .canvas-card *,
+      .canvases.drag-active .empty-cell * { pointer-events: none; }
+      .canvas-card.dragging { opacity: 0.45; }
+      .drop-ok { outline: 2px solid var(--accent); outline-offset: -2px; }
+      .drop-bad { outline: 2px solid #c0392b; outline-offset: -2px; }
+      .card-remove {
+        position: absolute;
+        top: 8px;
+        right: 8px;
+        width: 24px;
+        height: 24px;
+        padding: 0;
+        font: inherit;
+        font-size: 15px;
+        line-height: 1;
+        color: var(--text-dim);
+        background: rgba(255, 255, 255, 0.9);
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        cursor: pointer;
+      }
+      .card-remove:hover { color: var(--text); border-color: #d5d5ce; }
+      .empty-cell {
+        min-width: 0;
+        min-height: 0;
+        border: 1px dashed #c9c9c1;
+        border-radius: 12px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 11px;
+        color: var(--text-soft);
+      }
+      .empty-cell select {
+        font: inherit;
+        font-size: 12px;
+        max-width: calc(100% - 16px);
+        padding: 5px 8px;
+        border: 1px solid var(--line);
+        background: var(--panel-soft);
+        color: var(--text);
+        border-radius: 6px;
+        cursor: pointer;
+      }
       /* Viewer-computed cards get a dashed edge so they never read as model output. */
       .canvas-card[data-source="derived"] {
         border-style: dashed;
@@ -375,7 +430,8 @@
           grid-template-rows: none;
           align-content: start;
         }
-        .canvas-card {
+        .empty-cell { grid-row: auto !important; grid-column: auto !important; }
+        .canvas-card, .empty-cell {
           grid-area: auto;
           height: min(calc(100vw - 24px), 520px);
         }
@@ -481,6 +537,13 @@
         <div class="view-toolbar">
           <span style="color:var(--text-dim)">layout</span>
           <select id="layoutSelect" aria-label="Viewer layout"></select>
+          <button class="btn" id="editLayoutBtn">Edit layout</button>
+          <span class="layout-edit-tools hidden" id="layoutEditTools">
+            <button class="btn" id="addRowBtn">+ Row</button>
+            <button class="btn" id="removeRowBtn" title="Removes the last row (must be empty)">− Row</button>
+            <button class="btn" id="addColBtn">+ Column</button>
+            <button class="btn" id="removeColBtn" title="Removes the last column (must be empty)">− Column</button>
+          </span>
           <div class="metric-row" id="metricRow"></div>
         </div>
 
@@ -494,6 +557,6 @@
       </section>
     </div>
 
-    <script type="module" src="train.js?v=spectral-20261017"></script>
+    <script type="module" src="train.js?v=layout-edit-20261017"></script>
   </body>
 </html>

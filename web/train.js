@@ -83,6 +83,9 @@ const state = {
   targetAnalysis: null,  // viewer-side target luma / pyramid / spectrum (see targetAnalysis())
   spectra: null,         // spectra of the latest render (see currentSpectra())
   importanceImage: null, // RGBA8 importance map for the current target + mask
+  layoutName: null,      // active key in LAYOUTS
+  editing: false,        // layout edit mode (drag to move, add / remove, rows & cols)
+  dragId: null,          // view being dragged in edit mode
 };
 
 const ui = {
@@ -105,6 +108,12 @@ const ui = {
   saveTxt: document.getElementById("saveTxt"),
   paramsPanel: document.getElementById("paramsPanel"),
   layoutSelect: document.getElementById("layoutSelect"),
+  editLayoutBtn: document.getElementById("editLayoutBtn"),
+  layoutEditTools: document.getElementById("layoutEditTools"),
+  addRowBtn: document.getElementById("addRowBtn"),
+  removeRowBtn: document.getElementById("removeRowBtn"),
+  addColBtn: document.getElementById("addColBtn"),
+  removeColBtn: document.getElementById("removeColBtn"),
   canvases: document.getElementById("canvases"),
   metricRow: document.getElementById("metricRow"),
   progressFill: document.getElementById("progressFill"),
@@ -285,6 +294,10 @@ const LAYOUTS = {
 };
 const DEFAULT_LAYOUT = "overview";
 const LAYOUT_STORAGE_KEY = "sad.train.layout";
+// Edits in edit mode go to one "Custom" layout (editing a preset copies it
+// there first), saved in the same areas format as the presets.
+const CUSTOM_LAYOUT = "custom";
+const CUSTOM_STORAGE_KEY = "sad.train.customLayout";
 
 // Parses and validates a layout's areas string into a grid of view ids.
 function parseLayoutAreas(areas) {
@@ -345,10 +358,19 @@ function buildCards(name) {
       card.append(view.overlayCanvas);
     }
     if (view.hit) attachPlotHover(view, card, canvas);
+    if (state.editing) {
+      const r = viewRect(grid, id);
+      attachEditControls(view, id, card, label, r.r0, r.c0);
+    }
     root.append(card);
     view.card = card;
     view.canvas = canvas;
   }
+  root.classList.toggle("editing", state.editing);
+  if (state.editing) {
+    grid.forEach((row, r) => row.forEach((id, c) => { if (id === ".") root.append(emptyCell(ids, r, c)); }));
+  }
+  updateEditTools(grid);
 }
 
 async function setLayout(name) {
@@ -360,6 +382,7 @@ async function setLayout(name) {
     name = DEFAULT_LAYOUT;
     buildCards(name);
   }
+  state.layoutName = name;
   ui.layoutSelect.value = name;
   try { localStorage.setItem(LAYOUT_STORAGE_KEY, name); } catch {}
   // Fresh canvases are empty: repaint everything we have.
@@ -370,6 +393,192 @@ async function setLayout(name) {
 
 function savedLayout() {
   try { return localStorage.getItem(LAYOUT_STORAGE_KEY) || DEFAULT_LAYOUT; } catch { return DEFAULT_LAYOUT; }
+}
+
+// ---- Layout editing ----
+// Cards keep the size their layout gives them; the grid only grows or shrinks
+// by whole rows / columns at the bottom / right. Dragging a card by its label
+// onto another card swaps the two if they're the same size; onto an empty
+// cell moves it there (its top-left lands on that cell) if it fits.
+
+function loadCustomLayout() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(CUSTOM_STORAGE_KEY));
+    if (!saved?.areas) return;
+    parseLayoutAreas(saved.areas);
+    LAYOUTS[CUSTOM_LAYOUT] = { label: "Custom", areas: saved.areas, rows: saved.rows };
+  } catch {}
+}
+
+function gridToAreas(grid) {
+  return grid.map((row) => `"${row.join(" ")}"`).join("\n");
+}
+
+// Bounding cells of a view in the grid (views are rectangles).
+function viewRect(grid, id) {
+  let r0 = Infinity, r1 = -1, c0 = Infinity, c1 = -1;
+  grid.forEach((row, r) => row.forEach((v, c) => {
+    if (v !== id) return;
+    r0 = Math.min(r0, r); r1 = Math.max(r1, r);
+    c0 = Math.min(c0, c); c1 = Math.max(c1, c);
+  }));
+  return { r0, r1, c0, c1 };
+}
+
+function fillRect(grid, { r0, r1, c0, c1 }, id) {
+  for (let r = r0; r <= r1; r += 1) for (let c = c0; c <= c1; c += 1) grid[r][c] = id;
+}
+
+// Moves view `id` so it covers cell (r, c); returns false if not allowed.
+function moveView(grid, id, r, c) {
+  const s = viewRect(grid, id);
+  const h = s.r1 - s.r0, w = s.c1 - s.c0;
+  const occupant = grid[r][c];
+  if (occupant !== "." && occupant !== id) {
+    const t = viewRect(grid, occupant);
+    if (t.r1 - t.r0 !== h || t.c1 - t.c0 !== w) return false;
+    fillRect(grid, s, occupant);
+    fillRect(grid, t, id);
+    return true;
+  }
+  const dest = { r0: r, r1: r + h, c0: c, c1: c + w };
+  if (dest.r1 >= grid.length || dest.c1 >= grid[0].length) return false;
+  for (let y = dest.r0; y <= dest.r1; y += 1) {
+    for (let x = dest.c0; x <= dest.c1; x += 1) if (grid[y][x] !== "." && grid[y][x] !== id) return false;
+  }
+  fillRect(grid, s, ".");
+  fillRect(grid, dest, id);
+  return true;
+}
+
+function activeGrid() {
+  return parseLayoutAreas(LAYOUTS[state.layoutName].areas).grid.map((row) => [...row]);
+}
+
+// Applies `mutate` to a copy of the active grid and switches to the result as
+// the Custom layout. `mutate` returns false to refuse; an invalid result is
+// refused too. Explicit row sizes survive only while the row count does.
+async function editLayout(mutate) {
+  const base = LAYOUTS[state.layoutName];
+  const grid = activeGrid();
+  const rowCount = grid.length;
+  if (mutate(grid) === false) return;
+  const areas = gridToAreas(grid);
+  try {
+    parseLayoutAreas(areas);
+  } catch (err) {
+    appendLog(`Layout edit refused: ${err.message}`);
+    return;
+  }
+  LAYOUTS[CUSTOM_LAYOUT] = { label: "Custom", areas, rows: grid.length === rowCount ? base.rows : undefined };
+  try {
+    localStorage.setItem(CUSTOM_STORAGE_KEY, JSON.stringify({ areas, rows: LAYOUTS[CUSTOM_LAYOUT].rows }));
+  } catch {}
+  if (![...ui.layoutSelect.options].some((o) => o.value === CUSTOM_LAYOUT)) {
+    ui.layoutSelect.add(new Option("Custom", CUSTOM_LAYOUT));
+  }
+  await setLayout(CUSTOM_LAYOUT);
+}
+
+function canMove(id, r, c) {
+  return Boolean(id) && moveView(activeGrid(), id, r, c);
+}
+
+// Highlights a drop target while a card is dragged over it, and moves the
+// card on drop. (r, c) is the cell the dragged card lands on.
+function attachDropTarget(el, r, c) {
+  const clear = () => el.classList.remove("drop-ok", "drop-bad");
+  el.addEventListener("dragover", (ev) => {
+    if (!state.dragId) return;
+    const ok = canMove(state.dragId, r, c);
+    el.classList.toggle("drop-ok", ok);
+    el.classList.toggle("drop-bad", !ok);
+    if (ok) {
+      ev.preventDefault();
+      ev.dataTransfer.dropEffect = "move";
+    }
+  });
+  el.addEventListener("dragleave", clear);
+  el.addEventListener("drop", (ev) => {
+    ev.preventDefault();
+    clear();
+    const id = state.dragId;
+    state.dragId = null;
+    editLayout((grid) => moveView(grid, id, r, c));
+  });
+}
+
+function attachEditControls(view, id, card, label, r, c) {
+  label.draggable = true;
+  label.addEventListener("dragstart", (ev) => {
+    state.dragId = id;
+    ev.dataTransfer.setData("text/plain", id);
+    ev.dataTransfer.effectAllowed = "move";
+    card.classList.add("dragging");
+    ui.canvases.classList.add("drag-active");
+  });
+  label.addEventListener("dragend", () => {
+    state.dragId = null;
+    card.classList.remove("dragging");
+    ui.canvases.classList.remove("drag-active");
+  });
+  attachDropTarget(card, r, c);
+  const remove = document.createElement("button");
+  remove.className = "card-remove";
+  remove.textContent = "×";
+  remove.title = `Remove ${view.label}`;
+  remove.setAttribute("aria-label", `Remove ${view.label}`);
+  remove.addEventListener("click", () => editLayout((grid) => fillRect(grid, viewRect(grid, id), ".")));
+  card.append(remove);
+}
+
+// An empty cell in edit mode: a drop target with a picker of unplaced views,
+// grouped by source.
+function emptyCell(placed, r, c) {
+  const cell = document.createElement("div");
+  cell.className = "empty-cell";
+  cell.style.gridRow = String(r + 1);
+  cell.style.gridColumn = String(c + 1);
+  attachDropTarget(cell, r, c);
+  const free = Object.keys(VIEWS).filter((id) => !placed.includes(id));
+  if (!free.length) {
+    cell.textContent = "All views placed";
+    return cell;
+  }
+  const select = document.createElement("select");
+  select.setAttribute("aria-label", `Add a view at row ${r + 1}, column ${c + 1}`);
+  select.add(new Option("+ Add view…", ""));
+  for (const [key, source] of Object.entries(SOURCES)) {
+    const ids = free.filter((id) => VIEWS[id].source === key);
+    if (!ids.length) continue;
+    const group = document.createElement("optgroup");
+    group.label = source.badge;
+    for (const id of ids) group.append(new Option(VIEWS[id].label, id));
+    select.append(group);
+  }
+  select.addEventListener("change", () => {
+    const id = select.value;
+    if (id) editLayout((grid) => { grid[r][c] = id; });
+  });
+  cell.append(select);
+  return cell;
+}
+
+const rowEmpty = (grid, r) => grid[r].every((v) => v === ".");
+const colEmpty = (grid, c) => grid.every((row) => row[c] === ".");
+
+function updateEditTools(grid) {
+  ui.editLayoutBtn.textContent = state.editing ? "Done" : "Edit layout";
+  ui.editLayoutBtn.classList.toggle("btn-primary", state.editing);
+  ui.layoutEditTools.classList.toggle("hidden", !state.editing);
+  // Only an empty last row / column can go, and the grid keeps at least one.
+  ui.removeRowBtn.disabled = grid.length < 2 || !rowEmpty(grid, grid.length - 1);
+  ui.removeColBtn.disabled = grid[0].length < 2 || !colEmpty(grid, grid[0].length - 1);
+}
+
+function toggleEditing() {
+  state.editing = !state.editing;
+  setLayout(state.layoutName);
 }
 
 // Redraws the views in the layout that listen for any of `events`, in VIEWS
@@ -1746,6 +1955,7 @@ function toggleParams() {
 }
 
 async function main() {
+  loadCustomLayout();
   for (const [name, layout] of Object.entries(LAYOUTS)) ui.layoutSelect.add(new Option(layout.label, name));
   setLayout(savedLayout());
   try {
@@ -1793,6 +2003,17 @@ async function main() {
     }
   });
   ui.layoutSelect.addEventListener("change", () => setLayout(ui.layoutSelect.value));
+  ui.editLayoutBtn.addEventListener("click", toggleEditing);
+  ui.addRowBtn.addEventListener("click", () => editLayout((grid) => { grid.push(grid[0].map(() => ".")); }));
+  ui.removeRowBtn.addEventListener("click", () => editLayout((grid) => {
+    if (grid.length < 2 || !rowEmpty(grid, grid.length - 1)) return false;
+    grid.pop();
+  }));
+  ui.addColBtn.addEventListener("click", () => editLayout((grid) => { for (const row of grid) row.push("."); }));
+  ui.removeColBtn.addEventListener("click", () => editLayout((grid) => {
+    if (grid[0].length < 2 || !colEmpty(grid, grid[0].length - 1)) return false;
+    for (const row of grid) row.pop();
+  }));
   // Card sizes follow the viewer area (window resize, advanced panel toggle).
   new ResizeObserver(() => updateCanvasLayout()).observe(ui.canvases);
 }
