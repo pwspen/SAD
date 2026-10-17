@@ -9,8 +9,8 @@
     },
     {
       "name": "kodak-bench",
-      "runtimeExecutable": "python3",
-      "runtimeArgs": ["-m", "http.server", "8766", "--bind", "127.0.0.1", "--directory", ".."],
+      "runtimeExecutable": "./serve.sh",
+      "runtimeArgs": [],
       "port": 8766
     }
   ]

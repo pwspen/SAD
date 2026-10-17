@@ -14,17 +14,18 @@ git checkout multi-backend
 
 ## Train in the Browser
 
-Serve the repository over HTTP. ES modules and `fetch` don't work from `file://`.
+Serve the pages over HTTP (ES modules and `fetch` don't work from `file://`):
 
 ```bash
-python3 -m http.server 8000
+./serve.sh
 ```
 
-Then open:
+It serves the folder above the repo on port 8766 (`PORT=…` to change it), so the
+trainer's Kodak picker can reach `../comp/data/kodak`, and prints the links:
 
-- http://localhost:8000/web/train.html: interactive trainer
-- http://localhost:8000/web/index.html: viewer for saved `*_sites.txt` files
-- http://localhost:8000/web/bench.html?image=../test.png: scripted benchmark
+- http://127.0.0.1:8766/SAD/web/train.html: interactive trainer
+- http://127.0.0.1:8766/SAD/web/index.html: viewer for saved `*_sites.txt` files
+- http://127.0.0.1:8766/SAD/web/bench.html?image=../test.png: scripted benchmark
 
 ## Headless Sweeps (Node)
 

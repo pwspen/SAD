@@ -12,12 +12,10 @@ All pages read hyperparameters from `training_config.json`.
 
 - WebGPU-capable browser (Chrome/Edge, Safari Tech Preview).
 - HTTP(S) hosting. ES modules + `fetch` won't run from `file://`; GitHub Pages
-  works because it serves the repository over HTTPS:
-
-  ```bash
-  python -m http.server 8000 -d /path/to/SAD
-  # then open http://localhost:8000/web/train.html
-  ```
+  works because it serves the repository over HTTPS. Locally, run `./serve.sh`
+  from the repo root and open the trainer link it prints. It serves the parent
+  folder so the Kodak picker can find `../comp/data/kodak` (override the folder
+  with `?kodak=<dir>`).
 
 ## Viewer (`index.html`)
 
@@ -39,9 +37,9 @@ All pages read hyperparameters from `training_config.json`.
 Run the browser trainer without manual file picking:
 
 ```bash
-python -m http.server 8000 -d /path/to/SAD
+./serve.sh
 # then open:
-# http://localhost:8000/web/bench.html?image=../test.png
+# http://127.0.0.1:8766/SAD/web/bench.html?image=../test.png
 ```
 
 The page logs `BENCH_RESULT` with final PSNR, active sites, training time, and total elapsed time.
