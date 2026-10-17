@@ -263,7 +263,8 @@ const VIEWS = {
                       "correlation Σ Re(F_r·F_t*) / √(Σ|F_r|² Σ|F_t|²): 1 = matches, 0 = unrelated." },
   spectrum2d: { label: "2D power spectrum", kind: "plot", source: "derived", on: ["render", "target"],
                 draw: drawSpectrum2d,
-                note: "log₁₀ |F|² with DC at the centre, on one shared scale set by the target. " +
+                note: "log₁₀ |F|² with DC at the centre, on one shared scale set by the target; " +
+                      "the target tile's axes are fx and fy in cycles/px. " +
                       "Dashed ring: the site-spacing frequency." },
 };
 
@@ -1460,7 +1461,9 @@ function drawSpectrum2d(view) {
   if (!p) return;
   const { ctx, col, w, h } = p;
   const s = currentSpectra();
-  const box = { left: 12, right: w - 12, top: PLOT_PAD.top, bottom: h - 40 };
+  // The target tile carries the frequency axes: tick labels below and to its left.
+  const axisLeft = 44, axisBottom = 16;
+  const box = { left: 12 + axisLeft, right: w - 12, top: PLOT_PAD.top, bottom: h - 40 - axisBottom };
   if (!s) {
     drawEmpty(p, box, "Load a target to see its spectrum");
     return;
@@ -1468,7 +1471,7 @@ function drawSpectrum2d(view) {
   const tiles = spectrumTiles(s);
   const gap = 12;
   const side = Math.max(1, Math.min((box.right - box.left - 2 * gap) / 3, box.bottom - box.top));
-  const x0 = (w - (3 * side + 2 * gap)) / 2;
+  const x0 = axisLeft + (w - axisLeft - (3 * side + 2 * gap)) / 2;
   const fSite = siteFrequency(s.ta);
   ctx.font = PLOT_FONT;
   SIGNALS.forEach((sig, i) => {
@@ -1497,16 +1500,55 @@ function drawSpectrum2d(view) {
       ctx.stroke();
       ctx.restore();
     }
+    if (i === 0) drawSpectrumTileAxes(p, x, y, side);
     ctx.fillStyle = col.dim;
     ctx.textAlign = "center";
     ctx.textBaseline = "top";
-    ctx.fillText(sig.label, x + side / 2, y + side + 6);
+    ctx.fillText(sig.label, x + side / 2, y + side + 6 + axisBottom);
   });
   ctx.fillStyle = col.soft;
   ctx.textAlign = "center";
   ctx.textBaseline = "bottom";
   ctx.fillText(`log₁₀ power, shared scale ${tiles.lo.toFixed(1)} … ${tiles.hi.toFixed(1)}` +
                (fSite ? " · dashed ring: site spacing" : ""), w / 2, h - 8);
+}
+
+// Ticks in cycles/px along one tile: fx left→right, fy top→bottom (image rows),
+// matching logPowerImage's layout with DC at the centre.
+const SPECTRUM_TICKS = [-0.5, -0.25, 0, 0.25, 0.5];
+
+function drawSpectrumTileAxes(p, x, y, side) {
+  const { ctx, col } = p;
+  ctx.save();
+  ctx.font = PLOT_FONT;
+  ctx.strokeStyle = col.soft;
+  ctx.fillStyle = col.soft;
+  ctx.lineWidth = 1;
+  for (const f of SPECTRUM_TICKS) {
+    const t = Math.round((f + 0.5) * side);
+    const tx = Math.min(x + side - 0.5, x + t + 0.5);
+    const ty = Math.min(y + side - 0.5, y + t + 0.5);
+    ctx.beginPath();
+    ctx.moveTo(tx, y + side); ctx.lineTo(tx, y + side + 4);
+    ctx.moveTo(x, ty); ctx.lineTo(x - 4, ty);
+    ctx.stroke();
+    ctx.textAlign = "center";
+    ctx.textBaseline = "top";
+    ctx.fillText(fmtSig(f), x + t, y + side + 5);
+    ctx.textAlign = "right";
+    ctx.textBaseline = "middle";
+    ctx.fillText(fmtSig(f), x - 6, y + t);
+  }
+  ctx.fillStyle = col.dim;
+  ctx.textAlign = "right";
+  ctx.textBaseline = "top";
+  ctx.fillText("fx", x - 14, y + side + 5);
+  ctx.translate(x - 36, y + side / 2);
+  ctx.rotate(-Math.PI / 2);
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText("fy (cycles/px)", 0, 0);
+  ctx.restore();
 }
 
 // ---- Image views ----
