@@ -22,7 +22,7 @@ import {
   updateHilbertParamsBuffer,
   packJumpStep,
   hilbertBitsForSize,
-} from "./params.js?v=no-densify-20261016";
+} from "./params.js?v=adam-bounds-20261016b";
 
 import {
   createSitesBuffer,
@@ -34,7 +34,7 @@ import {
   createHilbertBuffers,
   createDummyStorageBuffer,
   readSites,
-} from "./buffers.js?v=no-densify-20261016";
+} from "./buffers.js?v=adam-bounds-20261016b";
 
 import {
   createRgba32FloatTexture,
@@ -42,7 +42,7 @@ import {
   writeFloat32ToRgba32FloatTexture,
   readRgba32FloatTexture,
   whiteMaskRgba32Float,
-} from "./textures.js?v=no-densify-20261016";
+} from "./textures.js?v=adam-bounds-20261016b";
 
 import {
   InitGradientEncoder,
@@ -59,9 +59,9 @@ import {
   TauEncoder,
   ClearBufferEncoder,
   HilbertEncoder,
-} from "./encoders.js?v=no-densify-20261016";
+} from "./encoders.js?v=adam-bounds-20261016b";
 
-import { RadixSortUInt2 } from "./radix_sort.js?v=no-densify-20261016";
+import { RadixSortUInt2 } from "./radix_sort.js?v=adam-bounds-20261016b";
 
 const MAX_PREVIEW_IMAGE_READBACKS = 2;
 // Direction/anisotropy start learning here. Previously derived from the prune

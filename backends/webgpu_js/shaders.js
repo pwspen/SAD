@@ -852,6 +852,8 @@ fn fsMain(in : VertexOut) -> @location(0) vec4<f32> {
   let inf = 1e20;
   let negInf = -1e20;
   var maxLogit = negInf;
+  var validCount = 0u;
+  var badLogit = false;
   for (var i = 0u; i < 8u; i = i + 1u) {
     let idx = candIds[i];
     if (idx >= renderParams.siteCount) {
@@ -863,15 +865,23 @@ fn fsMain(in : VertexOut) -> @location(0) vec4<f32> {
       logits[i] = negInf;
       continue;
     }
+    validCount = validCount + 1u;
     let tau = exp(site.log_tau);
     let dmix2 = voronoi_dmix2(site, uv, renderParams.invScaleSq);
     logits[i] = -tau * dmix2;
+    // max() with NaN is implementation-defined in WGSL, so flag it explicitly.
+    if (is_bad(logits[i])) { badLogit = true; }
     maxLogit = max(maxLogit, logits[i]);
   }
 
-  // Early exit if all candidates invalid
-  if (maxLogit == negInf) {
-    return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+  // Debug: magenta = no valid candidates (empty/dead top-K list).
+  if (validCount == 0u) {
+    return vec4<f32>(1.0, 0.0, 1.0, 1.0);
+  }
+
+  // Debug: cyan = NaN/Inf in the softmax (logits, max, or normalizer).
+  if (badLogit || is_bad(maxLogit) || maxLogit == negInf) {
+    return vec4<f32>(0.0, 1.0, 1.0, 1.0);
   }
 
   // Softmax
@@ -880,6 +890,9 @@ fn fsMain(in : VertexOut) -> @location(0) vec4<f32> {
   for (var i = 0u; i < 8u; i = i + 1u) {
     weights[i] = exp(logits[i] - maxLogit);
     sumW = sumW + weights[i];
+  }
+  if (is_bad(sumW) || !(sumW > 0.0)) {
+    return vec4<f32>(0.0, 1.0, 1.0, 1.0);
   }
   let invSum = 1.0 / max(sumW, 1e-8);
 

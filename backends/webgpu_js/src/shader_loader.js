@@ -13,8 +13,8 @@ import {
   TAU_WRITEBACK_OVERRIDE,
   RENDER_HASHED_OVERRIDE,
   RENDER_TAU_HEATMAP_OVERRIDE,
-} from "./wgsl_overrides.js?v=no-densify-20261016";
-export { tileSlotsForLimit } from "./wgsl_overrides.js?v=no-densify-20261016";
+} from "./wgsl_overrides.js?v=adam-bounds-20261016b";
+export { tileSlotsForLimit } from "./wgsl_overrides.js?v=adam-bounds-20261016b";
 
 const COMMON_URL = new URL("../../shared/sad_shared.wgsl", import.meta.url);
 const WGSL_DIR_URL = new URL("../../shared/wgsl/", import.meta.url);

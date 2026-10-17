@@ -274,6 +274,9 @@ fn loadGrad(i : u32) -> f32 { return bitcast<f32>(atomicLoad(&grads[i])); }
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   let idx = gid.x;
+  // Dispatch rounds up to 256 threads and the sites buffer is sized exactly to
+  // the site count, so the tail threads must not touch sites/adam/grads.
+  if (idx >= arrayLength(&sites)) { return; }
   let base_g = idx * 10u;
   let norm = 1.0 / f32(params.width * params.height);
   let scale = norm;

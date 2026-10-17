@@ -3,11 +3,11 @@
 // (mask, init-sites, candidates/lr…) in the collapsible left panel, and a
 // side-by-side target vs reconstruction view, both aspect-fit.
 
-import { loadShaders, tileSlotsForLimit } from "./src/shader_loader.js?v=no-densify-20261016";
-import { Trainer, buildArgs, GRAD_GROUPS } from "./src/trainer.js?v=no-densify-20261016";
-import { loadImageToFloat32, loadMaskRgba32Float, whiteMaskRgba32Float } from "./src/textures.js?v=no-densify-20261016";
-import { loadSitesFromFile, serializeSitesTxt, triggerDownload, floatImageToRgba8 } from "./src/io.js?v=no-densify-20261016";
-import { SITE_FLOATS } from "./src/params.js?v=no-densify-20261016";
+import { loadShaders, tileSlotsForLimit } from "./src/shader_loader.js?v=adam-bounds-20261016b";
+import { Trainer, buildArgs, GRAD_GROUPS } from "./src/trainer.js?v=adam-bounds-20261016b";
+import { loadImageToFloat32, loadMaskRgba32Float, whiteMaskRgba32Float } from "./src/textures.js?v=adam-bounds-20261016b";
+import { loadSitesFromFile, serializeSitesTxt, triggerDownload, floatImageToRgba8 } from "./src/io.js?v=adam-bounds-20261016b";
+import { SITE_FLOATS } from "./src/params.js?v=adam-bounds-20261016b";
 
 const CONFIG_URL = "../../training_config.json";
 const DEMO_MAX_IMAGE_SIDE = 2048;

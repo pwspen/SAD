@@ -20,4 +20,6 @@ __pycache__/
 /backends/pytorch/torch_ext/sad_ops/*.so
 
 # Training outputs and local data
-/results/
+/results/s
+
+/untracked/
