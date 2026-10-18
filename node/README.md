@@ -6,15 +6,16 @@ so parameter sweeps don't need a browser:
 ```bash
 cd node
 npm install
-node sweep.mjs --image /path/to/image.png --set siteMode=fixed --set sites=500,1000,2000 --set lrPosBase=0.025,0.05
+node sweep.mjs --image /path/to/image.png --set startSites=1 --set endSites=500,1000,2000 --set lrPosBase=0.025,0.05
 node sweep.mjs --image /path/to/image.png --grid grid.json --repeat 3 --save-dir results/sweep
 ```
 
-- Site growth is on by default (`siteMode=grow`: every `growEvery` iterations from `growInitSites` to
-  `growMaxSites` on the `growSchedule` curve, `"decay"` cooling from `growFrontLoad` × the
-  average rate or `"geometric"` × `growFactor`; λ as an early stop); `sites` only applies with
-  `--set siteMode=fixed`. Each run reports where and why growth ended (`growStop`,
-  `growDoneIter` in the JSON).
+- The site count goes from `startSites` to `endSites` by `countEnd` × `iters` on the
+  `countSchedule` curve (`linear`, `exponential` or `sawtooth`), stepping every `growEvery`
+  iterations: growth when start < end, merging when start > end, fixed when equal. λ can end
+  growth early. Each run reports where and why the schedule ended (`growStop`, `growDoneIter`
+  in the JSON). Note: `--set` axes combine as a grid, so for fixed counts use `--grid` with
+  explicit `{"startSites": n, "endSites": n}` runs.
 - `--set key=v1,v2` sweeps a trainer arg (camelCase, as in `buildArgs` in `trainer/trainer.js`) or a
   `training_config.json` key (UPPER_CASE). Axes combine as a cartesian grid.
   `--grid` takes the same as JSON, or an explicit list of runs.

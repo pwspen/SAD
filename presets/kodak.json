@@ -1,5 +1,5 @@
 {
-  "_note": "Trainer settings (camelCase = buildArgs args, UPPER_CASE = training_config.json keys, as in node/sweep.mjs --set) tuned on Kodak 768x512: growing 1 -> 100 sites over 1000 iterations, by mean final PSNR over 8 Kodak images, checked on the other 16 (commit adfadf0). Tuned with squared-error loss, before the loss option existed; growLrDecay 1 = off. Everything not listed comes from training_config.json. The LR warmup (200 of the 1000 iterations) was removed afterwards: within ±0.2 dB on MNIST and Kodak.",
+  "_note": "Trainer settings (camelCase = buildArgs args, UPPER_CASE = training_config.json keys, as in node/sweep.mjs --set) tuned on Kodak 768x512: growing 1 -> 100 sites over 1000 iterations, by mean final PSNR over 8 Kodak images, checked on the other 16 (commit adfadf0). Tuned with squared-error loss, before the loss option existed; growLrDecay 1 = off. Everything not listed comes from training_config.json. The LR warmup (200 of the 1000 iterations) was removed afterwards: within ±0.2 dB on MNIST and Kodak. Site count mapped afterwards to the start/end schedule: 1 → 100, exponential, reached at 30% of the run (countEnd 0.3): on 8 images at 256 px 24.04 dB vs 23.82 at 70%; at 5% λ 400 stopped growth at ~30 sites.",
   "args": {
     "iters": 1000,
     "lrMult": 8,
@@ -14,11 +14,11 @@
     "lrAnisoBase": 0.025,
     "INIT_LOG_TAU": 5,
     "INIT_RADIUS": 4,
-    "siteMode": "grow",
-    "growInitSites": 1,
-    "growMaxSites": 100,
+    "startSites": 1,
+    "endSites": 100,
+    "countSchedule": "exponential",
+    "countEnd": 0.3,
     "growEvery": 10,
-    "growFactor": 3,
     "growLambda": 400,
     "growBlur": 0,
     "growLrDecay": 1,

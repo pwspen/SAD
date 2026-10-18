@@ -179,7 +179,7 @@ async function runOne(ctx, run) {
 
   const startedAt = new Date().toISOString();
   try {
-    const initSiteCount = initSites ? initSites.count : args.sites;
+    const initSiteCount = initSites ? initSites.count : args.startSites;
     await trainer.prepare({
       width: target.width,
       height: target.height,

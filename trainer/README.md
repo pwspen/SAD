@@ -4,29 +4,31 @@ The WebGPU optimizer: the training loop, Adam schedule, GPU buffers and kernel d
 It has no DOM dependencies, so the browser pages in `web/` and the Node runner in `node/`
 both import it. Hyperparameter defaults come from `training_config.json`.
 
-`siteMode` picks how many sites a run uses:
+The site count goes from `startSites` (or a loaded sites file's count) to `endSites` by
+`countEnd` × `iters`, on the `countSchedule` curve, then holds; these are the only settings that
+set it. Every `growEvery` iterations the count moves to the curve's value (`countTarget`):
 
-- `"grow"` (default): start from `growInitSites` and every `growEvery` iterations add sites, up
-  to `growMaxSites`, following `growSchedule`: `"decay"` (default) adds them at a rate that
-  starts at `growFrontLoad` × the average rate (budget / run length; 1 = linear) and cools
-  exponentially so the whole budget is spent by the run's end (`growEndIter`); `"geometric"`
-  multiplies the count by `growFactor` (at least +1) each step. Each batch splits the cells whose color
-  structure a second site would explain best (the variance explained by a linear color ramp
-  across the cell): the site moves to one half, a new site takes the other. Only splits whose
-  gain beats `growLambda × BITS_PER_SITE` qualify (0 = any positive gain), so λ can
-  shrink a batch or end growth early. Sites are never removed.
-  `growMode` picks how sites are added: `"split"` (default, the split above) or `"insert"`
-  (`insert.js`): new sites are placed one at a time where they cut the training loss most,
-  computed exactly from the current fit (candidate positions, median colors), and
-  existing sites are left alone; λ is then in the training loss's units.
-- `"sawtooth"`: grow geometrically (× `growFactor` every `growEvery`) up to `growMaxSites`, then merge
-  sites that don't pay for their bits (see `pruneEvery`, 5 × `growEvery` if 0) until a batch doesn't
-  pay, compact the survivors, and grow again. Merging waits 2 merge intervals after growth and takes at
-  most a quarter of the sites per step; cycles stop when the last merge phase removed nothing or the
-  next wouldn't end by 70% of the run. On Kodak at 256 px (max 800) it ended at ~510 sites with a
-  lower description length than keeping 800 (16.30 vs 16.42 bpp); on MNIST (max 64) it beat a fixed
-  16 but not a single grow-then-prune (18.83 vs 17.42).
-- `"fixed"`: exactly `sites` for the whole run.
+- `"linear"`: the same number of sites per step.
+- `"exponential"` (default): the same factor per step.
+- `"sawtooth"`: the exponential curve with `sawTeeth` teeth on top, each rising to
+  (1 + `sawAmp`) × the curve over `sawRatio` / (1 + `sawRatio`) of the tooth, then merging back.
+  On 40 MNIST digits (1 → 32 by 30% of the run) it scored 22.25 dB vs 20.92 for exponential; on
+  Kodak at 256 px (1 → 400 by 70%) 27.33 vs 26.90. Teeth shorter than a few `growEvery` steps
+  never go down (`countPlan` shows it).
+
+Start < end grows. Each batch splits the cells whose color structure a second site would explain
+best (the variance explained by a linear color ramp across the cell): the site moves to one half, a
+new site takes the other. Only splits whose gain beats `growLambda × BITS_PER_SITE` qualify (0 = any
+positive gain), so λ can shrink a batch or end the schedule early. `growMode` picks how sites are
+added: `"split"` (default, the split above) or `"insert"` (`insert.js`): new sites are placed one at a
+time where they cut the training loss most, computed exactly from the current fit (candidate
+positions, median colors), and existing sites are left alone; λ is then in the training loss's units.
+
+Start > end prunes: each step merges the cheapest neighbouring pairs (Ward's criterion on cells at
+their mean colors, `merge.js`), each site in at most one merge per step, into the pixel-weighted
+average of both sites' parameters (anisotropy axes as doubled angles). Merges don't age the other
+sites for `growLrDecay`. On Kodak at 256 px, 1600 → 400 beat a fixed 400 (28.79 vs 28.06 dB); on
+MNIST, 128 → 16 was still behind a fixed 16 (L1 6.97 vs 5.32 levels). Start = end is a fixed count.
 
 `growCriterion` picks what ends growth early: `"lambda"` (default, predicted gain against
 `growLambda`) or `"mdl"`: at each growth step the cells are scored by description length (sites ×
@@ -35,7 +37,7 @@ both import it. Hyperparameter defaults come from `training_config.json`.
 where a new batch needs longer than `growEvery` to pay off (MNIST stops at ~2 sites).
 
 `pruneEvery` (0 = off) merges neighbouring sites that don't pay for their bits, every that many
-iterations once growth is over (`merge.js`). Pairs are scored by Ward's criterion on cells at their
+iterations once the count schedule is over (`merge.js`). Pairs are scored by Ward's criterion on cells at their
 mean colors and merged cheapest first while the cost stays under a site's bits; the merged site is
 the pixel-weighted average of every parameter (anisotropy axes as doubled angles). Each batch is
 kept only if the render's description length went down by the next step, else undone and pruning

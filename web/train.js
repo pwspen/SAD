@@ -5,7 +5,7 @@
 
 import { loadShaders, tileSlotsForLimit } from "../trainer/shader_loader.js?v=shared-wgsl-20261017";
 import { requestTrainingDevice } from "../trainer/device.js?v=shared-wgsl-20261017";
-import { Trainer, buildArgs, GRAD_GROUPS, lrSchedule, LR_SCHEDULES, LOSSES, GROW_MODES, GROW_CRITERIA, KEEP_BEST, GROW_SCHEDULES, growthPlan } from "../trainer/trainer.js?v=grow-decay-20261018";
+import { Trainer, buildArgs, GRAD_GROUPS, lrSchedule, LR_SCHEDULES, LOSSES, GROW_MODES, GROW_CRITERIA, KEEP_BEST, COUNT_SCHEDULES, countPlan, countVaries, countHorizon } from "../trainer/trainer.js?v=count-20261018";
 import { loadImageToFloat32, loadMaskRgba32Float, whiteMaskRgba32Float } from "../trainer/textures.js?v=shared-wgsl-20261017";
 import { loadSitesFromFile, serializeSitesTxt, triggerDownload, floatImageToRgba8, computeBpp, BITS_PER_SITE } from "../trainer/io.js?v=shared-wgsl-20261017";
 import { SITE_FLOATS } from "../trainer/params.js?v=shared-wgsl-20261017";
@@ -37,7 +37,13 @@ const MNIST_DIR = new URLSearchParams(location.search).get("mnist") || "../../co
 // init-sites / mask are pickers inside the panel (not listed here).
 const UI_FIELDS = [
   ["iters", "p-iters"],
-  ["sites", "p-sites"],
+  ["startSites", "p-startSites"],
+  ["endSites", "p-endSites"],
+  ["countSchedule", "p-countSchedule"],
+  ["countEnd", "p-countEnd"],
+  ["sawTeeth", "p-sawTeeth"],
+  ["sawAmp", "p-sawAmp"],
+  ["sawRatio", "p-sawRatio"],
   ["logFreq", "p-logFreq"], // also sets viewerFreq (one "refresh every" field)
   ["candFreq", "p-candFreq"],
   ["candUpdatePasses", "p-candUpdatePasses"],
@@ -57,13 +63,7 @@ const UI_FIELDS = [
   ["lrAnisoBase", "p-lrAnisoBase"],
   ["colorSpace", "p-colorSpace"],
   ["loss", "p-loss"],
-  ["siteMode", "p-siteMode"],
   ["growLambda", "p-growLambda"],
-  ["growInitSites", "p-growInitSites"],
-  ["growMaxSites", "p-growMaxSites"],
-  ["growSchedule", "p-growSchedule"],
-  ["growFrontLoad", "p-growFrontLoad"],
-  ["growFactor", "p-growFactor"],
   ["growEvery", "p-growEvery"],
   ["growBlur", "p-growBlur"],
   ["growLrDecay", "p-growLrDecay"],
@@ -175,8 +175,8 @@ function applyConfigToForm(config, overrides = {}) {
     .replaceChildren(...Object.entries(LOSSES).map(([key, loss]) => new Option(loss.label, key)));
   document.getElementById("p-growMode")
     .replaceChildren(...Object.entries(GROW_MODES).map(([key, label]) => new Option(label, key)));
-  document.getElementById("p-growSchedule")
-    .replaceChildren(...Object.entries(GROW_SCHEDULES).map(([key, label]) => new Option(label, key)));
+  document.getElementById("p-countSchedule")
+    .replaceChildren(...Object.entries(COUNT_SCHEDULES).map(([key, label]) => new Option(label, key)));
   document.getElementById("p-growCriterion")
     .replaceChildren(...Object.entries(GROW_CRITERIA).map(([key, label]) => new Option(label, key)));
   document.getElementById("p-keepBest")
@@ -225,42 +225,31 @@ function updatePlanSummary() {
   const n = args.iters;
   lines.push(`Run: <b>${n}</b> iterations.`);
   let growEnd = 0;
-  if (args.siteMode === "sawtooth") {
-    lines.push(`Sites: sawtooth, ×${args.growFactor} every ${args.growEvery} up to ${args.growMaxSites}, then merges every ` +
-               `${args.pruneEvery || 5 * args.growEvery} until a batch doesn't pay, then again; cycles end by 70% of the run.`);
-  } else if (args.siteMode === "grow") {
-    const start = state.initSites ? state.initSites.count : args.growInitSites;
-    const plan = growthPlan(args, start);
-    const counts = plan.map((p) => p.count);
-    growEnd = plan.length ? plan.at(-1).it : 0;
-    const seq = [start, ...counts];
-    const seqText = seq.length > 7 ? `${seq.slice(0, 4).join(", ")}, …, ${seq.at(-1)}` : seq.join(", ");
-    if (!counts.length) {
-      lines.push(`Growth: none, start sites (${start}) ≥ max sites.`);
-    } else if (args.growSchedule === "decay") {
-      const half = plan.find((p) => p.count - start >= (args.growMaxSites - start) / 2);
-      lines.push(`Growth: ${seqText} — cooling from ${args.growFrontLoad}× the average rate, ` +
-                 `half the budget by iter ${half ? half.it : growEnd}, all of it by iter <b>${growEnd}</b> ` +
-                 `if every step is full (λ (stop) can end growth early).`);
-    } else if (growEnd < n) {
-      lines.push(`Growth: ${seqText} — ${counts.length} steps of ×${args.growFactor} every ${args.growEvery}, ` +
-                 `done at iter <b>${growEnd}</b> if every step is full (λ (stop) can trim steps, which adds more, or end growth early).`);
-    } else {
-      const reached = seq[Math.min(seq.length - 1, Math.floor((n - 1) / args.growEvery))];
-      lines.push(`Growth: ${seqText} would finish at iter ${growEnd}, ` +
-                 `<span class="warn">after the run ends at ${n}: it stops at ${reached} sites. ` +
-                 `Raise iterations, or lower grow every or max sites.</span>`);
-      growEnd = n;
-    }
+  const start = state.initSites ? state.initSites.count : args.startSites;
+  if (!countVaries(args, start)) {
+    lines.push(`Sites: fixed at <b>${start}</b>.`);
   } else {
-    lines.push(`Sites: fixed at <b>${state.initSites ? state.initSites.count : args.sites}</b>.`);
+    const plan = countPlan(args, start);
+    growEnd = countHorizon(args);
+    const seq = [start, ...plan.map((p) => p.count)];
+    const seqText = seq.length > 8 ? `${seq.slice(0, 4).join(", ")}, …, ${seq.slice(-3).join(", ")}` : seq.join(", ");
+    const peak = Math.max(...seq);
+    const dir = args.endSites > start ? "grow" : args.endSites < start ? "prune" : "hold";
+    lines.push(`Sites: ${seqText} — ${args.countSchedule}` +
+               (args.countSchedule === "sawtooth" ? ` (${args.sawTeeth} teeth, +${Math.round(args.sawAmp * 100)}%, ` +
+                 `${args.sawRatio}:1 grow:merge, peak ${peak})` : "") +
+               `, ${dir} ${start} → ${args.endSites} by iter <b>${growEnd}</b>, a step every ${args.growEvery}` +
+               (dir === "grow" ? " (λ (stop) can end growth early)." : "."));
+    if (growEnd >= n) lines.push(`<span class="warn">No iterations left to refine after the count settles: lower reach end by.</span>`);
+    if (args.countSchedule === "sawtooth" && !plan.some((p, i) => p.count < (i ? plan[i - 1].count : start))) {
+      lines.push(`<span class="warn">The teeth are too short for a step every ${args.growEvery}: the count never goes ` +
+                 `down. Use fewer teeth, a later reach end by, or a smaller step every.</span>`);
+    }
   }
   if (args.lrSchedule === "fixed") {
     lines.push(`LR: full throughout.`);
-  } else if (args.lrSchedule === "decay-after-growth" && args.siteMode === "sawtooth") {
-    lines.push(`LR: full while growing, then down toward 0 by ${n}; back to full each time a cycle grows again.`);
   } else if (args.lrSchedule === "decay-after-growth" && growEnd > 0) {
-    lines.push(`LR: full until growth ends (iter ${growEnd}), then down to 0 by ${n}.`);
+    lines.push(`LR: full until the count settles (iter ${growEnd}), then down to 0 by ${n}.`);
   } else {
     lines.push(`LR: full at iter 0, down to 0 by ${n}.`);
   }
@@ -273,24 +262,21 @@ function updatePlanSummary() {
   el.innerHTML = lines.join("<br>");
 }
 
-// Show only the chosen site mode's fields, and lock its starting-count field
-// (sites when fixed, start sites when growing) to a loaded sites file's count,
-// restoring the typed value once the file is cleared.
+// Show the count schedule's fields (growth / merge fields only if the count
+// changes, sawtooth's only for sawtooth), and lock start sites to a loaded
+// sites file's count, restoring the typed value once the file is cleared.
 function syncSiteFields() {
-  const mode = document.getElementById("p-siteMode").value;
-  // Sawtooth shows the grow fields, with geometric growth (its factor).
-  ui.paramsPanel.dataset.siteMode = mode === "sawtooth" ? "grow" : mode;
-  ui.paramsPanel.dataset.growSchedule = mode === "sawtooth" ? "geometric" : document.getElementById("p-growSchedule").value;
-  const locked = mode !== "fixed" ? "p-growInitSites" : "p-sites";
-  for (const id of ["p-sites", "p-growInitSites"]) {
-    const el = document.getElementById(id);
-    const lock = id === locked && state.initSites != null;
-    if (lock && !el.disabled) el.dataset.typed = el.value;
-    if (!lock && el.disabled) el.value = el.dataset.typed ?? el.value;
-    el.disabled = lock;
-    if (lock) el.value = state.initSites.count;
-    el.title = lock ? "Set by the loaded sites file (Clear it to edit)" : "";
-  }
+  const el = document.getElementById("p-startSites");
+  const lock = state.initSites != null;
+  if (lock && !el.disabled) el.dataset.typed = el.value;
+  if (!lock && el.disabled) el.value = el.dataset.typed ?? el.value;
+  el.disabled = lock;
+  if (lock) el.value = state.initSites.count;
+  el.title = lock ? "Set by the loaded sites file (Clear it to edit)" : "";
+  let varies = true;
+  try { const args = readFormArgs(); varies = countVaries(args, state.initSites?.count ?? args.startSites); } catch {}
+  ui.paramsPanel.dataset.siteMode = varies ? "grow" : "fixed";
+  ui.paramsPanel.dataset.countSchedule = document.getElementById("p-countSchedule").value;
   updatePlanSummary();
 }
 
@@ -2735,7 +2721,7 @@ async function startTraining() {
 
   let init = scaleInitSitesIfNeeded(state.initSites, width, height);
   if (init) init = overrideInitLogTau(init, args.initLogTau);
-  const initSiteCount = init ? init.count : args.sites;
+  const initSiteCount = init ? init.count : args.startSites;
 
   state.psnrHistory = [];
   state.lastLrScale = null;
@@ -2745,14 +2731,13 @@ async function startTraining() {
   state.growthGain = [];
   state.lrHistory = [];
   state.snapAnalysis = null;
-  // Growth follows growSchedule, so its end (where "decay after growth"
-  // starts decaying) is predictable unless λ stops it early; the plan is
-  // corrected once the trainer reports the real end.
-  const startCount = init ? init.count : args.growInitSites;
-  const plannedGrowEnd = args.siteMode === "fixed" ? 0
-    : Math.min(args.growEndIter, growthPlan(args.siteMode === "sawtooth" ? { ...args, growSchedule: "geometric" } : args,
-                                            startCount).at(-1)?.it ?? 0);
-  state.runSiteMode = args.siteMode;
+  // The count schedule ends at countHorizon (where "decay after growth"
+  // starts decaying) unless λ stops it early; the plan is corrected once the
+  // trainer reports the real end.
+  const startCount = initSiteCount;
+  const varies = countVaries(args, startCount);
+  const plannedGrowEnd = varies ? countHorizon(args) : 0;
+  state.runSiteMode = varies ? "grow" : "fixed";
   state.lastGrowth = null;
   state.lrPlan = { iters: args.iters, lrMult: args.lrMult,
                    kind: args.lrSchedule, growDoneIter: plannedGrowEnd };
@@ -2763,14 +2748,11 @@ async function startTraining() {
   for (const view of Object.values(VIEWS)) view.hoverKey = null;
   await refreshViews("run");
 
-  const sitesDesc = args.siteMode === "sawtooth"
-    ? `sawtooth ${startCount} → ${args.growMaxSites} by ${GROW_MODES[args.growMode]}, ×${args.growFactor} every ` +
-      `${args.growEvery} iters, merge every ${args.pruneEvery || 5 * args.growEvery}`
-    : args.siteMode === "grow"
-    ? `grow ${startCount} → ${Math.max(args.growMaxSites, startCount)} by ${GROW_MODES[args.growMode]}, ` +
-      (args.growSchedule === "decay" ? `cooling from ${args.growFrontLoad}× avg rate` : `×${args.growFactor}`) +
-      ` every ${args.growEvery} iters ` +
-      `(λ stop ${args.growLambda})` + (args.growLrDecay !== 1 ? `, older sites' LR ×${args.growLrDecay} per step` : "")
+  const sitesDesc = varies
+    ? `${startCount} → ${args.endSites} ${args.countSchedule}` +
+      (args.countSchedule === "sawtooth" ? ` (${args.sawTeeth} teeth, +${Math.round(args.sawAmp * 100)}%, ${args.sawRatio}:1)` : "") +
+      ` by iter ${countHorizon(args)}, step every ${args.growEvery} iters, grow by ${GROW_MODES[args.growMode]} ` +
+      `(λ stop ${args.growLambda})` + (args.growLrDecay !== 1 ? `, older sites' LR ×${args.growLrDecay} per growth step` : "")
     : `${initSiteCount} fixed`;
   appendLog(`Target: ${width}×${height} | sites: ${sitesDesc} | iters: ${args.iters} | lr ×${args.lrMult} ${LR_SCHEDULES[args.lrSchedule]} | color: ${COLOR_SPACES[args.colorSpace].label} | loss: ${LOSSES[args.loss].label} | refresh: ${args.logFreq}`);
   updateProgress(0, args.iters, "Preparing…");
@@ -3461,8 +3443,10 @@ async function main() {
   ui.maskInput.addEventListener("change", handleMaskInput);
   ui.initSitesInput.addEventListener("change", handleInitSitesInput);
   ui.initSitesClear.addEventListener("click", clearInitSites);
-  document.getElementById("p-siteMode").addEventListener("change", syncSiteFields);
-  document.getElementById("p-growSchedule").addEventListener("change", syncSiteFields);
+  for (const id of ["p-startSites", "p-endSites", "p-countSchedule", "p-sawAmp", "p-sawTeeth"]) {
+    document.getElementById(id).addEventListener("input", syncSiteFields);
+    document.getElementById(id).addEventListener("change", syncSiteFields);
+  }
   ui.paramsPanel.addEventListener("input", updatePlanSummary);
   ui.startBtn.addEventListener("click", startTraining);
   ui.stopBtn.addEventListener("click", stopTraining);

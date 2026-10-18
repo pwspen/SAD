@@ -219,8 +219,7 @@
       .plan-summary .warn { color: #b4471a; }
       #paramsPanel[data-site-mode="fixed"] .param[data-site-mode="grow"],
       #paramsPanel[data-site-mode="grow"] .param[data-site-mode="fixed"],
-      #paramsPanel[data-grow-schedule="decay"] .param[data-grow-schedule="geometric"],
-      #paramsPanel[data-grow-schedule="geometric"] .param[data-grow-schedule="decay"] { display: none; }
+      #paramsPanel:not([data-count-schedule="sawtooth"]) .param[data-count-schedule="sawtooth"] { display: none; }
       .row input:disabled { color: var(--text-soft); background: var(--panel-soft); }
       .panel h3.has-tip::after { content: " ⓘ"; letter-spacing: 0; }
       .tip {
@@ -647,6 +646,46 @@
 
     <div class="main">
       <aside class="panel hidden" id="paramsPanel">
+        <h3 class="has-tip" tabindex="0">Site count<span class="tip" role="tooltip">The only settings that decide how many sites the run uses. The count goes from <b>start sites</b> at iteration 0 to <b>end sites</b> by <b>reach end by</b>, on the chosen curve, then holds while the rest of the run refines. Start &lt; end grows (splitting or inserting sites, see <b>grow by</b>); start &gt; end prunes, merging the cheapest neighbouring pairs into one site (the pixel-weighted average of both); start = end is a fixed count. Each site costs 128 bits: bpp = sites × 128 / (width × height).</span></h3>
+        <div class="param">
+          <div class="row"><label>start sites</label><input id="p-startSites" type="number" min="1" /></div>
+          <p class="help"><span class="unit">sites at iteration 0</span></p>
+          <div class="tip" role="tooltip">Placed at iteration 0 by the default edge-based init (1 works). A loaded init sites file sets this to its own count.</div>
+        </div>
+        <div class="param">
+          <div class="row"><label>end sites</label><input id="p-endSites" type="number" min="1" /></div>
+          <p class="help"><span class="unit">sites once the schedule is done</span></p>
+          <div class="tip" role="tooltip">Where the count ends up. Below <b>start sites</b> the run prunes: each step merges the cheapest neighbouring pairs (the least squared error added with the merged cell at its mean color), each site in at most one merge per step. On Kodak at 256 px, 1600 → 400 beat a fixed 400 (28.8 vs 28.1 dB); on MNIST 128 → 16 was still behind a fixed 16.</div>
+        </div>
+        <div class="param">
+          <div class="row"><label>schedule</label><select id="p-countSchedule" aria-label="Site count schedule"></select></div>
+          <div class="tip" role="tooltip">The curve from start to end. <b>linear</b>: the same number of sites per step. <b>exponential</b>: the same factor per step, so few sites change early and many late when growing (the other way round when pruning). <b>sawtooth</b>: the exponential curve with teeth on top: each tooth grows above it by <b>amplitude</b>, then merges back down to it. On MNIST (1 → 32 by 30% of the run) sawtooth scored 22.3 dB vs 20.9 for exponential; on Kodak at 256 px (1 → 400 by 70%) 27.3 vs 26.9. Teeth shorter than a few steps can't go down: the summary warns when a sawtooth never merges.</div>
+        </div>
+        <div class="param" data-site-mode="grow">
+          <div class="row"><label>reach end by</label><input id="p-countEnd" type="number" step="0.05" min="0" max="1" /></div>
+          <p class="help"><span class="unit">fraction of the run (0–1)</span></p>
+          <div class="tip" role="tooltip">The count reaches <b>end sites</b> at this fraction of the iterations; the rest of the run refines that set (with <b>decay after growth</b>, the LR cools down from here). Slow ramps take many small steps, and <b>LR decay</b> compounds per growth step.</div>
+        </div>
+        <div class="param" data-count-schedule="sawtooth">
+          <div class="row"><label>teeth</label><input id="p-sawTeeth" type="number" min="0" step="1" /></div>
+          <p class="help"><span class="unit">teeth before the count reaches the end</span></p>
+          <div class="tip" role="tooltip">Frequency: how many grow-then-merge cycles fit between iteration 0 and <b>reach end by</b>.</div>
+        </div>
+        <div class="param" data-count-schedule="sawtooth">
+          <div class="row"><label>amplitude</label><input id="p-sawAmp" type="number" min="0" step="0.1" /></div>
+          <p class="help"><span class="unit">peak above the curve, as a fraction of it</span></p>
+          <div class="tip" role="tooltip">Each tooth peaks at (1 + this) × the exponential curve's count at that point, e.g. 0.5 = 50% more sites, then merges back down to the curve.</div>
+        </div>
+        <div class="param" data-count-schedule="sawtooth">
+          <div class="row"><label>grow : merge</label><input id="p-sawRatio" type="number" min="0.01" step="0.5" /></div>
+          <p class="help"><span class="unit">time growing per unit of time merging, within a tooth</span></p>
+          <div class="tip" role="tooltip">3 = each tooth spends 3/4 of its time growing up to the peak and 1/4 merging back down.</div>
+        </div>
+        <div class="param" data-site-mode="grow">
+          <div class="row"><label>step every</label><input id="p-growEvery" type="number" min="1" /></div>
+          <p class="help"><span class="unit">iterations between count steps</span></p>
+          <div class="tip" role="tooltip">Time for each batch to settle before the next is placed. Too short and the next step still sees the old error where the last batch landed. Growth finishes after (number of steps) × this, e.g. 1 → 64 with factor 2 and 25 takes 6 steps, done at iteration 150.</div>
+        </div>
         <h3>Preset</h3>
         <div class="param">
           <div class="row"><label>preset</label><select id="presetSelect" aria-label="Settings preset"></select></div>
@@ -673,19 +712,9 @@
               <span class="file-name" id="initLabel">gradient init</span>
             </div>
           </div>
-          <div class="tip" role="tooltip">Start from these sites instead of the default placement (sites sampled where the image has edges). Positions are rescaled to the target size and every site's τ is reset. Its site count becomes the starting count: it replaces <b>sites</b> (fixed) or <b>start sites</b> (grow), and that field is locked to show it until the file is cleared.</div>
+          <div class="tip" role="tooltip">Start from these sites instead of the default placement (sites sampled where the image has edges). Positions are rescaled to the target size and every site's τ is reset. Its site count becomes the starting count: it replaces <b>start sites</b>, which is locked to show it until the file is cleared.</div>
         </div>
 
-        <h3 class="has-tip" tabindex="0">Site count<span class="tip" role="tooltip">How many sites the run uses. <b>Fixed</b>: exactly the number you give, for the whole run. <b>Grow</b>: start from a few sites and multiply the count by a factor on a regular schedule, splitting the cells where a second site would explain the most color structure, until <b>max sites</b> (or earlier, once new sites aren't worth their bits at λ). Sites are never removed. Each site costs 128 bits: bpp = sites × 128 / (width × height).</span></h3>
-        <div class="param">
-          <div class="row"><label>mode</label><select id="p-siteMode" aria-label="Site count mode"><option value="grow">grow</option><option value="sawtooth">sawtooth</option><option value="fixed">fixed</option></select></div>
-          <div class="tip" role="tooltip"><b>grow</b>: start sites → max sites, × <b>factor</b> every <b>grow every</b> iterations. <b>sawtooth</b>: grow × <b>factor</b> up to max sites, then merge sites that don't pay for their bits (as <b>prune every</b>, which defaults to 5 × grow every here) until a batch doesn't pay, then grow again, and so on. Merging waits 2 merge intervals after growth, takes at most a quarter of the sites per step, and cycles stop once one wouldn't end within 70% of the run. On Kodak at 256 px (max 800) it ended at ~510 sites with a better description length than 800; on MNIST it beat a fixed 16 but not a single grow-then-prune. <b>fixed</b>: the count is <b>sites</b>. Only the fields for the chosen mode are shown.</div>
-        </div>
-        <div class="param" data-site-mode="fixed">
-          <div class="row"><label>sites</label><input id="p-sites" type="number" /></div>
-          <p class="help"><span class="unit">sites (128 bits each)</span></p>
-          <div class="tip" role="tooltip">The exact site count for the whole run, placed at iteration 0 by the default edge-based init.</div>
-        </div>
         <div class="param" data-site-mode="grow">
           <div class="row"><label>blur × spacing</label><input id="p-growBlur" type="number" step="0.05" /></div>
           <p class="help"><span class="unit">multiple of the site spacing (unitless); σ in px = this × √(mask pixels / sites)</span></p>
@@ -704,42 +733,13 @@
           <div class="tip" role="tooltip">How the learning rate changes over the run. <b>cosine</b>: falls from full to 0 on a cosine over the run. <b>fixed</b>: stays at full. <b>decay after growth</b>: stays at full while sites are being added, then falls to 0 on a cosine by the end of the run, so late sites aren't starved and the finished set still gets a cool-down (with fixed site count it equals cosine). The cool-down matters: without it MNIST lost 1–1.5 dB.</div>
         </div>
         <div class="param" data-site-mode="grow">
-          <div class="row"><label>start sites</label><input id="p-growInitSites" type="number" min="1" /></div>
-          <p class="help"><span class="unit">sites</span></p>
-          <div class="tip" role="tooltip">Count at iteration 0, placed by the default edge-based init. 1 works. Growth only adds, so this is also the minimum.</div>
-        </div>
-        <div class="param" data-site-mode="grow">
           <div class="row"><label>grow by</label><select id="p-growMode" aria-label="Growth mode"></select></div>
           <div class="tip" role="tooltip">How each step adds sites. <b>split cells</b>: the cells whose colors a linear ramp explains best are each split in two; the site moves to one half and a new site takes the other. <b>insert (exact loss)</b>: new sites are placed one at a time where they cut the training loss most, computed exactly from the current fit; candidates are every pixel (or the worst-fit pixels on large images), with the shape of the site that owns it, colored with the median of the pixels it would win. Existing sites are left alone. Insertion is slower per step on large images.</div>
-        </div>
-        <div class="param" data-site-mode="grow">
-          <div class="row"><label>schedule</label><select id="p-growSchedule" aria-label="Growth schedule"></select></div>
-          <div class="tip" role="tooltip">How the site budget (<b>max sites</b> − <b>start sites</b>) is spent over the run. <b>cooling</b>: sites are added fast at first and the rate decays exponentially, so the whole budget is used by the run's end; <b>front-load</b> sets how fast it starts. <b>× factor per step</b>: each step multiplies the count by <b>factor</b> until max sites, then stops.</div>
-        </div>
-        <div class="param" data-site-mode="grow" data-grow-schedule="decay">
-          <div class="row"><label>front-load</label><input id="p-growFrontLoad" type="number" step="1" min="1" /></div>
-          <p class="help"><span class="unit">× the average rate, at the start (≥ 1)</span></p>
-          <div class="tip" role="tooltip">The starting slope of the site-count curve, as a multiple of the average rate (budget ÷ run length). The rate then cools exponentially so the budget runs out exactly at the end. 1 = linear (constant rate). 10 = about 2/3 of the budget in the first tenth of the run; 50 = about 2/3 in the first 2%. Steps still happen every <b>grow every</b> iterations; split growth can at most double the count per step.</div>
-        </div>
-        <div class="param" data-site-mode="grow" data-grow-schedule="geometric">
-          <div class="row"><label>factor</label><input id="p-growFactor" type="number" step="0.1" min="1.0001" /></div>
-          <p class="help"><span class="unit">× sites per step (above 1)</span></p>
-          <div class="tip" role="tooltip">Each step multiplies the count by this (rounded up, at least +1), capped at <b>max sites</b>. 2 doubles: 1, 2, 4, 8, …; 1.5 gives 1, 2, 3, 5, 8, 12, …. Within a step, the cells whose color structure a split would explain best are each split in two: the site moves to one half and a new site takes the other. A factor just above 1 adds one site per step.</div>
-        </div>
-        <div class="param" data-site-mode="grow">
-          <div class="row"><label>grow every</label><input id="p-growEvery" type="number" min="1" /></div>
-          <p class="help"><span class="unit">iterations between steps</span></p>
-          <div class="tip" role="tooltip">Time for each batch to settle before the next is placed. Too short and the next step still sees the old error where the last batch landed. Growth finishes after (number of steps) × this, e.g. 1 → 64 with factor 2 and 25 takes 6 steps, done at iteration 150.</div>
         </div>
         <div class="param" data-site-mode="grow">
           <div class="row"><label>LR decay</label><input id="p-growLrDecay" type="number" step="0.05" min="0" /></div>
           <p class="help"><span class="unit">× per growth step, for sites older than it</span></p>
           <div class="tip" role="tooltip">Each growth step multiplies the learning rates of every site that was already there by this, so early sites settle while later ones refine around them. A split's parent counts as new (it moves and gets fresh Adam moments), so only sites that stop being split slow down. A site 3 steps old at 0.5 learns at 0.125× the normal rate. 1 = off. Applies to every parameter, color included.</div>
-        </div>
-        <div class="param" data-site-mode="grow">
-          <div class="row"><label>max sites</label><input id="p-growMaxSites" type="number" min="1" /></div>
-          <p class="help"><span class="unit">sites</span></p>
-          <div class="tip" role="tooltip">Growth stops when the count reaches this; the rest of the run refines the sites it has. Leave the run long enough after the last step for that.</div>
         </div>
         <div class="param" data-site-mode="grow">
           <div class="row"><label>stop by</label><select id="p-growCriterion" aria-label="Growth stop criterion"></select></div>

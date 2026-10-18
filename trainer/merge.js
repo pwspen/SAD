@@ -95,8 +95,9 @@ export function mergeCost({ count, sum }, i, j) {
 
 // The merges that pay for themselves, cheapest first, each site at most once:
 // [{ keep, drop, cost }] with `keep` the larger cell. `samples` = masked
-// pixels × 3.
-export function pickMerges(moments, samples, bitsPerSite) {
+// pixels × 3. With `count`, the `count` cheapest merges instead, paying or
+// not (a count schedule going down).
+export function pickMerges(moments, samples, bitsPerSite, { count = null } = {}) {
   const frac = Math.pow(2, (2 * bitsPerSite) / Math.max(1, samples)) - 1;
   let err = cellSse(moments);
   const options = [];
@@ -108,8 +109,8 @@ export function pickMerges(moments, samples, bitsPerSite) {
   const used = new Set();
   const merges = [];
   for (const { i, j, cost } of options) {
+    if (count != null ? merges.length >= count : !(cost < err * frac)) break;
     if (used.has(i) || used.has(j)) continue;
-    if (!(cost < err * frac)) break;
     used.add(i);
     used.add(j);
     err += cost;

@@ -81,9 +81,10 @@
         });
         const overrides = {
           iters: numberParam("iters"),
-          sites: numberParam("sites"),
-          // A speed benchmark needs a known count: fixed unless ?siteMode=grow.
-          siteMode: params.get("siteMode") || "fixed",
+          // A speed benchmark needs a known count: ?sites=N fixed (default
+          // 1000), unless ?endSites differs.
+          startSites: numberParam("sites") ?? 1000,
+          endSites: numberParam("endSites") ?? numberParam("sites") ?? 1000,
           logFreq: numberParam("logFreq"),
           viewerFreq: numberParam("viewerFreq"),
           candUpdatePasses: numberParam("candPasses"),
@@ -92,7 +93,7 @@
           if (overrides[key] === undefined) delete overrides[key];
         }
         const args = buildArgs(config, overrides);
-        log(`Config | iters=${args.iters} | sites=${args.sites} | log-freq=${args.logFreq} | viewer-freq=${args.viewerFreq}`);
+        log(`Config | iters=${args.iters} | sites=${args.startSites}${args.endSites !== args.startSites ? ` → ${args.endSites}` : ""} | log-freq=${args.logFreq} | viewer-freq=${args.viewerFreq}`);
 
         const imageBlob = await fetch(imageUrl, { cache: "no-cache" }).then((r) => {
           if (!r.ok) throw new Error(`Failed to load image: ${r.status}`);
@@ -129,7 +130,7 @@
           maskRgba32f: null,
           maskSum: target.width * target.height,
           initSites: null,
-          initSiteCount: args.sites,
+          initSiteCount: args.startSites,
         });
 
         const trainStart = performance.now();
