@@ -610,6 +610,7 @@ export class Trainer {
             totalSites: siteCount,
             fitSigma: this.fitSigma || 0,
             growDoneIter: this.growDoneIter,
+            growStop: this.growStop,
             itsPerSec,
             elapsedSec: elapsed,
             renderRgba: rgba,
@@ -680,8 +681,8 @@ export class Trainer {
   async _growStep(it) {
     const args = this.args;
     if (this.growDoneIter !== null) return;
-    if (this.siteCount >= this.bufferCapacity) { this._endGrowth(it, "max sites"); return; }
-    if (it >= args.growEndIter) { this._endGrowth(it, "end iter"); return; }
+    if (this.siteCount >= this.bufferCapacity) { this._endGrowth(it, "reached max sites"); return; }
+    if (it >= args.growEndIter) { this._endGrowth(it, "growEndIter safety stop"); return; }
     if (it === 0 || it % args.growEvery !== 0) return;
 
     const device = this.device;
@@ -722,7 +723,7 @@ export class Trainer {
     const picked = growthBlocks(cells, cellsX, cellsY, cell, Math.max(cell, spacing), threshold,
       target - n0, minDist);
     if (!picked.length) {
-      this._endGrowth(it, `λ: no new site would remove more than λ × ${BITS_PER_SITE} = ` +
+      this._endGrowth(it, `λ (stop): no new site would remove more than λ × ${BITS_PER_SITE} = ` +
                           `${fmtLambda(threshold)} levels²`);
       return;
     }
@@ -787,7 +788,7 @@ export class Trainer {
     this._log(`Grow @${it}: +${k} → ${n1} sites` + (k < target - n0 ? ` (${target - n0} wanted; no other spot both beats λ and is a spacing away)` : "") +
               ` | best gain ${fmtLambda(picked[0].gain / BITS_PER_SITE)} levels²/bit | spacing ${minDist.toFixed(0)}px` +
               (this.fitSigma ? ` | blur σ ${this.fitSigma.toFixed(1)}px` : ""));
-    if (n1 >= this.bufferCapacity) this._endGrowth(it, "max sites");
+    if (n1 >= this.bufferCapacity) this._endGrowth(it, "reached max sites");
   }
 
   // Encode preview readbacks into the same submission as the preview render.

@@ -5,7 +5,7 @@
 
 import { loadShaders, tileSlotsForLimit } from "../trainer/shader_loader.js?v=shared-wgsl-20261017";
 import { requestTrainingDevice } from "../trainer/device.js?v=shared-wgsl-20261017";
-import { Trainer, buildArgs, GRAD_GROUPS, lrSchedule, LR_SCHEDULES, growthCounts } from "../trainer/trainer.js?v=batch-20261017";
+import { Trainer, buildArgs, GRAD_GROUPS, lrSchedule, LR_SCHEDULES, growthCounts } from "../trainer/trainer.js?v=schedule-20261017";
 import { loadImageToFloat32, loadMaskRgba32Float, whiteMaskRgba32Float } from "../trainer/textures.js?v=shared-wgsl-20261017";
 import { loadSitesFromFile, serializeSitesTxt, triggerDownload, floatImageToRgba8, computeBpp, BITS_PER_SITE } from "../trainer/io.js?v=shared-wgsl-20261017";
 import { SITE_FLOATS } from "../trainer/params.js?v=shared-wgsl-20261017";
@@ -80,6 +80,8 @@ const state = {
   gradHistory: [],       // [{ it, stats }] per-param |grad| mean/max from log ticks
   lrHistory: [],         // [{ it, lr }] LR multiplier (schedule × LR mult) from log ticks
   lrPlan: null,          // { warmupIters, decayIters, lrMult, kind, growDoneIter } of the current run
+  lastGrowth: null,      // { mode, doneIter, stop, sites, it, iters } at the latest log tick (Schedule summary)
+  runSiteMode: null,     // siteMode of the current/last run
   bandHistory: [],       // [{ it, snr: [dB per band] }] from every render
   targetAnalysis: null,  // viewer-side target luma / pyramid / spectrum (see targetAnalysis())
   spectra: null,         // spectra of the latest render (see currentSpectra())
@@ -162,6 +164,61 @@ function readFormArgs() {
   return buildArgs(state.config, overrides);
 }
 
+// The Schedule section's summary: what the current fields will do (run
+// length, LR schedule, growth steps and when growth ends) and, after a run,
+// when and why growth actually ended, naming the field to change.
+function updatePlanSummary() {
+  const el = document.getElementById("planSummary");
+  if (!el || !state.config) return;
+  let args;
+  try {
+    args = readFormArgs();
+  } catch (err) {
+    el.innerHTML = `<span class="warn">${err.message}</span>`;
+    return;
+  }
+  const lines = [];
+  const n = args.iters;
+  lines.push(`Run: <b>${n}</b> iterations (${args.warmupIters} warmup + ${args.decayIters} decay).`);
+  let growEnd = 0;
+  if (args.siteMode === "grow") {
+    const start = state.initSites ? state.initSites.count : args.growInitSites;
+    const counts = growthCounts(start, args.growFactor, args.growMaxSites);
+    growEnd = counts.length * args.growEvery;
+    const seq = [start, ...counts];
+    const seqText = seq.length > 7 ? `${seq.slice(0, 4).join(", ")}, …, ${seq.at(-1)}` : seq.join(", ");
+    if (!counts.length) {
+      lines.push(`Growth: none, start sites (${start}) ≥ max sites.`);
+    } else if (growEnd < n) {
+      lines.push(`Growth: ${seqText} — ${counts.length} steps of ×${args.growFactor} every ${args.growEvery}, ` +
+                 `done at iter <b>${growEnd}</b> (earlier if λ (stop) ends it).`);
+    } else {
+      const reached = seq[Math.min(seq.length - 1, Math.floor((n - 1) / args.growEvery))];
+      lines.push(`Growth: ${seqText} would finish at iter ${growEnd}, ` +
+                 `<span class="warn">after the run ends at ${n}: it stops at ${reached} sites. ` +
+                 `Raise decay iters, or lower grow every or max sites.</span>`);
+      growEnd = n;
+    }
+  } else {
+    lines.push(`Sites: fixed at <b>${state.initSites ? state.initSites.count : args.sites}</b>.`);
+  }
+  const w = args.warmupIters;
+  if (args.lrSchedule === "fixed") {
+    lines.push(`LR: full from iter ${w} to the end.`);
+  } else if (args.lrSchedule === "decay-after-growth" && growEnd > w) {
+    lines.push(`LR: full from iter ${w} until growth ends (iter ${growEnd}), then down to 0 by ${n}.`);
+  } else {
+    lines.push(`LR: full at iter ${w}, down to 0 by ${n}.`);
+  }
+  const g = state.lastGrowth;
+  if (g && g.mode === "grow") {
+    lines.push(g.doneIter != null
+      ? `Last run: growth ended at iter <b>${g.doneIter}</b> with ${g.sites} sites — ${g.stop}.`
+      : `Last run: still growing at iter ${g.it + 1} of ${g.iters} with ${g.sites} sites (the run ended first).`);
+  }
+  el.innerHTML = lines.join("<br>");
+}
+
 // Show only the chosen site mode's fields, and lock its starting-count field
 // (sites when fixed, start sites when growing) to a loaded sites file's count,
 // restoring the typed value once the file is cleared.
@@ -178,6 +235,7 @@ function syncSiteFields() {
     if (lock) el.value = state.initSites.count;
     el.title = lock ? "Set by the loaded sites file (Clear it to edit)" : "";
   }
+  updatePlanSummary();
 }
 
 async function initDevice() {
@@ -1883,6 +1941,8 @@ async function startTraining() {
   const startCount = init ? init.count : args.growInitSites;
   const plannedGrowEnd = args.siteMode !== "grow" ? 0
     : Math.min(args.growEndIter, growthCounts(startCount, args.growFactor, args.growMaxSites).length * args.growEvery);
+  state.runSiteMode = args.siteMode;
+  state.lastGrowth = null;
   state.lrPlan = { warmupIters: args.warmupIters, decayIters: args.decayIters, lrMult: args.lrMult,
                    kind: args.lrSchedule, growDoneIter: plannedGrowEnd };
   state.lastActiveSites = initSiteCount;
@@ -1915,6 +1975,9 @@ async function startTraining() {
         state.lastLrScale = info.lrScale;
         state.lastActiveSites = info.activeSites;
         if (info.growDoneIter != null && state.lrPlan) state.lrPlan.growDoneIter = info.growDoneIter;
+        state.lastGrowth = { mode: state.runSiteMode, doneIter: info.growDoneIter, stop: info.growStop,
+                             sites: info.totalSites, it: info.it, iters: info.iters };
+        updatePlanSummary();
         if (Number.isFinite(info.psnr)) {
           state.psnrHistory.push({ it: info.it, psnr: info.psnr });
           const run = state.bppRuns[state.bppRuns.length - 1];
@@ -2175,6 +2238,7 @@ async function main() {
   ui.initSitesInput.addEventListener("change", handleInitSitesInput);
   ui.initSitesClear.addEventListener("click", clearInitSites);
   document.getElementById("p-siteMode").addEventListener("change", syncSiteFields);
+  ui.paramsPanel.addEventListener("input", updatePlanSummary);
   ui.startBtn.addEventListener("click", startTraining);
   ui.stopBtn.addEventListener("click", stopTraining);
   ui.toggleParamsBtn.addEventListener("click", toggleParams);
