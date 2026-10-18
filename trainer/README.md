@@ -18,6 +18,14 @@ both import it. Hyperparameter defaults come from `training_config.json`.
   existing sites are left alone; λ is then in the training loss's units.
 - `"fixed"`: exactly `sites` for the whole run.
 
+`keepBest` scores every log tick and ends the run on the best state seen, restored exactly
+(sites and Adam moments, candidate lists rebuilt): `"loss"` (default, lowest training loss),
+`"mdl"` (description length: sites × `BITS_PER_SITE` plus the residual coded at 8-bit precision
+under the loss's likelihood, so fewer sites at equal loss win) or `"off"`. With `growPatience` > 0,
+growth also ends, and the run returns to the best state, after that many growth steps without a
+better score. Mid-growth states are far from converged, so `"mdl"` and patience pick early
+half-fitted states with the current presets; see the comment on `KEEP_BEST` in `trainer.js`.
+
 `lrSchedule` is `"warmup-cosine"` (default), `"fixed"` (constant after warmup) or
 `"decay-after-growth"` (constant until growth ends, then cosine to 0 by the end of the run).
 

@@ -91,6 +91,41 @@ export const LOSSES = {
   l2: { label: "L2 (squared error)", id: 0 },
 };
 
+// Keeping the best state (args.keepBest): every log tick is scored and the run
+// ends on the best state seen, restored exactly (sites and Adam moments).
+// "loss": the training loss alone (default); it only ever trades the final
+// state for one with lower loss, at the same or a lower site count.
+// "mdl": total bits of a two-part code, sites × BITS_PER_SITE plus the
+// residual coded at 8-bit precision under the training loss's likelihood
+// (L1 → Laplace, L2 → Gaussian; selectionScore). Fewer sites at the same loss
+// always win, and a site is kept only if it pays for its own bits. Compared on
+// converged fits it picks 8-16 sites on MNIST digits and 400-800 on Kodak at
+// 256 px, but mid-growth states are far from converged (2-10× the converged
+// loss with the MNIST preset), so within one growing run it tends to return
+// an unconverged early state; use it to compare finished runs, or with
+// growPatience only once growth checkpoints have settled. "off": the last state.
+export const KEEP_BEST = {
+  loss: "lowest training loss",
+  mdl: "description length (bits)",
+  off: "off (final state)",
+};
+
+// Score of a state for args.keepBest (lower is better). `err` is the mean
+// training loss per sample (mean |r| for L1, mean r² for L2, colors in 0..1),
+// `samples` the number of residuals (masked pixels × 3). For "mdl" it's bits:
+// the ML Laplace (L1) / Gaussian (L2) fit to the residual has entropy
+// log2(2e·b) / ½·log2(2πe·σ²) per sample, at a quantization step of 1/255,
+// floored at 0 bits per sample.
+const QUANT = 1 / 255;
+export function selectionScore(kind, { err, sites, samples, loss }) {
+  if (!Number.isFinite(err)) return Infinity;
+  if (kind !== "mdl") return err;
+  const perSample = loss === "l2"
+    ? 0.5 * Math.log2(2 * Math.PI * Math.E * Math.max(err, 1e-30) / (QUANT * QUANT))
+    : Math.log2(2 * Math.E * Math.max(err, 1e-30) / QUANT);
+  return sites * BITS_PER_SITE + samples * Math.max(0, perSample);
+}
+
 // How growth adds sites (args.growMode).
 export const GROW_MODES = {
   split: "split cells",       // split the cells a linear color ramp explains best (siteSplit)
@@ -199,6 +234,11 @@ export function buildArgs(config, overrides = {}) {
     // existed before it (split parents count as new) by this; 1 = off.
     growLrDecay: Math.max(0, Number(pick("growLrDecay", "GROW_LR_DECAY", 1))),
     growMode: String(pick("growMode", "GROW_MODE", "split")),
+    // Keep the best log tick by this score (KEEP_BEST) and end on it.
+    keepBest: String(pick("keepBest", "KEEP_BEST", "loss")),
+    // While growing: end growth and go back to the best state once that many
+    // growth steps in a row haven't beaten it (keepBest score; 0 = never).
+    growPatience: Math.max(0, Math.floor(Number(pick("growPatience", "GROW_PATIENCE", 0)))),
   };
   args.decayIters = Math.max(0, Math.floor(Number(overrides.iters !== undefined && overrides.decayIters === undefined
     ? overrides.iters - args.warmupIters
@@ -221,6 +261,9 @@ export function buildArgs(config, overrides = {}) {
   colorSpaceFor(args.colorSpace); // fail early on an unknown name
   if (!GROW_MODES[args.growMode]) {
     throw new Error(`growMode must be one of ${Object.keys(GROW_MODES).join(", ")} (got "${args.growMode}")`);
+  }
+  if (!KEEP_BEST[args.keepBest]) {
+    throw new Error(`keepBest must be one of ${Object.keys(KEEP_BEST).join(", ")} (got "${args.keepBest}")`);
   }
   if (!LOSSES[args.loss]) {
     throw new Error(`loss must be one of ${Object.keys(LOSSES).join(", ")} (got "${args.loss}")`);
@@ -452,6 +495,7 @@ export class Trainer {
     // Growth state: the iteration it ended (null while growing) and why.
     this.growDoneIter = this.usesGrow ? null : 0;
     this.growGen = 0; // growth steps that added sites (see growLrDecay)
+    this.growSteps = 0; // growth steps taken (growPatience)
     this.growStop = null;
     if (this.usesGrow) this._updateFitTarget();
 
@@ -459,6 +503,91 @@ export class Trainer {
     this.aniStartIter = ANI_START_ITER;
     this.trainStartMs = performance.now();
     this.bestPsnr = 0;
+
+    // Best state by args.keepBest: GPU copies of the sites and Adam buffers
+    // (so a restore resumes exactly, growth LR ages included) and its stats.
+    this.best = null;
+    this.restoredBest = null;
+    if (args.keepBest !== "off") {
+      const usage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST;
+      this.bestSitesBuf = device.createBuffer({ size: this.bufferCapacity * SITE_FLOATS * 4, usage });
+      this.bestAdamBuf = device.createBuffer({ size: this.bufferCapacity * ADAM_FLOATS * 4, usage });
+    }
+    this.samples = 3 * (this.maskCpu ? this.maskCpu.reduce((a, m) => a + (m > 0 ? 1 : 0), 0) : width * height);
+  }
+
+  // Score the state just rendered (log tick) and snapshot it if it's the best.
+  _trackBest(it, rgba, psnr) {
+    if (this.args.keepBest === "off") return;
+    const err = computeLoss(rgba, this.target, this.width, this.height, this.maskCpu, this.args.loss);
+    const sites = this.activeEstimate;
+    const score = selectionScore(this.args.keepBest, { err, sites, samples: this.samples, loss: this.args.loss });
+    this.lastScore = { it, score, err, sites, psnr };
+    if (this.best && !(score < this.best.score)) return;
+    const encoder = this.device.createCommandEncoder();
+    encoder.copyBufferToBuffer(this.sitesBuf, 0, this.bestSitesBuf, 0, this.bufferCapacity * SITE_FLOATS * 4);
+    encoder.copyBufferToBuffer(this.adamBuf, 0, this.bestAdamBuf, 0, this.bufferCapacity * ADAM_FLOATS * 4);
+    this.device.queue.submit([encoder.finish()]);
+    this.best = {
+      it, score, err, psnr, sites, siteCount: this.siteCount, growGen: this.growGen,
+      growStep: this.growSteps,
+    };
+  }
+
+  // Put the best state back: sites, Adam moments, counts, and fresh candidate
+  // lists (a full jump flood from the restored sites), then render it.
+  _restoreBest(reason) {
+    const b = this.best;
+    const device = this.device;
+    const queue = device.queue;
+    const encoder = device.createCommandEncoder();
+    encoder.copyBufferToBuffer(this.bestSitesBuf, 0, this.sitesBuf, 0, this.bufferCapacity * SITE_FLOATS * 4);
+    encoder.copyBufferToBuffer(this.bestAdamBuf, 0, this.adamBuf, 0, this.bufferCapacity * ADAM_FLOATS * 4);
+    queue.submit([encoder.finish()]);
+    this.siteCount = this.actualSites = b.siteCount;
+    this.activeEstimate = b.sites;
+    this.growGen = b.growGen;
+    updateClearParamsBuffer(queue, this.countParams, b.siteCount);
+    updateGradParamsBuffer(queue, this.gradParams, b.siteCount, this.invScaleSq);
+    this._rebuildCandidates(b.siteCount);
+    this.restoredBest = { ...b, reason };
+    this._log(`Restored best state from iter ${b.it} (${reason}): ${b.sites} sites, ` +
+              `${this.args.keepBest === "mdl" ? `${(b.score / 8192).toFixed(2)} KiB` : `loss ${b.err.toPrecision(4)}`}.`);
+  }
+
+  // Candidate lists from scratch for sites [0, n): init, seed every site at
+  // its home pixel, then jump-flood passes from long jumps down to 1 px, twice.
+  _rebuildCandidates(n) {
+    const device = this.device;
+    const queue = device.queue;
+    const stages = Math.max(1, Math.ceil(Math.log2(Math.max(this.candWidth, this.candHeight, 2))));
+    this.growJfaParams ??= [];
+    for (let st = 0; st < stages; st += 1) {
+      this.growJfaParams[st] ??= createParamsBuffer(device, this._paramsArgs(n, 0, 0));
+      updateParamsBuffer(queue, this.growJfaParams[st],
+        this._paramsArgs(n, packJumpStep(st, this.candWidth, this.candHeight), 0));
+    }
+    this.rebuildParams ??= createParamsBuffer(device, this._paramsArgs(n, 0, 0));
+    updateParamsBuffer(queue, this.rebuildParams, this._paramsArgs(n, 0, 0));
+    const encoder = device.createCommandEncoder();
+    this.candsEnc.encodeInit(encoder, this.rebuildParams, this.cand0A, this.cand1A, this.candWidth, this.candHeight);
+    encoder.copyTextureToTexture({ texture: this.cand0A }, { texture: this.cand0B },
+      [this.candWidth, this.candHeight, 1]);
+    this.seedEnc.encode(encoder, this.sitesBuf, this.rebuildParams, this.cand0A, this.cand0B, n);
+    [this.cand0A, this.cand0B] = [this.cand0B, this.cand0A];
+    this.hilbertReady = false;
+    this._maybeRefreshHilbert(encoder, n);
+    this.packEnc.encode(encoder, this.sitesBuf, this.packedSitesBuf, this.countParams, n);
+    for (let pass = 0; pass < 2; pass += 1) {
+      for (let st = 0; st < stages; st += 1) {
+        this.candsEnc.encodeUpdate(encoder, this.packedSitesBuf, this.growJfaParams[st],
+          this.cand0A, this.cand1A, this.cand0B, this.cand1B,
+          this._hilbertOrderBuf(), this._hilbertPosBuf(), this.candWidth, this.candHeight);
+        [this.cand0A, this.cand0B] = [this.cand0B, this.cand0A];
+        [this.cand1A, this.cand1B] = [this.cand1B, this.cand1A];
+      }
+    }
+    queue.submit([encoder.finish()]);
   }
 
   _paramsArgs(siteCount, step, seed) {
@@ -635,6 +764,7 @@ export class Trainer {
         gradStaging.destroy();
         const psnr = computePsnrSafe(rgba, this.target, this.width, this.height, this.maskCpu, this.maskSum);
         this.bestPsnr = Math.max(this.bestPsnr, psnr);
+        this._trackBest(it, rgba, psnr);
         const elapsed = (performance.now() - this.trainStartMs) / 1000;
         const itsPerSec = (it + 1) / Math.max(elapsed, 1e-6);
         if (this.onLog) {
@@ -649,6 +779,8 @@ export class Trainer {
             fitSigma: this.fitSigma || 0,
             growDoneIter: this.growDoneIter,
             growStop: this.growStop,
+            score: this.lastScore,
+            best: this.best,
             itsPerSec,
             elapsedSec: elapsed,
             renderRgba: rgba,
@@ -668,6 +800,7 @@ export class Trainer {
 
     }
 
+    if (this.best && this.lastScore && this.best.it !== this.lastScore.it) this._restoreBest("end of run");
     const queue2 = device.queue;
     updateParamsBuffer(queue2, this.renderParams, this._paramsArgs(this.actualSites, 0, 0));
     const encoder = device.createCommandEncoder();
@@ -858,6 +991,12 @@ export class Trainer {
     if (this.siteCount >= this.bufferCapacity) { this._endGrowth(it, "reached max sites"); return; }
     if (it >= args.growEndIter) { this._endGrowth(it, "growEndIter safety stop"); return; }
     if (it === 0 || it % args.growEvery !== 0) return;
+    if (args.growPatience > 0 && this.best && this.growSteps - this.best.growStep >= args.growPatience) {
+      this._restoreBest(`no better ${args.keepBest} score in ${args.growPatience} growth step(s)`);
+      this._endGrowth(it, `patience: ${args.growPatience} growth step(s) without a better ${args.keepBest} score`);
+      return;
+    }
+    this.growSteps += 1;
     const stats = await this._siteStats();
     this._reportGrowthGain(it, stats);
 
@@ -1187,6 +1326,8 @@ export class Trainer {
       growDoneIter: this.growDoneIter,
       growStop: this.growStop,
       growthGain: this.growGainHistory || [],
+      best: this.best,
+      restoredBest: this.restoredBest,
       trainSeconds: (performance.now() - this.trainStartMs) / 1000,
     };
   }
@@ -1208,6 +1349,7 @@ export class Trainer {
       this.dummyHilbertBuf, this.hilbertParams, this._tauHeatBuf, this._gnBuf,
       this.blurTex, this.blurTmpTex, this.growBlurParams, this.growSeedParams,
       ...(this.growJfaParams || []), this.siteStatsParams, this.siteStatsBuf,
+      this.bestSitesBuf, this.bestAdamBuf, this.rebuildParams,
     ];
     if (this.hilbertRes) {
       owned.push(this.hilbertRes.pairs, this.hilbertRes.order, this.hilbertRes.pos);
@@ -1323,6 +1465,24 @@ function computeGradStats(raw, siteCount, numPixels) {
     groups[grp.key] = { mean: counted ? sums[g] / counted : 0, max: maxs[g] };
   });
   return { groups, sites: counted };
+}
+
+// Mean training loss per sample over the masked pixels: |r| for "l1", r² for
+// "l2" (NaN → 0, +Inf → 1, as in computePsnrSafe).
+function computeLoss(render, target, width, height, maskCpu, loss) {
+  let acc = 0;
+  let counted = 0;
+  for (let i = 0; i < width * height; i += 1) {
+    if (maskCpu && maskCpu[i] <= 0) continue;
+    for (let c = 0; c < 3; c += 1) {
+      let r = render[i * 4 + c];
+      if (!Number.isFinite(r)) r = r === Number.POSITIVE_INFINITY ? 1 : 0;
+      const d = r - target[i * 4 + c];
+      acc += loss === "l2" ? d * d : Math.abs(d);
+    }
+    counted += 3;
+  }
+  return acc / Math.max(1, counted);
 }
 
 // Mirrors main()'s PSNR computation: only pixels inside the mask count, values

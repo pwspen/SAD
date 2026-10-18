@@ -5,7 +5,7 @@
 
 import { loadShaders, tileSlotsForLimit } from "../trainer/shader_loader.js?v=shared-wgsl-20261017";
 import { requestTrainingDevice } from "../trainer/device.js?v=shared-wgsl-20261017";
-import { Trainer, buildArgs, GRAD_GROUPS, lrSchedule, LR_SCHEDULES, LOSSES, GROW_MODES, growthCounts } from "../trainer/trainer.js?v=insert-20261018";
+import { Trainer, buildArgs, GRAD_GROUPS, lrSchedule, LR_SCHEDULES, LOSSES, GROW_MODES, KEEP_BEST, growthCounts } from "../trainer/trainer.js?v=keep-best-20261018";
 import { loadImageToFloat32, loadMaskRgba32Float, whiteMaskRgba32Float } from "../trainer/textures.js?v=shared-wgsl-20261017";
 import { loadSitesFromFile, serializeSitesTxt, triggerDownload, floatImageToRgba8, computeBpp, BITS_PER_SITE } from "../trainer/io.js?v=shared-wgsl-20261017";
 import { SITE_FLOATS } from "../trainer/params.js?v=shared-wgsl-20261017";
@@ -67,6 +67,8 @@ const UI_FIELDS = [
   ["growBlur", "p-growBlur"],
   ["growLrDecay", "p-growLrDecay"],
   ["growMode", "p-growMode"],
+  ["keepBest", "p-keepBest"],
+  ["growPatience", "p-growPatience"],
 ];
 
 const state = {
@@ -163,6 +165,8 @@ function applyConfigToForm(config, overrides = {}) {
     .replaceChildren(...Object.entries(LOSSES).map(([key, loss]) => new Option(loss.label, key)));
   document.getElementById("p-growMode")
     .replaceChildren(...Object.entries(GROW_MODES).map(([key, label]) => new Option(label, key)));
+  document.getElementById("p-keepBest")
+    .replaceChildren(...Object.entries(KEEP_BEST).map(([key, label]) => new Option(label, key)));
   const defaults = buildArgs(config, overrides);
   for (const [key, elId, opts] of UI_FIELDS) {
     const el = document.getElementById(elId);

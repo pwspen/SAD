@@ -657,6 +657,16 @@
           <div class="tip" role="tooltip">With <b>insert</b>, gains are measured in the training loss: levels (absolute error) under L1, levels² under L2. Only cells whose split would remove more than λ × 128 levels² of error (a site costs 128 bits) are split; a step adds fewer sites if fewer qualify, and growth ends early once none do. Example: λ = 400 → 51,200 levels², e.g. 100 pixels each off by about 13 levels in all three channels. Higher λ stops sooner. 0 = never stop early (any site that helps at all qualifies). The log says which limit ended growth.</div>
         </div>
 
+        <div class="param">
+          <div class="row"><label>keep best</label><select id="p-keepBest" aria-label="Keep best state by"></select></div>
+          <div class="tip" role="tooltip">At every refresh the state is scored, and the run ends on the best one seen (restored exactly), not the last. <b>lowest training loss</b>: only ever swaps the final state for one with lower loss at the same or fewer sites; in tests about 1 run in 10 ended a few % worse than an earlier refresh. <b>description length</b>: the bits to send the sites (128 per site) plus the residual coded at 8-bit precision under the training loss's own likelihood (Laplace for L1, Gaussian for L2); fewer sites at the same loss score better, and a site is worth keeping only if it saves more than its 128 bits (on 28×28 about 4% less error per site, on 768×512 under 0.01%). Caveat: states in the middle of growth are far from converged, so within a growing run this tends to pick an early, half-fitted state. <b>off</b>: the last state.</div>
+        </div>
+        <div class="param" data-site-mode="grow">
+          <div class="row"><label>patience</label><input id="p-growPatience" type="number" min="0" /></div>
+          <p class="help"><span class="unit">growth steps without a better score</span></p>
+          <div class="tip" role="tooltip">With <b>keep best</b> on: if this many growth steps in a row haven't produced a better score, growth ends, the run goes back to the best state and spends the remaining iterations refining it. 0 = never (grow to <b>max sites</b> or λ, and only go back at the end of the run).</div>
+        </div>
+
         <h3>Logging</h3>
         <div class="param">
           <div class="row"><label>refresh every</label><input id="p-logFreq" type="number" /></div>
