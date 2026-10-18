@@ -13,8 +13,8 @@ import { COLOR_SPACES } from "../trainer/color_spaces.js?v=color-space-20261017"
 import {
   luma, maskWeights, laplacianBands, maskLevels, bandEnergies, IMPORTANCE, importanceMap,
   spectralPlan, windowedSpectrum, spectrumDiff, radialStats, frcCrossing, logPowerImage,
-  mutualInfoMatrix, MI_BINS,
-} from "./analysis.js?v=site-mi-20261018";
+  mutualInfoMatrix, MI_BINS, neighborFeatures, NEIGHBOR_K,
+} from "./analysis.js?v=site-mi-nb-20261018";
 
 const CONFIG_URL = "../training_config.json";
 const DEMO_MAX_IMAGE_SIDE = 2048;
@@ -365,7 +365,10 @@ const VIEWS = {
                 note: `Normalized mutual information I(X;Y) / min(H(X), H(Y)) between site parameters over active ` +
                       `sites: ${MI_BINS} equal-width bins per parameter (1st–99th percentile; θ over [0, π)), ` +
                       `entropies with the Miller–Madow correction. θ is the major axis, skipped for sites with ` +
-                      `|log_aniso| < ${MI_ROUND_ANISO}. Colors are decoded RGB. Hover a cell for bits.` },
+                      `|log_aniso| < ${MI_ROUND_ANISO}. Colors are decoded RGB. Neighbour columns use each site's ` +
+                      `${NEIGHBOR_K} nearest sites: log distance to the farthest of them, and the main direction φ ` +
+                      `and eccentricity (λ1 − λ2) / (λ1 + λ2) of the structure tensor of the unit offsets to them. ` +
+                      `Hover a cell for bits.` },
 };
 
 // Layouts are CSS grid-template-areas: one quoted string per row, one view id
@@ -1744,20 +1747,31 @@ function drawSpectrumTileAxes(p, x, y, side) {
 // One column per parameter in the form that matters for coding. Orientation
 // is the major axis mod π: voronoi_dmix2 weights distance along aniso_dir by
 // exp(log_aniso), so for log_aniso > 0 the cell is long across that direction.
-// It's left undefined (NaN) for near-round sites, whose θ is noise.
+// It's left undefined (NaN) for near-round sites, whose θ is noise. The last
+// four columns describe each site's k nearest neighbours (neighborFeatures),
+// which a decoder knows once positions are decoded.
 
+const modPi = (t) => ((t % Math.PI) + Math.PI) % Math.PI;
+function majorAxis(s, b) {
+  if (!(Math.abs(s[b + 9]) >= MI_ROUND_ANISO)) return NaN;
+  return modPi(Math.atan2(s[b + 8], s[b + 7]) + (s[b + 9] > 0 ? Math.PI / 2 : 0));
+}
+
+// get(sites, base, neighbours, active index) → value, NaN = undefined.
 const MI_COLUMNS = [
   { short: "τ", label: "log_tau", get: (s, b) => s[b + 2] },
   { short: "rad", label: "radius (distance offset)", get: (s, b) => s[b + 3] },
   { short: "elong", label: "elongation |log_aniso|", get: (s, b) => Math.abs(s[b + 9]) },
-  { short: "θ", label: "major axis θ mod π", range: [0, Math.PI], get: (s, b) => {
-      if (!(Math.abs(s[b + 9]) >= MI_ROUND_ANISO)) return NaN;
-      const t = Math.atan2(s[b + 8], s[b + 7]) + (s[b + 9] > 0 ? Math.PI / 2 : 0);
-      return ((t % Math.PI) + Math.PI) % Math.PI;
-    } },
+  { short: "θ", label: "major axis θ mod π", range: [0, Math.PI], get: majorAxis },
   { short: "R", label: "red (decoded)", get: (s, b) => s[b + 4] },
   { short: "G", label: "green (decoded)", get: (s, b) => s[b + 5] },
   { short: "B", label: "blue (decoded)", get: (s, b) => s[b + 6] },
+  { short: "space", label: `log spacing (${NEIGHBOR_K}th-neighbour distance)`,
+    get: (s, b, nb, a) => Math.log(nb.spacing[a]) },
+  { short: "φ", label: "neighbour direction φ mod π", range: [0, Math.PI], get: (s, b, nb, a) => nb.phi[a] },
+  { short: "θ−φ", label: "major axis vs neighbours, θ − φ mod π", range: [0, Math.PI],
+    get: (s, b, nb, a) => modPi(majorAxis(s, b) - nb.phi[a]) },
+  { short: "ecc", label: "neighbour eccentricity", get: (s, b, nb, a) => nb.ecc[a] },
 ];
 
 // MI over the active sites of the latest readback, cached per readback.
@@ -1767,9 +1781,11 @@ function currentSiteMI() {
   if (state.siteMI?.sites === sites) return state.siteMI.mi;
   const active = [];
   for (let i = 0; i < state.lastSiteCount; i += 1) if (sites[i * SITE_FLOATS] >= 0) active.push(i * SITE_FLOATS);
+  const nb = neighborFeatures(Float32Array.from(active, (b) => sites[b]),
+                             Float32Array.from(active, (b) => sites[b + 1]));
   const columns = MI_COLUMNS.map((c) => ({
     range: c.range,
-    values: Float32Array.from(active, (b) => c.get(sites, b)),
+    values: Float32Array.from(active, (b, a) => c.get(sites, b, nb, a)),
   }));
   const mi = active.length > 1 ? mutualInfoMatrix(columns) : null;
   state.siteMI = { sites, mi };

@@ -437,3 +437,77 @@ export function mutualInfoMatrix(columns, bins = MI_BINS) {
   }
   return { n, h, bits, norm };
 }
+
+// ---- Site neighbourhoods ----
+// k nearest sites by grid bucketing (about one site per cell). Per site:
+// spacing = distance to the k-th neighbour; the structure tensor of the unit
+// offsets to the k neighbours gives their main direction phi (mod π) and
+// eccentricity (λ1 − λ2) / (λ1 + λ2) in [0, 1], 0 = no preferred direction.
+// Sites with fewer than k others get NaN.
+
+export const NEIGHBOR_K = 6;
+
+export function neighborFeatures(xs, ys, k = NEIGHBOR_K) {
+  const n = xs.length;
+  const spacing = new Float32Array(n).fill(NaN);
+  const phi = new Float32Array(n).fill(NaN);
+  const ecc = new Float32Array(n).fill(NaN);
+  if (n <= k) return { spacing, phi, ecc };
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (let i = 0; i < n; i += 1) {
+    x0 = Math.min(x0, xs[i]); x1 = Math.max(x1, xs[i]);
+    y0 = Math.min(y0, ys[i]); y1 = Math.max(y1, ys[i]);
+  }
+  const cell = Math.max(1e-6, Math.sqrt(((x1 - x0) * (y1 - y0) || 1) / n));
+  const gw = Math.floor((x1 - x0) / cell) + 1, gh = Math.floor((y1 - y0) / cell) + 1;
+  const cx = (i) => Math.min(gw - 1, Math.floor((xs[i] - x0) / cell));
+  const cy = (i) => Math.min(gh - 1, Math.floor((ys[i] - y0) / cell));
+  // Counting sort of sites into cells: cellStart[c] .. cellStart[c + 1].
+  const cellStart = new Uint32Array(gw * gh + 1);
+  for (let i = 0; i < n; i += 1) cellStart[cy(i) * gw + cx(i) + 1] += 1;
+  for (let c = 0; c < gw * gh; c += 1) cellStart[c + 1] += cellStart[c];
+  const fill = cellStart.slice(0, gw * gh);
+  const order = new Uint32Array(n);
+  for (let i = 0; i < n; i += 1) order[fill[cy(i) * gw + cx(i)]++] = i;
+
+  const bestD = new Float64Array(k), bestJ = new Int32Array(k);
+  for (let i = 0; i < n; i += 1) {
+    const qx = cx(i), qy = cy(i);
+    let found = 0;
+    // Ring r holds the cells at Chebyshev distance r from the query's cell;
+    // every site past it is at least r·cell away.
+    for (let r = 0; r <= Math.max(gw, gh); r += 1) {
+      for (let gy = qy - r; gy <= qy + r; gy += 1) {
+        if (gy < 0 || gy >= gh) continue;
+        const edge = gy === qy - r || gy === qy + r;
+        for (let gx = qx - r; gx <= qx + r; gx += edge ? 1 : 2 * r || 1) {
+          if (gx < 0 || gx >= gw) continue;
+          const c = gy * gw + gx;
+          for (let t = cellStart[c]; t < cellStart[c + 1]; t += 1) {
+            const j = order[t];
+            if (j === i) continue;
+            const d = Math.hypot(xs[j] - xs[i], ys[j] - ys[i]);
+            if (found === k && d >= bestD[k - 1]) continue;
+            let s = found < k ? found++ : k - 1;
+            while (s > 0 && bestD[s - 1] > d) { bestD[s] = bestD[s - 1]; bestJ[s] = bestJ[s - 1]; s -= 1; }
+            bestD[s] = d; bestJ[s] = j;
+          }
+        }
+      }
+      if (found === k && bestD[k - 1] <= r * cell) break;
+    }
+    if (found < k) continue;
+    spacing[i] = bestD[k - 1];
+    let txx = 0, txy = 0, tyy = 0;
+    for (let s = 0; s < k; s += 1) {
+      if (!(bestD[s] > 0)) continue;
+      const ux = (xs[bestJ[s]] - xs[i]) / bestD[s], uy = (ys[bestJ[s]] - ys[i]) / bestD[s];
+      txx += ux * ux; txy += ux * uy; tyy += uy * uy;
+    }
+    const tr = txx + tyy;
+    if (!(tr > 0)) continue;
+    phi[i] = ((0.5 * Math.atan2(2 * txy, txx - tyy)) % Math.PI + Math.PI) % Math.PI;
+    ecc[i] = Math.hypot(txx - tyy, 2 * txy) / tr;
+  }
+  return { spacing, phi, ecc };
+}
