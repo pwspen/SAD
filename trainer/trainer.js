@@ -25,7 +25,6 @@ import {
   updateClearParamsBuffer,
   createUniform32,
   updateGrowBlurParamsBuffer,
-  updateGrowGainParamsBuffer,
   packJumpStep,
   hilbertBitsForSize,
 } from "./params.js?v=noflow-20261017";
@@ -67,7 +66,7 @@ import {
   HilbertEncoder,
   GrowEncoder,
   SiteStatsEncoder,
-} from "./encoders.js?v=gain-20261018";
+} from "./encoders.js?v=split-20261018";
 
 import { RadixSortUInt2 } from "./radix_sort.js?v=shared-wgsl-20261017";
 import { BITS_PER_SITE } from "./io.js";
@@ -347,14 +346,11 @@ export class Trainer {
     if (this.usesGrow) {
       this.maskArea = maskSum > 0 ? maskSum : width * height;
       this.growBlurParams = createUniform32(device);
-      this.growGainParams = createUniform32(device);
       this.growSeedParams = createParamsBuffer(device, this._paramsArgs(initSiteCount, 0, 0));
       if (args.growBlur > 0) {
         this.blurTex = createRgba32FloatTexture(device, width, height, { storage: true, copyDst: false });
         this.blurTmpTex = createRgba32FloatTexture(device, width, height, { storage: true, copyDst: false });
       }
-      this.growCellsBuf = null;
-      this.growCellsCap = 0;
       this.siteStatsParams = createUniform32(device);
       this.siteStatsBuf = device.createBuffer({
         size: this.bufferCapacity * SITE_STAT_CH * 4,
@@ -650,14 +646,13 @@ export class Trainer {
   }
 
   // ---- Site growth ----
-  // Rate-distortion growth in batches. Every growEvery iterations the count is
-  // multiplied by growFactor (growthCounts). Every dyadic block of a grid finer
-  // than the site spacing is scored by the error one new site taking it over
-  // would remove (growthBlocks), and the batch goes to the best blocks, skipping
-  // any closer than the new spacing to one already picked, so a batch never
-  // stacks sites on one spot. Only blocks whose gain beats λ·BITS_PER_SITE (the
+  // Rate-distortion growth in batches, by splitting cells. Every growEvery
+  // iterations the count is multiplied by growFactor (growthCounts); each
+  // existing site is scored by the error a two-way split of its cell would
+  // remove (siteSplit, from site_stats.wgsl's moments) and the best cells are
+  // split, one new site each. Only splits whose gain beats λ·BITS_PER_SITE (the
   // cost of a site's bits; λ = 0 only requires a positive gain) qualify; growth
-  // ends at growMaxSites, when no block qualifies, or at the hidden growEndIter
+  // ends at growMaxSites, when no split qualifies, or at the hidden growEndIter
   // safety stop. Optionally (growBlur > 0) the fit target is the
   // image blurred to the current spacing until growth ends; in tests that cost
   // 0.5-2 dB at a matched site count, since sites place edges far finer than
@@ -739,71 +734,61 @@ export class Trainer {
     if (this.siteCount >= this.bufferCapacity) { this._endGrowth(it, "reached max sites"); return; }
     if (it >= args.growEndIter) { this._endGrowth(it, "growEndIter safety stop"); return; }
     if (it === 0 || it % args.growEvery !== 0) return;
-    this._reportGrowthGain(it, await this._siteStats());
+    const stats = await this._siteStats();
+    this._reportGrowthGain(it, stats);
 
     const device = this.device;
     const queue = device.queue;
     const n0 = this.siteCount;
-    // Stats on cells of a quarter site spacing, but at most GROW_MAX_CELL px so
-    // even the first few sites can land on a specific feature.
-    const spacing = this._siteSpacing();
-    const cell = Math.max(1, Math.min(GROW_MAX_CELL, Math.round(spacing / 4)));
-    const cellsX = Math.ceil(this.width / cell);
-    const cellsY = Math.ceil(this.height / cell);
-    const cellCount = cellsX * cellsY;
-    const cellBytes = cellCount * 12 * 4;
-    if (cellBytes > this.growCellsCap) {
-      this.growCellsBuf?.destroy();
-      this.growCellsBuf = device.createBuffer({ size: cellBytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
-      this.growCellsCap = cellBytes;
-    }
-    updateGrowGainParamsBuffer(queue, this.growGainParams,
-      { width: this.width, height: this.height, cellSize: cell, cellsX, cellsY, siteCount: n0 });
-    updateParamsBuffer(queue, this.renderParams, this._paramsArgs(n0, 0, 0));
-    const staging = device.createBuffer({ size: cellBytes, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
-    const encoder = device.createCommandEncoder();
-    this.renderEnc.encode(encoder, this.sitesBuf, this.renderParams,
-      this.cand0A, this.cand1A, this.renderTex, this.width, this.height);
-    this.growEnc.encodeGain(encoder, this.growGainParams, this.sitesBuf, this.renderTex, this.fitTex,
-      this.maskTex, this.cand0A, this.growCellsBuf, cellCount);
-    encoder.copyBufferToBuffer(this.growCellsBuf, 0, staging, 0, cellBytes);
-    queue.submit([encoder.finish()]);
-    await staging.mapAsync(GPUMapMode.READ);
-    const cells = new Float32Array(staging.getMappedRange()).slice();
-    staging.unmap();
-    staging.destroy();
-
     const target = growthCounts(n0, args.growFactor, this.bufferCapacity)[0];
-    const minDist = Math.sqrt(this.maskArea / target);
     const threshold = args.growLambda * BITS_PER_SITE;
-    const picked = growthBlocks(cells, cellsX, cellsY, cell, Math.max(cell, spacing), threshold,
-      target - n0, minDist);
-    if (!picked.length) {
-      this._endGrowth(it, `λ (stop): no new site would remove more than λ × ${BITS_PER_SITE} = ` +
+    const sitesRaw = await readSites(device, this.sitesBuf, n0);
+    const splits = [];
+    for (let i = 0; i < n0; i += 1) {
+      if (sitesRaw[i * SITE_FLOATS] < 0) continue;
+      const sp = siteSplit(stats, i);
+      if (sp && sp.gain > threshold) splits.push(sp);
+    }
+    splits.sort((x, y) => y.gain - x.gain);
+    splits.length = Math.min(splits.length, target - n0);
+    if (!splits.length) {
+      this._endGrowth(it, `λ (stop): no split would remove more than λ × ${BITS_PER_SITE} = ` +
                           `${fmtLambda(threshold)} levels²`);
       return;
     }
 
-    // New sites: error centroid of each block, its mean fit color, its owners'
-    // tau and radius (so it competes as an equal), isotropic. A small jitter
-    // keeps them off existing positions.
-    const k = picked.length;
+    // Each split: the existing site moves to one half's centroid with that
+    // half's ramp color, the new site takes the other half with an exact copy
+    // of the site's shape (τ, radius, anisotropy), so the boundary between the
+    // two lands on the split line. Both get fresh Adam moments.
+    const k = splits.length;
     const data = new Float32Array(k * SITE_FLOATS);
-    picked.forEach((blk, i) => {
-      const o = i * SITE_FLOATS;
-      data[o] = Math.min(this.width - 1, Math.max(0, blk.x + (Math.random() - 0.5) * 0.5));
-      data[o + 1] = Math.min(this.height - 1, Math.max(0, blk.y + (Math.random() - 0.5) * 0.5));
-      data[o + 2] = blk.ownerW > 0 ? blk.tau / blk.ownerW : args.initLogTau;
-      data[o + 3] = blk.ownerW > 0 ? blk.radius / blk.ownerW : args.initRadius;
-      data.set(blk.color, o + 4);
-      data[o + 7] = 1;
+    const adam = new Float32Array(ADAM_FLOATS);
+    adam[20] = it;
+    const clampPos = (v, max) => Math.min(max - 1, Math.max(0, v));
+    splits.forEach((sp, j) => {
+      const b = sp.site * SITE_FLOATS;
+      const px = sitesRaw[b], py = sitesRaw[b + 1];
+      const old = sitesRaw.slice(b, b + SITE_FLOATS);
+      old[0] = clampPos(px + sp.oldOffset[0], this.width);
+      old[1] = clampPos(py + sp.oldOffset[1], this.height);
+      old.set(sp.oldColor, 4);
+      const o = j * SITE_FLOATS;
+      data.set(sitesRaw.subarray(b, b + SITE_FLOATS), o);
+      data[o] = clampPos(px + sp.newOffset[0], this.width);
+      data[o + 1] = clampPos(py + sp.newOffset[1], this.height);
+      data.set(sp.newColor, o + 4);
+      // Rewrite the existing site whole: its stored colors are in the run's
+      // color space, so re-encode from RGB like the new site.
+      const enc = encodeSiteColors(old, 1, this.colorSpace);
+      queue.writeBuffer(this.sitesBuf, sp.site * SITE_FLOATS * 4, enc);
+      queue.writeBuffer(this.adamBuf, sp.site * ADAM_FLOATS * 4, adam);
     });
     queue.writeBuffer(this.sitesBuf, n0 * SITE_FLOATS * 4, encodeSiteColors(data, k, this.colorSpace));
-    // Fresh Adam moments, with the birth step for per-site bias correction.
-    const adam = new Float32Array(k * ADAM_FLOATS);
-    for (let i = 0; i < k; i += 1) adam[i * ADAM_FLOATS + 20] = it;
-    queue.writeBuffer(this.adamBuf, n0 * ADAM_FLOATS * 4, adam);
-    this.growPending = { it, sites: picked.map((blk, i) => ({ id: n0 + i, predicted: blk.gain })) };
+    const adamNew = new Float32Array(k * ADAM_FLOATS);
+    for (let j = 0; j < k; j += 1) adamNew[j * ADAM_FLOATS + 20] = it;
+    queue.writeBuffer(this.adamBuf, n0 * ADAM_FLOATS * 4, adamNew);
+    this.growPending = { it, sites: splits.map((sp, j) => ({ id: n0 + j, predicted: sp.gain })) };
 
     const n1 = n0 + k;
     this.siteCount = n1;
@@ -842,8 +827,8 @@ export class Trainer {
     queue.submit([seedEnc.finish()]);
 
     this._updateFitTarget();
-    this._log(`Grow @${it}: +${k} → ${n1} sites` + (k < target - n0 ? ` (${target - n0} wanted; no other spot both beats λ and is a spacing away)` : "") +
-              ` | best gain ${fmtLambda(picked[0].gain / BITS_PER_SITE)} levels²/bit | spacing ${minDist.toFixed(0)}px` +
+    this._log(`Grow @${it}: +${k} → ${n1} sites` + (k < target - n0 ? ` (${target - n0} wanted; the rest under λ)` : "") +
+              ` | best split ${fmtLambda(splits[0].gain / BITS_PER_SITE)} levels²/bit` +
               (this.fitSigma ? ` | blur σ ${this.fitSigma.toFixed(1)}px` : ""));
     if (n1 >= this.bufferCapacity) this._endGrowth(it, "reached max sites");
   }
@@ -1082,8 +1067,8 @@ export class Trainer {
       this.renderParams, this.gradParams, this.adamParams,
       this.countParams, this.gradCountParams, this.tauParams,
       this.dummyHilbertBuf, this.hilbertParams, this._tauHeatBuf,
-      this.blurTex, this.blurTmpTex, this.growBlurParams, this.growGainParams, this.growSeedParams,
-      this.growCellsBuf, ...(this.growJfaParams || []), this.siteStatsParams, this.siteStatsBuf,
+      this.blurTex, this.blurTmpTex, this.growBlurParams, this.growSeedParams,
+      ...(this.growJfaParams || []), this.siteStatsParams, this.siteStatsBuf,
     ];
     if (this.hilbertRes) {
       owned.push(this.hilbertRes.pairs, this.hilbertRes.order, this.hilbertRes.pos);
@@ -1101,101 +1086,64 @@ export class Trainer {
 
 const fmtLambda = (v) => (v >= 100 ? v.toFixed(0) : v.toPrecision(2));
 
-// Places for up to `count` new sites, from grow_gain.wgsl's per-cell stats
-// (`cells`, 12 floats per cell of `cell` px). Cells are merged 2×2 into a
-// pyramid of aligned dyadic blocks, up to `maxBlock` px (about one site
-// spacing), and each block is scored by the error a site taking it over with
-// the block's mean color would remove: sum|fit - pred|² - sum|fit - mean|²,
-// in 8-bit levels² summed over RGB. Scoring sub-spacing blocks matters
-// because the remaining error concentrates at edges finer than the spacing.
-// Blocks whose gain beats `threshold` are taken best first, skipping any whose
-// site would land within `minDist` px of one already taken (non-maximum
-// suppression across all scales). Returns [{ gain, size, x, y, color, tau,
-// radius, ownerW }], best first.
-const GROW_MAX_CELL = 32;
-const SITE_STAT_CH = 18; // channels per site in site_stats.wgsl's output
-
-export function growthBlocks(cells, cellsX, cellsY, cell, maxBlock, threshold, count, minDist) {
-  const L2 = 255 * 255;
-  // Per block: weight, color sum, variance sum (about the block's own mean),
-  // error energy, energy-weighted absolute position, owner tau/radius sums.
-  let w = cellsX, h = cellsY;
-  let lvl = new Array(w * h);
-  for (let y = 0; y < h; y += 1) {
-    for (let x = 0; x < w; x += 1) {
-      const b = (y * w + x) * 12;
-      const n = cells[b];
-      if (!(n > 0)) { lvl[y * w + x] = null; continue; }
-      const e = cells[b + 5];
-      lvl[y * w + x] = {
-        n, c: [n * cells[b + 1], n * cells[b + 2], n * cells[b + 3]], v: cells[b + 4], e,
-        ex: cells[b + 6] + e * x * cell, ey: cells[b + 7] + e * y * cell,
-        tau: cells[b + 8], rad: cells[b + 9], ow: cells[b + 10],
-      };
-    }
+// The best two-way split of site `i`'s cell, from site_stats.wgsl's owner
+// moments (offsets d from the site, fit target t, over the pixels it owns).
+// Adding a site to a partition model means splitting a cell, so the gain is
+// the color variance a split can explain: here the variance explained by a
+// linear color ramp across the cell, n·tr(B C⁻¹ Bᵀ) with C the spatial
+// covariance and B the color-position covariance, in 8-bit levels² summed
+// over RGB. (A two-level step along a ramp captures 3/4 of it, while a step
+// fitted to an edge captures more than a ramp does; the ramp is the middle.)
+// Error from soft edges or texture finer than any site isn't explained by a
+// split, so it doesn't count. The split runs across u, the direction colors
+// change fastest; the halves' centroids sit ±0.866σ along u (uniform cell).
+// Returns { site, gain, oldOffset, newOffset, oldColor, newColor } or null.
+export function siteSplit(stats, i) {
+  const b = i * SITE_STAT_CH;
+  const n = stats[b];
+  if (!(n >= 4)) return null;
+  const mx = stats[b + 1] / n, my = stats[b + 2] / n;
+  // Spatial covariance, plus 1/12 px² for pixel quantization.
+  const cxx = stats[b + 3] / n - mx * mx + 1 / 12;
+  const cxy = stats[b + 4] / n - mx * my;
+  const cyy = stats[b + 5] / n - my * my + 1 / 12;
+  const det = cxx * cyy - cxy * cxy;
+  if (!(det > 1e-9)) return null;
+  const ixx = cyy / det, ixy = -cxy / det, iyy = cxx / det;
+  const mean = [0, 1, 2].map((c) => stats[b + 6 + c] / n);
+  let explained = 0;
+  const A = [];   // per channel: color gradient (per px) = B_c C⁻¹
+  for (let c = 0; c < 3; c += 1) {
+    const bx = stats[b + 9 + c] / n - mean[c] * mx;
+    const by = stats[b + 12 + c] / n - mean[c] * my;
+    const ax = bx * ixx + by * ixy, ay = bx * ixy + by * iyy;
+    A.push([ax, ay]);
+    explained += ax * bx + ay * by;
   }
-  const cands = [];
-  for (let size = cell; ; size *= 2) {
-    for (const blk of lvl) {
-      if (!blk || !(blk.e > 0)) continue;
-      const gain = (blk.e - blk.v) * L2;
-      if (gain > threshold) cands.push({ blk, gain, size });
-    }
-    if (size * 2 > maxBlock || (w === 1 && h === 1)) break;
-    // Merge 2×2; pooled variance = within-child spread + spread of child means.
-    const w2 = Math.ceil(w / 2), h2 = Math.ceil(h / 2);
-    const next = new Array(w2 * h2);
-    for (let y = 0; y < h2; y += 1) {
-      for (let x = 0; x < w2; x += 1) {
-        const kids = [];
-        for (let dy = 0; dy < 2; dy += 1) for (let dx = 0; dx < 2; dx += 1) {
-          const cx = 2 * x + dx, cy = 2 * y + dy;
-          if (cx < w && cy < h && lvl[cy * w + cx]) kids.push(lvl[cy * w + cx]);
-        }
-        if (!kids.length) { next[y * w2 + x] = null; continue; }
-        const m = { n: 0, c: [0, 0, 0], v: 0, e: 0, ex: 0, ey: 0, tau: 0, rad: 0, ow: 0 };
-        for (const k of kids) {
-          m.n += k.n; m.v += k.v; m.e += k.e; m.ex += k.ex; m.ey += k.ey;
-          m.tau += k.tau; m.rad += k.rad; m.ow += k.ow;
-          for (let c = 0; c < 3; c += 1) m.c[c] += k.c[c];
-        }
-        for (const k of kids) {
-          let d2 = 0;
-          for (let c = 0; c < 3; c += 1) d2 += (k.c[c] / k.n - m.c[c] / m.n) ** 2;
-          m.v += k.n * d2;
-        }
-        next[y * w2 + x] = m;
-      }
-    }
-    lvl = next; w = w2; h = h2;
-  }
-  cands.sort((a, b) => b.gain - a.gain);
-  // Greedy suppression, with picks bucketed in a minDist grid so each test
-  // only looks at the 3×3 neighbouring buckets.
-  const out = [];
-  const grid = new Map();
-  const r2 = minDist * minDist;
-  for (const { blk, gain, size } of cands) {
-    if (out.length >= count) break;
-    const x = blk.ex / blk.e, y = blk.ey / blk.e;
-    const gx = Math.floor(x / minDist), gy = Math.floor(y / minDist);
-    let near = false;
-    for (let dy = -1; dy <= 1 && !near; dy += 1) {
-      for (let dx = -1; dx <= 1 && !near; dx += 1) {
-        for (const p of grid.get(`${gx + dx},${gy + dy}`) || []) {
-          if ((p.x - x) ** 2 + (p.y - y) ** 2 < r2) { near = true; break; }
-        }
-      }
-    }
-    if (near) continue;
-    const pick = { gain, size, x, y, color: blk.c.map((v) => v / blk.n), tau: blk.tau, radius: blk.rad, ownerW: blk.ow };
-    out.push(pick);
-    const key = `${gx},${gy}`;
-    if (!grid.has(key)) grid.set(key, []);
-    grid.get(key).push(pick);
-  }
-  return out;
+  const total = Math.max(0, stats[b + 15] / n - (mean[0] ** 2 + mean[1] ** 2 + mean[2] ** 2));
+  const gain = n * Math.min(Math.max(0, explained), total) * 255 * 255;
+  if (!(gain > 0) || !Number.isFinite(gain)) return null;
+  // u = top eigenvector of AᵀA (2×2, symmetric).
+  let mxx = 0, mxy = 0, myy = 0;
+  for (const [ax, ay] of A) { mxx += ax * ax; mxy += ax * ay; myy += ay * ay; }
+  const tr = mxx + myy, gap = Math.sqrt(Math.max(0, (mxx - myy) ** 2 / 4 + mxy * mxy));
+  const lam = tr / 2 + gap;
+  let ux = mxy, uy = lam - mxx;
+  if (Math.hypot(ux, uy) < 1e-12) { ux = lam - myy; uy = mxy; }
+  const ul = Math.hypot(ux, uy);
+  if (ul < 1e-12) { ux = 1; uy = 0; } else { ux /= ul; uy /= ul; }
+  const sigma = Math.sqrt(Math.max(1e-6, ux * ux * cxx + 2 * ux * uy * cxy + uy * uy * cyy));
+  const s = 0.866 * sigma;
+  const clamp01 = (v) => Math.min(1, Math.max(0, v));
+  const color = (sign) => A.map(([ax, ay], c) => clamp01(mean[c] + sign * s * (ax * ux + ay * uy)));
+  return {
+    site: i, gain,
+    newOffset: [mx + s * ux, my + s * uy], oldOffset: [mx - s * ux, my - s * uy],
+    newColor: color(1), oldColor: color(-1),
+  };
 }
+
+const SITE_STAT_CH = 18; // channels per site in site_stats.wgsl's output
 
 // Gradient groups over the consolidated grads[idx*10+ch] channels. Multi-channel
 // groups use the vector magnitude (e.g. |(dx, dy)| for position).

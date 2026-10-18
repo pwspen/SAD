@@ -571,7 +571,7 @@
           <div class="tip" role="tooltip">Start from these sites instead of the default placement (sites sampled where the image has edges). Positions are rescaled to the target size and every site's τ is reset. Its site count becomes the starting count: it replaces <b>sites</b> (fixed) or <b>start sites</b> (grow), and that field is locked to show it until the file is cleared.</div>
         </div>
 
-        <h3 class="has-tip" tabindex="0">Site count<span class="tip" role="tooltip">How many sites the run uses. <b>Fixed</b>: exactly the number you give, for the whole run. <b>Grow</b>: start from a few sites and multiply the count by a factor on a regular schedule, placing each batch where new sites remove the most error, until <b>max sites</b> (or earlier, once new sites aren't worth their bits at λ). Sites are never removed. Each site costs 128 bits: bpp = sites × 128 / (width × height).</span></h3>
+        <h3 class="has-tip" tabindex="0">Site count<span class="tip" role="tooltip">How many sites the run uses. <b>Fixed</b>: exactly the number you give, for the whole run. <b>Grow</b>: start from a few sites and multiply the count by a factor on a regular schedule, splitting the cells where a second site would explain the most color structure, until <b>max sites</b> (or earlier, once new sites aren't worth their bits at λ). Sites are never removed. Each site costs 128 bits: bpp = sites × 128 / (width × height).</span></h3>
         <div class="param">
           <div class="row"><label>mode</label><select id="p-siteMode" aria-label="Site count mode"><option value="grow">grow</option><option value="fixed">fixed</option></select></div>
           <div class="tip" role="tooltip"><b>grow</b>: start sites → max sites, × <b>factor</b> every <b>grow every</b> iterations. <b>fixed</b>: the count is <b>sites</b>. Only the fields for the chosen mode are shown.</div>
@@ -611,7 +611,7 @@
         <div class="param" data-site-mode="grow">
           <div class="row"><label>factor</label><input id="p-growFactor" type="number" step="0.1" min="1.0001" /></div>
           <p class="help"><span class="unit">× sites per step (above 1)</span></p>
-          <div class="tip" role="tooltip">Each step multiplies the count by this (rounded up, at least +1), capped at <b>max sites</b>. 2 doubles: 1, 2, 4, 8, …; 1.5 gives 1, 2, 3, 5, 8, 12, …. Within a step, new sites go to the best-scoring spots and are kept at least the new site spacing apart, so a batch never stacks up on one spot. A factor just above 1 adds one site per step.</div>
+          <div class="tip" role="tooltip">Each step multiplies the count by this (rounded up, at least +1), capped at <b>max sites</b>. 2 doubles: 1, 2, 4, 8, …; 1.5 gives 1, 2, 3, 5, 8, 12, …. Within a step, the cells whose color structure a split would explain best are each split in two: the site moves to one half and a new site takes the other. A factor just above 1 adds one site per step.</div>
         </div>
         <div class="param" data-site-mode="grow">
           <div class="row"><label>grow every</label><input id="p-growEvery" type="number" min="1" /></div>
@@ -626,7 +626,7 @@
         <div class="param" data-site-mode="grow">
           <div class="row"><label>λ (stop)</label><input id="p-growLambda" type="number" step="10" min="0" /></div>
           <p class="help"><span class="unit">squared error per bit: 8-bit levels² (summed over R, G, B and pixels) per bit</span></p>
-          <div class="tip" role="tooltip">Only spots where a new site would remove more than λ × 128 levels² of error (a site costs 128 bits) get one; a step adds fewer sites if fewer qualify, and growth ends early once none do. Example: λ = 400 → 51,200 levels², e.g. 100 pixels each off by about 13 levels in all three channels. Higher λ stops sooner. 0 = never stop early (any site that helps at all qualifies). The log says which limit ended growth.</div>
+          <div class="tip" role="tooltip">Only cells whose split would remove more than λ × 128 levels² of error (a site costs 128 bits) are split; a step adds fewer sites if fewer qualify, and growth ends early once none do. Example: λ = 400 → 51,200 levels², e.g. 100 pixels each off by about 13 levels in all three channels. Higher λ stops sooner. 0 = never stop early (any site that helps at all qualifies). The log says which limit ended growth.</div>
         </div>
 
         <h3>Logging</h3>
@@ -746,6 +746,6 @@
       </section>
     </div>
 
-    <script type="module" src="train.js?v=gain-20261018"></script>
+    <script type="module" src="train.js?v=split-20261018"></script>
   </body>
 </html>

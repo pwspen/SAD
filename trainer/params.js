@@ -233,8 +233,7 @@ export function updateTauParamsBuffer(queue, buffer, siteCount, lambda, candDown
 // ---------------------------------------------------------------------------
 // GrowBlurParams (grow_blur.wgsl):
 //   u32 width, height, radius, _pad, f32 invTwoSigmaSq, _pad x3   (32 bytes)
-// GrowGainParams (grow_gain.wgsl):
-//   u32 width, height, cellSize, cellsX, cellsY, siteCount, _pad x2   (32 bytes)
+// SiteStatsParams (site_stats.wgsl): u32 siteCount, _pad x3, f32 invScaleSq, _pad x3
 // ---------------------------------------------------------------------------
 
 export function createUniform32(device) {
@@ -251,9 +250,6 @@ export function updateGrowBlurParamsBuffer(queue, buffer, { width, height, sigma
   queue.writeBuffer(buffer, 0, u);
 }
 
-export function updateGrowGainParamsBuffer(queue, buffer, { width, height, cellSize, cellsX, cellsY, siteCount }) {
-  queue.writeBuffer(buffer, 0, new Uint32Array([width, height, cellSize, cellsX, cellsY, siteCount, 0, 0]));
-}
 
 // ---------------------------------------------------------------------------
 // HilbertParams (hilbert.wgsl):

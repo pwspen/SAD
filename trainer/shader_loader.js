@@ -48,7 +48,6 @@ const SHADER_FILES = [
   "render_hashed",
   "render_tau_heatmap",
   "grow_blur",
-  "grow_gain",
   "site_stats",
 ];
 
@@ -118,7 +117,6 @@ export async function loadShaders({ tileSlots = 128, readText = fetchText } = {}
     RENDER_HASHED: out.render_hashed,
     RENDER_TAU_HEATMAP: out.render_tau_heatmap,
     GROW_BLUR: out.grow_blur,
-    GROW_GAIN: out.grow_gain,
     SITE_STATS: out.site_stats,
     tileSlots,
   };
