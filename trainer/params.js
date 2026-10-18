@@ -134,25 +134,25 @@ export function updateGradParamsBuffer(queue, buffer, siteCount, invScaleSq) {
 // ---------------------------------------------------------------------------
 // AdamParams (adam.wgsl):
 //   f32 lrPos, lrTau, lrRadius, lrColor, lrDir, lrAniso, beta1, beta2, eps,
-//   u32 t, u32 width, u32 height, u32 _pad   (13 slots, buffer padded to 64 bytes
-//   to match the WGSL struct roundUp alignment).
+//   u32 t, u32 width, u32 height, u32 growGen, f32 growLrDecay, u32 _pad × 2
+//   (16 slots, 64 bytes).
 // ---------------------------------------------------------------------------
 
 export function createAdamParamsBuffer(device, lrPos, lrTau, lrRadius, lrColor,
                                        lrDir, lrAniso, beta1, beta2, eps,
-                                       t, width, height) {
+                                       t, width, height, growGen = 0, growLrDecay = 1) {
   const buf = device.createBuffer({
     size: 64,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
   updateAdamParamsBuffer(device.queue, buf, lrPos, lrTau, lrRadius, lrColor,
-                          lrDir, lrAniso, beta1, beta2, eps, t, width, height);
+                          lrDir, lrAniso, beta1, beta2, eps, t, width, height, growGen, growLrDecay);
   return buf;
 }
 
 export function updateAdamParamsBuffer(queue, buffer, lrPos, lrTau, lrRadius, lrColor,
                                         lrDir, lrAniso, beta1, beta2, eps,
-                                        t, width, height) {
+                                        t, width, height, growGen = 0, growLrDecay = 1) {
   const bytes = new ArrayBuffer(64);
   const f = new Float32Array(bytes);
   const u = new Uint32Array(bytes);
@@ -168,7 +168,8 @@ export function updateAdamParamsBuffer(queue, buffer, lrPos, lrTau, lrRadius, lr
   u[9] = t >>> 0;
   u[10] = width >>> 0;
   u[11] = height >>> 0;
-  u[12] = 0;
+  u[12] = growGen >>> 0;
+  f[13] = growLrDecay;
   queue.writeBuffer(buffer, 0, bytes);
 }
 

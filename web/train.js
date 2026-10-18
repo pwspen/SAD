@@ -5,7 +5,7 @@
 
 import { loadShaders, tileSlotsForLimit } from "../trainer/shader_loader.js?v=shared-wgsl-20261017";
 import { requestTrainingDevice } from "../trainer/device.js?v=shared-wgsl-20261017";
-import { Trainer, buildArgs, GRAD_GROUPS, lrSchedule, LR_SCHEDULES, LOSSES, growthCounts } from "../trainer/trainer.js?v=loss-20261018";
+import { Trainer, buildArgs, GRAD_GROUPS, lrSchedule, LR_SCHEDULES, LOSSES, growthCounts } from "../trainer/trainer.js?v=lr-decay-20261018";
 import { loadImageToFloat32, loadMaskRgba32Float, whiteMaskRgba32Float } from "../trainer/textures.js?v=shared-wgsl-20261017";
 import { loadSitesFromFile, serializeSitesTxt, triggerDownload, floatImageToRgba8, computeBpp, BITS_PER_SITE } from "../trainer/io.js?v=shared-wgsl-20261017";
 import { SITE_FLOATS } from "../trainer/params.js?v=shared-wgsl-20261017";
@@ -60,6 +60,7 @@ const UI_FIELDS = [
   ["growFactor", "p-growFactor"],
   ["growEvery", "p-growEvery"],
   ["growBlur", "p-growBlur"],
+  ["growLrDecay", "p-growLrDecay"],
 ];
 
 const state = {
@@ -2486,7 +2487,7 @@ async function startTraining() {
 
   const sitesDesc = args.siteMode === "grow"
     ? `grow ${startCount} → ${Math.max(args.growMaxSites, startCount)}, ×${args.growFactor} every ${args.growEvery} iters ` +
-      `(λ stop ${args.growLambda})`
+      `(λ stop ${args.growLambda})` + (args.growLrDecay !== 1 ? `, older sites' LR ×${args.growLrDecay} per step` : "")
     : `${initSiteCount} fixed`;
   appendLog(`Target: ${width}×${height} | sites: ${sitesDesc} | iters: ${args.warmupIters} warmup + ${args.decayIters} decay | lr ×${args.lrMult} ${LR_SCHEDULES[args.lrSchedule]} | color: ${COLOR_SPACES[args.colorSpace].label} | loss: ${LOSSES[args.loss].label} | refresh: ${args.logFreq}`);
   updateProgress(0, args.iters, "Preparing…");

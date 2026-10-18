@@ -632,6 +632,11 @@
           <div class="tip" role="tooltip">Time for each batch to settle before the next is placed. Too short and the next step still sees the old error where the last batch landed. Growth finishes after (number of steps) × this, e.g. 1 → 64 with factor 2 and 25 takes 6 steps, done at iteration 150.</div>
         </div>
         <div class="param" data-site-mode="grow">
+          <div class="row"><label>LR decay</label><input id="p-growLrDecay" type="number" step="0.05" min="0" /></div>
+          <p class="help"><span class="unit">× per growth step, for sites older than it</span></p>
+          <div class="tip" role="tooltip">Each growth step multiplies the learning rates of every site that was already there by this, so early sites settle while later ones refine around them. A split's parent counts as new (it moves and gets fresh Adam moments), so only sites that stop being split slow down. A site 3 steps old at 0.5 learns at 0.125× the normal rate. 1 = off. Applies to every parameter, color included.</div>
+        </div>
+        <div class="param" data-site-mode="grow">
           <div class="row"><label>max sites</label><input id="p-growMaxSites" type="number" min="1" /></div>
           <p class="help"><span class="unit">sites</span></p>
           <div class="tip" role="tooltip">Growth stops when the count reaches this; the rest of the run refines the sites it has. Leave the run long enough after the last step for that.</div>
@@ -765,6 +770,6 @@
       </section>
     </div>
 
-    <script type="module" src="train.js?v=dots-toggle2-20261018"></script>
+    <script type="module" src="train.js?v=lr-decay-20261018"></script>
   </body>
 </html>

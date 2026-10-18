@@ -143,7 +143,10 @@ struct AdamParams {
   t : u32,
   width : u32,
   height : u32,
+  grow_gen : u32,      // growth steps so far
+  grow_lr_decay : f32, // per-site LR × this per growth step since the site's birth step
   _pad0 : u32,
+  _pad1 : u32,
 }
 
 struct SplitParams {

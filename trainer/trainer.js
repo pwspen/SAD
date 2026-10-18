@@ -27,7 +27,7 @@ import {
   updateGrowBlurParamsBuffer,
   packJumpStep,
   hilbertBitsForSize,
-} from "./params.js?v=noflow-20261017";
+} from "./params.js?v=lr-decay-20261018";
 
 import {
   createSitesBuffer,
@@ -188,6 +188,9 @@ export function buildArgs(config, overrides = {}) {
     // While growing, the fit target is blurred with sigma = growBlur × site
     // spacing √(mask area / sites); 0 = always fit the original.
     growBlur: Math.max(0, Number(pick("growBlur", "GROW_BLUR", 0))),
+    // Each growth step multiplies the learning rates of every site that
+    // existed before it (split parents count as new) by this; 1 = off.
+    growLrDecay: Math.max(0, Number(pick("growLrDecay", "GROW_LR_DECAY", 1))),
   };
   args.decayIters = Math.max(0, Math.floor(Number(overrides.iters !== undefined && overrides.decayIters === undefined
     ? overrides.iters - args.warmupIters
@@ -437,6 +440,7 @@ export class Trainer {
 
     // Growth state: the iteration it ended (null while growing) and why.
     this.growDoneIter = this.usesGrow ? null : 0;
+    this.growGen = 0; // growth steps that added sites (see growLrDecay)
     this.growStop = null;
     if (this.usesGrow) this._updateFitTarget();
 
@@ -526,7 +530,8 @@ export class Trainer {
       const lrAniso = it >= this.aniStartIter ? args.lrAnisoBase * lrScale : 0;
       updateAdamParamsBuffer(queue, this.adamParams,
         args.lrPosBase * lrScale, args.lrTauBase * lrScale, args.lrRadiusBase * lrScale,
-        args.lrColorBase * lrScale, lrDir, lrAniso, args.beta1, args.beta2, args.eps, it + 1, this.width, this.height);
+        args.lrColorBase * lrScale, lrDir, lrAniso, args.beta1, args.beta2, args.eps, it + 1, this.width, this.height,
+        this.growGen, args.growLrDecay);
 
       const blend = it / Math.max(1, iters);
       const lambda = TAU_DIFFUSE_LAMBDA * (0.1 + 0.9 * blend);
@@ -778,8 +783,10 @@ export class Trainer {
     // two lands on the split line. Both get fresh Adam moments.
     const k = splits.length;
     const data = new Float32Array(k * SITE_FLOATS);
+    this.growGen += 1;
     const adam = new Float32Array(ADAM_FLOATS);
     adam[20] = it;
+    adam[21] = this.growGen;
     const clampPos = (v, max) => Math.min(max - 1, Math.max(0, v));
     splits.forEach((sp, j) => {
       const b = sp.site * SITE_FLOATS;
@@ -801,7 +808,10 @@ export class Trainer {
     });
     queue.writeBuffer(this.sitesBuf, n0 * SITE_FLOATS * 4, encodeSiteColors(data, k, this.colorSpace));
     const adamNew = new Float32Array(k * ADAM_FLOATS);
-    for (let j = 0; j < k; j += 1) adamNew[j * ADAM_FLOATS + 20] = it;
+    for (let j = 0; j < k; j += 1) {
+      adamNew[j * ADAM_FLOATS + 20] = it;
+      adamNew[j * ADAM_FLOATS + 21] = this.growGen;
+    }
     queue.writeBuffer(this.adamBuf, n0 * ADAM_FLOATS * 4, adamNew);
     this.growPending = { it, sites: splits.map((sp, j) => ({ id: n0 + j, predicted: sp.gain })) };
 
