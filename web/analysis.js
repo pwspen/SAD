@@ -511,3 +511,59 @@ export function neighborFeatures(xs, ys, k = NEIGHBOR_K) {
   }
   return { spacing, phi, ecc };
 }
+
+// ---- k-means ----
+// Lloyd's algorithm on n points of dimension d (row-major Float64Array).
+// `init` (k·d) warm-starts the centroids so labels stay put between calls;
+// without it, k-means++ seeding from a fixed-seed generator. Clusters that
+// empty out keep their previous centroid. Returns { centroids, labels, iters }.
+
+export function kMeans(points, n, d, k, { init = null, maxIters = 50 } = {}) {
+  const centroids = new Float64Array(k * d);
+  const dist2 = (i, c) => {
+    let s = 0;
+    for (let t = 0; t < d; t += 1) { const v = points[i * d + t] - centroids[c * d + t]; s += v * v; }
+    return s;
+  };
+  if (init) {
+    centroids.set(init);
+  } else {
+    let seed = 0x9e3779b9;
+    const rand = () => { seed ^= seed << 13; seed ^= seed >>> 17; seed ^= seed << 5; return (seed >>> 0) / 4294967296; };
+    const best = new Float64Array(n).fill(Infinity);
+    for (let c = 0; c < k; c += 1) {
+      let pick = 0;
+      if (c === 0) {
+        pick = Math.floor(rand() * n);
+      } else {
+        let total = 0;
+        for (let i = 0; i < n; i += 1) total += best[i];
+        let r = rand() * total;
+        for (pick = 0; pick < n - 1 && (r -= best[pick]) > 0; pick += 1);
+      }
+      for (let t = 0; t < d; t += 1) centroids[c * d + t] = points[pick * d + t];
+      for (let i = 0; i < n; i += 1) best[i] = Math.min(best[i], dist2(i, c));
+    }
+  }
+  const labels = new Int32Array(n).fill(-1);
+  const sum = new Float64Array(k * d), count = new Float64Array(k);
+  let iters = 0;
+  for (; iters < maxIters; iters += 1) {
+    let changed = 0;
+    for (let i = 0; i < n; i += 1) {
+      let bc = 0, bd = Infinity;
+      for (let c = 0; c < k; c += 1) { const v = dist2(i, c); if (v < bd) { bd = v; bc = c; } }
+      if (labels[i] !== bc) { labels[i] = bc; changed += 1; }
+    }
+    if (!changed) break;
+    sum.fill(0); count.fill(0);
+    for (let i = 0; i < n; i += 1) {
+      count[labels[i]] += 1;
+      for (let t = 0; t < d; t += 1) sum[labels[i] * d + t] += points[i * d + t];
+    }
+    for (let c = 0; c < k; c += 1) {
+      if (count[c]) for (let t = 0; t < d; t += 1) centroids[c * d + t] = sum[c * d + t] / count[c];
+    }
+  }
+  return { centroids, labels, iters };
+}

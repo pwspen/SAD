@@ -13,8 +13,8 @@ import { COLOR_SPACES } from "../trainer/color_spaces.js?v=color-space-20261017"
 import {
   luma, maskWeights, laplacianBands, maskLevels, bandEnergies, IMPORTANCE, importanceMap,
   spectralPlan, windowedSpectrum, spectrumDiff, radialStats, frcCrossing, logPowerImage,
-  mutualInfoMatrix, MI_BINS, neighborFeatures, NEIGHBOR_K,
-} from "./analysis.js?v=site-mi-nb-20261018";
+  mutualInfoMatrix, MI_BINS, neighborFeatures, NEIGHBOR_K, kMeans,
+} from "./analysis.js?v=site-clusters-20261018";
 
 const CONFIG_URL = "../training_config.json";
 const DEMO_MAX_IMAGE_SIDE = 2048;
@@ -89,6 +89,7 @@ const state = {
   targetAnalysis: null,  // viewer-side target luma / pyramid / spectrum (see targetAnalysis())
   spectra: null,         // spectra of the latest render (see currentSpectra())
   siteMI: null,          // { sites, mi } parameter mutual information for the latest readback
+  siteClusters: null,    // { sites, result, centers } shape k-means for the latest readback (see currentSiteClusters())
   importanceImage: null, // RGBA8 importance map for the current target + mask
   layoutName: null,      // active key in LAYOUTS
   editing: false,        // layout edit mode (drag to move, add / remove, rows & cols)
@@ -369,6 +370,16 @@ const VIEWS = {
                       `${NEIGHBOR_K} nearest sites: log distance to the farthest of them, and the main direction φ ` +
                       `and eccentricity (λ1 − λ2) / (λ1 + λ2) of the structure tensor of the unit offsets to them. ` +
                       `Hover a cell for bits.` },
+  siteClusters: { label: "Site shape clusters", kind: "plot", source: "derived", on: ["render", "run"],
+                draw: drawSiteClusters,
+                note: "k-means (k = 5) on log_tau, radius and |log_aniso|, each z-scored over the active sites; " +
+                      "orientation and color are left out. Per cluster: share of sites, then centroid ± standard " +
+                      "deviation in original units. R²: share of the z-scored variance the clusters explain. Each " +
+                      "fit starts from the previous centroids, so clusters keep their colors during a run." },
+  clusterMap: { label: "Shape clusters on the image", kind: "image", source: "derived", blank: "#f1f1ec",
+                on: ["render"], draw: drawClusterMap,
+                note: "The latest render, washed out, with each site's centroid in its shape cluster's color " +
+                      "(same colors as the Site shape clusters card)." },
 };
 
 // Layouts are CSS grid-template-areas: one quoted string per row, one view id
@@ -399,7 +410,8 @@ const LAYOUTS = {
   },
   siteStats: {
     label: "Site stats",
-    areas: `"preview siteMI"`,
+    areas: `"preview    siteMI"
+            "clusterMap siteClusters"`,
   },
   spectral: {
     label: "Spectral",
@@ -1798,14 +1810,23 @@ function drawSiteMI(view) {
   const { ctx, col, w, h } = p;
   const mi = currentSiteMI();
   const k = MI_COLUMNS.length;
-  const labelW = 40, labelH = 18;
-  const box = { left: 12 + labelW, right: w - 12, top: PLOT_PAD.top + labelH, bottom: h - 28 };
+  // Column labels sit above the cells, or turn vertical when the cells are
+  // too narrow for them.
+  ctx.font = PLOT_FONT;
+  const maxLabel = Math.max(...MI_COLUMNS.map((c) => ctx.measureText(c.short).width));
+  const labelW = Math.ceil(maxLabel) + 10;
+  const fit = (labelH) => {
+    const box = { left: 12 + labelW, right: w - 12, top: PLOT_PAD.top + labelH, bottom: h - 28 };
+    return { box, cell: Math.max(1, Math.floor(Math.min((box.right - box.left) / k, (box.bottom - box.top) / k))) };
+  };
+  let { box, cell } = fit(18);
+  const vertical = maxLabel + 4 > cell;
+  if (vertical) ({ box, cell } = fit(Math.ceil(maxLabel) + 8));
   if (!mi) {
     view.geom = null;
     drawEmpty(p, { ...box, left: 12, top: PLOT_PAD.top }, "Sites appear after the first render");
     return;
   }
-  const cell = Math.max(1, Math.floor(Math.min((box.right - box.left) / k, (box.bottom - box.top) / k)));
   const x0 = Math.round(box.left + (box.right - box.left - cell * k) / 2);
   const y0 = box.top;
   view.geom = { ...box, x0, y0, cell, k };
@@ -1837,9 +1858,18 @@ function drawSiteMI(view) {
     ctx.textAlign = "right";
     ctx.textBaseline = "middle";
     ctx.fillText(c.short, x0 - 6, y0 + i * cell + cell / 2);
-    ctx.textAlign = "center";
-    ctx.textBaseline = "bottom";
-    ctx.fillText(c.short, x0 + i * cell + cell / 2, y0 - 4);
+    if (vertical) {
+      ctx.save();
+      ctx.translate(x0 + i * cell + cell / 2, y0 - 4);
+      ctx.rotate(-Math.PI / 2);
+      ctx.textAlign = "left";
+      ctx.fillText(c.short, 0, 0);
+      ctx.restore();
+    } else {
+      ctx.textAlign = "center";
+      ctx.textBaseline = "bottom";
+      ctx.fillText(c.short, x0 + i * cell + cell / 2, y0 - 4);
+    }
   });
   ctx.fillStyle = col.soft;
   ctx.textAlign = "center";
@@ -1867,6 +1897,145 @@ function drawSiteMI(view) {
 function hitSiteMI(g, mx, my) {
   const j = Math.floor((mx - g.x0) / g.cell), i = Math.floor((my - g.y0) / g.cell);
   return i >= 0 && j >= 0 && i < g.k && j < g.k ? `${i},${j}` : null;
+}
+
+// ---- Site shape clusters ----
+// k-means on the canonical shape (log_tau, radius, elongation), each z-scored
+// over the active sites; orientation and color stay out. Each fit warm-starts
+// from the previous one's centroids so a cluster keeps its color while the
+// run goes on; the first fit of a run numbers clusters by size.
+
+const CLUSTER_K = 5;
+const CLUSTER_PARAMS = MI_COLUMNS.slice(0, 3); // τ, rad, elong
+
+function currentSiteClusters() {
+  const sites = state.lastSites;
+  if (!sites) return null;
+  if (state.siteClusters?.sites === sites) return state.siteClusters.result;
+  const d = CLUSTER_PARAMS.length;
+  const bases = [];
+  const raw = [];
+  for (let i = 0; i < state.lastSiteCount; i += 1) {
+    const b = i * SITE_FLOATS;
+    if (sites[b] < 0) continue;
+    const v = CLUSTER_PARAMS.map((c) => c.get(sites, b));
+    if (v.every(Number.isFinite)) { bases.push(b); raw.push(...v); }
+  }
+  const n = bases.length;
+  if (n < CLUSTER_K * 2) {
+    state.siteClusters = { sites, result: null, centers: state.siteClusters?.centers };
+    return null;
+  }
+  const mean = new Float64Array(d), sd = new Float64Array(d);
+  for (let i = 0; i < n; i += 1) for (let t = 0; t < d; t += 1) mean[t] += raw[i * d + t] / n;
+  for (let i = 0; i < n; i += 1) for (let t = 0; t < d; t += 1) sd[t] += (raw[i * d + t] - mean[t]) ** 2 / n;
+  for (let t = 0; t < d; t += 1) sd[t] = Math.sqrt(sd[t]) || 1;
+  const z = Float64Array.from(raw, (v, j) => (v - mean[j % d]) / sd[j % d]);
+  const prev = state.siteClusters?.centers;
+  const init = prev && Float64Array.from(prev, (v, j) => (v - mean[j % d]) / sd[j % d]);
+  let { centroids, labels } = kMeans(z, n, d, CLUSTER_K, { init });
+
+  const count = new Float64Array(CLUSTER_K);
+  for (const l of labels) count[l] += 1;
+  if (!init) {
+    // First fit of the run: renumber clusters largest first.
+    const order = [...count.keys()].sort((a, b) => count[b] - count[a]);
+    const rank = new Int32Array(CLUSTER_K);
+    order.forEach((c, r) => { rank[c] = r; });
+    labels = labels.map((l) => rank[l]);
+    centroids = Float64Array.from({ length: CLUSTER_K * d }, (_, j) => centroids[order[Math.floor(j / d)] * d + j % d]);
+    count.set(order.map((c) => count[c]));
+  }
+  // Centroid ± spread in original units; R² = share of the z-scored variance
+  // the clusters account for.
+  const center = [], spread = [];
+  let within = 0;
+  for (let c = 0; c < CLUSTER_K; c += 1) {
+    center.push(Array.from({ length: d }, (_, t) => centroids[c * d + t] * sd[t] + mean[t]));
+    spread.push(new Array(d).fill(0));
+  }
+  for (let i = 0; i < n; i += 1) {
+    const c = labels[i];
+    for (let t = 0; t < d; t += 1) {
+      spread[c][t] += (raw[i * d + t] - center[c][t]) ** 2;
+      within += (z[i * d + t] - centroids[c * d + t]) ** 2;
+    }
+  }
+  for (let c = 0; c < CLUSTER_K; c += 1) for (let t = 0; t < d; t += 1) spread[c][t] = Math.sqrt(spread[c][t] / (count[c] || 1));
+  const result = { n, bases, labels, share: Array.from(count, (v) => v / n), center, spread, r2: 1 - within / (n * d) };
+  state.siteClusters = { sites, result, centers: center.flat() };
+  return result;
+}
+
+const CLUSTER_COLORS = SERIES_COLORS.slice(0, CLUSTER_K);
+
+function drawSiteClusters(view) {
+  const p = beginPlot(view);
+  if (!p) return;
+  const { ctx, col, w, h } = p;
+  const box = { left: 12, right: w - 12, top: PLOT_PAD.top, bottom: h - 28 };
+  const cl = currentSiteClusters();
+  if (!cl) {
+    drawEmpty(p, box, "Sites appear after the first render");
+    return;
+  }
+  const fmt = (v) => (Math.abs(v) >= 100 ? v.toFixed(0) : Math.abs(v) >= 10 ? v.toFixed(1) : v.toFixed(2));
+  const headers = ["cluster", "sites", ...CLUSTER_PARAMS.map((c) => c.short)];
+  const rows = cl.center.map((ctr, c) => [
+    String(c + 1), `${(cl.share[c] * 100).toFixed(0)}%`,
+    ...ctr.map((v, t) => `${fmt(v)} ± ${fmt(cl.spread[c][t])}`),
+  ]);
+  const rowH = Math.min(26, (box.bottom - box.top) / (rows.length + 1));
+  const colX = [box.left + 18, box.left + 90];
+  const valueW = (box.right - colX[1] - 24) / CLUSTER_PARAMS.length;
+  CLUSTER_PARAMS.forEach((_, t) => colX.push(colX[1] + 24 + valueW * (t + 1)));
+  ctx.font = PLOT_FONT;
+  ctx.textBaseline = "middle";
+  const drawRow = (cells, y, color) => {
+    ctx.fillStyle = color;
+    cells.forEach((s, j) => {
+      ctx.textAlign = j === 0 ? "left" : "right";
+      ctx.fillText(s, colX[j], y);
+    });
+  };
+  let y = box.top + rowH / 2;
+  drawRow(headers, y, col.dim);
+  ctx.strokeStyle = col.line;
+  ctx.beginPath(); ctx.moveTo(box.left, y + rowH / 2); ctx.lineTo(box.right, y + rowH / 2); ctx.stroke();
+  rows.forEach((cells, c) => {
+    y += rowH;
+    ctx.fillStyle = CLUSTER_COLORS[c];
+    ctx.beginPath();
+    ctx.arc(box.left + 5, y, 5, 0, Math.PI * 2);
+    ctx.fill();
+    drawRow(cells, y, col.text);
+  });
+  ctx.fillStyle = col.soft;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "bottom";
+  ctx.fillText(`k-means, k = ${CLUSTER_K}, z-scored · R² = ${cl.r2.toFixed(2)} · ${cl.n} sites · centroid ± sd`,
+               w / 2, h - 8);
+}
+
+// The reconstruction, washed out, with each site's centroid in its cluster color.
+function drawClusterMap() {
+  const canvas = VIEWS.clusterMap.canvas;
+  const render = state.lastRender;
+  const cl = currentSiteClusters();
+  if (!canvas || !render) return;
+  const { rgba, width, height } = render;
+  drawToCanvas(canvas, rgba, width, height);
+  const ctx = canvas.getContext("2d");
+  ctx.fillStyle = "rgba(255, 255, 255, 0.6)";
+  ctx.fillRect(0, 0, width, height);
+  if (!cl) return;
+  const r = Math.max(1.5, Math.max(width, height) / 350);
+  cl.bases.forEach((b, i) => {
+    ctx.fillStyle = CLUSTER_COLORS[cl.labels[i]];
+    ctx.beginPath();
+    ctx.arc(state.lastSites[b], state.lastSites[b + 1], r, 0, Math.PI * 2);
+    ctx.fill();
+  });
 }
 
 // ---- Image views ----
@@ -2154,6 +2323,7 @@ async function startTraining() {
   state.bandHistory = [];
   state.growthGain = [];
   state.lrHistory = [];
+  state.siteClusters = null; // a new run renumbers its clusters by size
   // Growth multiplies the count by growFactor every growEvery iterations, so
   // its end (where "decay after growth" starts decaying) is predictable unless
   // λ stops it early; the plan is corrected once the trainer reports the real end.
