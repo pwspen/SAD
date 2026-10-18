@@ -352,3 +352,88 @@ export function logPowerImage(plan, F, size) {
   for (let p = 0; p < out.length; p += 1) out[p] = Math.log10(sum[p] / (cnt[p] * w2Sum) + 1e-20);
   return out;
 }
+
+// ---- Mutual information between per-site parameters ----
+// Plug-in entropies from equal-width histograms with the Miller–Madow bias
+// correction, H ≈ H_ML + (m − 1) / (2N ln 2) bits, m = occupied bins. Each
+// column is a Float32Array over sites; NaN marks "undefined for this site"
+// and drops it from every pair that uses that column.
+
+export const MI_BINS = 16;
+
+// Bin index per site (−1 for NaN). `range` = [lo, hi] fixes the bins (for
+// circular values); otherwise they span the 1st–99th percentile and outliers
+// fall into the edge bins.
+function binColumn(values, bins, range) {
+  let lo, hi;
+  if (range) {
+    [lo, hi] = range;
+  } else {
+    const finite = Array.from(values).filter(Number.isFinite).sort((a, b) => a - b);
+    if (!finite.length) return new Int32Array(values.length).fill(-1);
+    lo = finite[Math.floor(0.01 * (finite.length - 1))];
+    hi = finite[Math.ceil(0.99 * (finite.length - 1))];
+  }
+  const scale = hi > lo ? bins / (hi - lo) : 0;
+  const out = new Int32Array(values.length);
+  for (let i = 0; i < values.length; i += 1) {
+    const v = values[i];
+    out[i] = Number.isFinite(v) ? Math.max(0, Math.min(bins - 1, Math.floor((v - lo) * scale))) : -1;
+  }
+  return out;
+}
+
+// Miller–Madow entropy in bits of a count table with total n.
+function entropyMM(counts, n) {
+  let h = 0, m = 0;
+  for (const c of counts) {
+    if (c > 0) { h -= (c / n) * Math.log2(c / n); m += 1; }
+  }
+  return h + (m - 1) / (2 * n * Math.LN2);
+}
+
+// columns = [{ values, range? }]. Returns { n, h, bits, norm } where h[i] is
+// column i's entropy over its own defined sites, and for each pair, over the
+// sites defined in both: bits[i][j] = H(X) + H(Y) − H(X,Y) and
+// norm[i][j] = bits / min(H(X), H(Y)) clamped to [0, 1]. Diagonals are 1.
+export function mutualInfoMatrix(columns, bins = MI_BINS) {
+  const k = columns.length;
+  const idx = columns.map((c) => binColumn(c.values, bins, c.range));
+  const nSites = idx[0]?.length ?? 0;
+  const n = [], h = [], bits = [], norm = [];
+  for (let i = 0; i < k; i += 1) {
+    const counts = new Float64Array(bins);
+    let ni = 0;
+    for (const b of idx[i]) if (b >= 0) { counts[b] += 1; ni += 1; }
+    h.push(ni > 1 ? entropyMM(counts, ni) : 0);
+    n.push(new Array(k).fill(0));
+    bits.push(new Array(k).fill(0));
+    norm.push(new Array(k).fill(1));
+    n[i][i] = ni;
+    bits[i][i] = h[i];
+  }
+  const joint = new Float64Array(bins * bins);
+  const px = new Float64Array(bins), py = new Float64Array(bins);
+  for (let i = 0; i < k; i += 1) {
+    for (let j = i + 1; j < k; j += 1) {
+      joint.fill(0); px.fill(0); py.fill(0);
+      let nij = 0;
+      for (let s = 0; s < nSites; s += 1) {
+        const a = idx[i][s], b = idx[j][s];
+        if (a < 0 || b < 0) continue;
+        joint[a * bins + b] += 1; px[a] += 1; py[b] += 1; nij += 1;
+      }
+      let I = 0, r = 0;
+      if (nij > 1) {
+        const hx = entropyMM(px, nij), hy = entropyMM(py, nij);
+        I = Math.max(0, hx + hy - entropyMM(joint, nij));
+        const hMin = Math.min(hx, hy);
+        r = hMin > 0 ? Math.min(1, I / hMin) : 0;
+      }
+      n[i][j] = n[j][i] = nij;
+      bits[i][j] = bits[j][i] = I;
+      norm[i][j] = norm[j][i] = r;
+    }
+  }
+  return { n, h, bits, norm };
+}

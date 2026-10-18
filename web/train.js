@@ -13,10 +13,12 @@ import { COLOR_SPACES } from "../trainer/color_spaces.js?v=color-space-20261017"
 import {
   luma, maskWeights, laplacianBands, maskLevels, bandEnergies, IMPORTANCE, importanceMap,
   spectralPlan, windowedSpectrum, spectrumDiff, radialStats, frcCrossing, logPowerImage,
-} from "./analysis.js?v=spectral-20261017";
+  mutualInfoMatrix, MI_BINS,
+} from "./analysis.js?v=site-mi-20261018";
 
 const CONFIG_URL = "../training_config.json";
 const DEMO_MAX_IMAGE_SIDE = 2048;
+const MI_ROUND_ANISO = 0.05; // |log_aniso| below this, a site has no orientation (site MI view)
 // Kodak set lives outside this repo; the default resolves under the
 // kodak-bench server (which serves the parent dir). Override with ?kodak=<dir>.
 const KODAK_DIR = new URLSearchParams(location.search).get("kodak") || "../../comp/data/kodak/";
@@ -86,6 +88,7 @@ const state = {
   bandHistory: [],       // [{ it, snr: [dB per band] }] from every render
   targetAnalysis: null,  // viewer-side target luma / pyramid / spectrum (see targetAnalysis())
   spectra: null,         // spectra of the latest render (see currentSpectra())
+  siteMI: null,          // { sites, mi } parameter mutual information for the latest readback
   importanceImage: null, // RGBA8 importance map for the current target + mask
   layoutName: null,      // active key in LAYOUTS
   editing: false,        // layout edit mode (drag to move, add / remove, rows & cols)
@@ -357,6 +360,12 @@ const VIEWS = {
                 note: "log₁₀ |F|² with DC at the centre, on one shared scale set by the target; " +
                       "the target tile's axes are fx and fy in cycles/px. " +
                       "Dashed ring: the site-spacing frequency." },
+  siteMI:     { label: "Site parameter mutual information", kind: "plot", source: "derived", on: ["render", "run"],
+                draw: drawSiteMI, hit: hitSiteMI,
+                note: `Normalized mutual information I(X;Y) / min(H(X), H(Y)) between site parameters over active ` +
+                      `sites: ${MI_BINS} equal-width bins per parameter (1st–99th percentile; θ over [0, π)), ` +
+                      `entropies with the Miller–Madow correction. θ is the major axis, skipped for sites with ` +
+                      `|log_aniso| < ${MI_ROUND_ANISO}. Colors are decoded RGB. Hover a cell for bits.` },
 };
 
 // Layouts are CSS grid-template-areas: one quoted string per row, one view id
@@ -384,6 +393,10 @@ const LAYOUTS = {
     label: "Plots",
     areas: `"psnr bpp  lr"
             "grad grad growGain"`,
+  },
+  siteStats: {
+    label: "Site stats",
+    areas: `"preview siteMI"`,
   },
   spectral: {
     label: "Spectral",
@@ -1725,6 +1738,119 @@ function drawSpectrumTileAxes(p, x, y, side) {
   ctx.textBaseline = "middle";
   ctx.fillText("fy (cycles/px)", 0, 0);
   ctx.restore();
+}
+
+// ---- Site parameter mutual information ----
+// One column per parameter in the form that matters for coding. Orientation
+// is the major axis mod π: voronoi_dmix2 weights distance along aniso_dir by
+// exp(log_aniso), so for log_aniso > 0 the cell is long across that direction.
+// It's left undefined (NaN) for near-round sites, whose θ is noise.
+
+const MI_COLUMNS = [
+  { short: "τ", label: "log_tau", get: (s, b) => s[b + 2] },
+  { short: "rad", label: "radius (distance offset)", get: (s, b) => s[b + 3] },
+  { short: "elong", label: "elongation |log_aniso|", get: (s, b) => Math.abs(s[b + 9]) },
+  { short: "θ", label: "major axis θ mod π", range: [0, Math.PI], get: (s, b) => {
+      if (!(Math.abs(s[b + 9]) >= MI_ROUND_ANISO)) return NaN;
+      const t = Math.atan2(s[b + 8], s[b + 7]) + (s[b + 9] > 0 ? Math.PI / 2 : 0);
+      return ((t % Math.PI) + Math.PI) % Math.PI;
+    } },
+  { short: "R", label: "red (decoded)", get: (s, b) => s[b + 4] },
+  { short: "G", label: "green (decoded)", get: (s, b) => s[b + 5] },
+  { short: "B", label: "blue (decoded)", get: (s, b) => s[b + 6] },
+];
+
+// MI over the active sites of the latest readback, cached per readback.
+function currentSiteMI() {
+  const sites = state.lastSites;
+  if (!sites) return null;
+  if (state.siteMI?.sites === sites) return state.siteMI.mi;
+  const active = [];
+  for (let i = 0; i < state.lastSiteCount; i += 1) if (sites[i * SITE_FLOATS] >= 0) active.push(i * SITE_FLOATS);
+  const columns = MI_COLUMNS.map((c) => ({
+    range: c.range,
+    values: Float32Array.from(active, (b) => c.get(sites, b)),
+  }));
+  const mi = active.length > 1 ? mutualInfoMatrix(columns) : null;
+  state.siteMI = { sites, mi };
+  return mi;
+}
+
+function drawSiteMI(view) {
+  const p = beginPlot(view);
+  if (!p) return;
+  const { ctx, col, w, h } = p;
+  const mi = currentSiteMI();
+  const k = MI_COLUMNS.length;
+  const labelW = 40, labelH = 18;
+  const box = { left: 12 + labelW, right: w - 12, top: PLOT_PAD.top + labelH, bottom: h - 28 };
+  if (!mi) {
+    view.geom = null;
+    drawEmpty(p, { ...box, left: 12, top: PLOT_PAD.top }, "Sites appear after the first render");
+    return;
+  }
+  const cell = Math.max(1, Math.floor(Math.min((box.right - box.left) / k, (box.bottom - box.top) / k)));
+  const x0 = Math.round(box.left + (box.right - box.left - cell * k) / 2);
+  const y0 = box.top;
+  view.geom = { ...box, x0, y0, cell, k };
+
+  ctx.font = PLOT_FONT;
+  for (let i = 0; i < k; i += 1) {
+    for (let j = 0; j < k; j += 1) {
+      const v = mi.norm[i][j];
+      const idx = Math.max(0, Math.min(255, Math.round(v * 255))) * 3;
+      ctx.fillStyle = `rgb(${SPECTRUM_LUT[idx]}, ${SPECTRUM_LUT[idx + 1]}, ${SPECTRUM_LUT[idx + 2]})`;
+      const x = x0 + j * cell, y = y0 + i * cell;
+      ctx.fillRect(x, y, cell - 1, cell - 1);
+      if (cell >= 28 && i !== j) {
+        ctx.fillStyle = v > 0.5 ? "#ffffff" : col.text;
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillText(v.toFixed(2), x + cell / 2, y + cell / 2);
+      }
+    }
+  }
+  if (view.hoverKey != null) {
+    const [i, j] = view.hoverKey.split(",").map(Number);
+    ctx.strokeStyle = col.text;
+    ctx.lineWidth = 1.5;
+    ctx.strokeRect(x0 + j * cell + 0.75, y0 + i * cell + 0.75, cell - 2.5, cell - 2.5);
+  }
+  ctx.fillStyle = col.dim;
+  MI_COLUMNS.forEach((c, i) => {
+    ctx.textAlign = "right";
+    ctx.textBaseline = "middle";
+    ctx.fillText(c.short, x0 - 6, y0 + i * cell + cell / 2);
+    ctx.textAlign = "center";
+    ctx.textBaseline = "bottom";
+    ctx.fillText(c.short, x0 + i * cell + cell / 2, y0 - 4);
+  });
+  ctx.fillStyle = col.soft;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "bottom";
+  ctx.fillText(`I / min(H) · ${mi.n[0][0]} sites · ${MI_BINS} bins · Miller–Madow`, w / 2, h - 8);
+
+  if (view.hoverKey != null) {
+    const [i, j] = view.hoverKey.split(",").map(Number);
+    const a = MI_COLUMNS[i], b = MI_COLUMNS[j];
+    const ax = x0 + j * cell + cell / 2, ay = y0 + i * cell;
+    const tip = i === j
+      ? { rows: [{ cells: [a.label, ""] }, { cells: ["H", `${mi.h[i].toFixed(2)} bits`] },
+                 { cells: ["sites", String(mi.n[i][i])] }] }
+      : { rows: [{ cells: [`${a.short} vs ${b.short}`, ""] },
+                 { cells: ["I / min(H)", mi.norm[i][j].toFixed(3)] },
+                 { cells: ["I", `${mi.bits[i][j].toFixed(3)} bits`] },
+                 { cells: [`H(${a.short})`, `${mi.h[i].toFixed(2)} bits`] },
+                 { cells: [`H(${b.short})`, `${mi.h[j].toFixed(2)} bits`] },
+                 { cells: ["sites", String(mi.n[i][j])] }],
+          footer: `${a.label} · ${b.label}` };
+    drawTooltip(p, { ...view.geom, top: 4, bottom: h - 4, right: w - 4 }, ax, ay, tip);
+  }
+}
+
+function hitSiteMI(g, mx, my) {
+  const j = Math.floor((mx - g.x0) / g.cell), i = Math.floor((my - g.y0) / g.cell);
+  return i >= 0 && j >= 0 && i < g.k && j < g.k ? `${i},${j}` : null;
 }
 
 // ---- Image views ----
