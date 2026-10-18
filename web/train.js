@@ -28,8 +28,7 @@ const UI_FIELDS = [
   ["warmupIters", "p-warmupIters"],
   ["decayIters", "p-decayIters"],
   ["sites", "p-sites"],
-  ["logFreq", "p-logFreq"],
-  ["viewerFreq", "p-viewerFreq"],
+  ["logFreq", "p-logFreq"], // also sets viewerFreq (one "refresh every" field)
   ["candFreq", "p-candFreq"],
   ["candUpdatePasses", "p-candUpdatePasses"],
   ["candDownscale", "p-candDownscale"],
@@ -151,6 +150,7 @@ function readFormArgs() {
     else if (el.value === "") continue;
     else overrides[key] = Number(el.value);
   }
+  if (overrides.logFreq !== undefined) overrides.viewerFreq = overrides.logFreq;
   return buildArgs(state.config, overrides);
 }
 
@@ -1846,7 +1846,7 @@ async function startTraining() {
   const sitesDesc = args.growLambda > 0 && !init
     ? `grow ${Math.min(args.growInitSites, args.sites)} → ≤${args.sites} (λ ${args.growLambda}, until iter ${args.growEndIter})`
     : initSiteCount;
-  appendLog(`Target: ${width}×${height} | sites: ${sitesDesc} | iters: ${args.warmupIters} warmup + ${args.decayIters} decay | lr ×${args.lrMult} | color: ${COLOR_SPACES[args.colorSpace].label} | log: ${args.logFreq} | view: ${args.viewerFreq}`);
+  appendLog(`Target: ${width}×${height} | sites: ${sitesDesc} | iters: ${args.warmupIters} warmup + ${args.decayIters} decay | lr ×${args.lrMult} | color: ${COLOR_SPACES[args.colorSpace].label} | refresh: ${args.logFreq}`);
   updateProgress(0, args.iters, "Preparing…");
 
   const trainer = new Trainer(state.device, state.shaders, args, {

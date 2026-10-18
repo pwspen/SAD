@@ -557,31 +557,16 @@
           <div class="tip" role="tooltip">Start from these sites instead of the default placement (sites sampled where the image has edges). Positions are rescaled to the target size and every site's τ is reset. The file's site count replaces <b>sites</b> (or <b>start sites</b> when growth is on).</div>
         </div>
 
-        <h3>Sites &amp; iterations</h3>
-        <div class="param">
-          <div class="row"><label>warmup iters</label><input id="p-warmupIters" type="number" /></div>
-          <p class="help"><span class="unit">iterations</span></p>
-          <div class="tip" role="tooltip">Every learning rate ramps linearly from 0 to full over this many iterations. Run length = warmup + decay.</div>
-        </div>
-        <div class="param">
-          <div class="row"><label>decay iters</label><input id="p-decayIters" type="number" /></div>
-          <p class="help"><span class="unit">iterations</span></p>
-          <div class="tip" role="tooltip">After warmup, the learning rates fall to 0 on a cosine curve over this many iterations.</div>
-        </div>
+        <h3>Sites &amp; logging</h3>
         <div class="param">
           <div class="row"><label>sites</label><input id="p-sites" type="number" /></div>
           <p class="help"><span class="unit">sites (128 bits each)</span></p>
           <div class="tip" role="tooltip">Growth off: the exact count for the whole run. Growth on: the <b>maximum</b>. Bits per pixel = sites × 128 / (width × height).</div>
         </div>
         <div class="param">
-          <div class="row"><label>log-freq</label><input id="p-logFreq" type="number" /></div>
-          <p class="help"><span class="unit">iterations between log ticks</span></p>
-          <div class="tip" role="tooltip">At each tick training pauses to read back the render and update PSNR, gradient stats and the plots. Smaller = finer curves, slower runs.</div>
-        </div>
-        <div class="param">
-          <div class="row"><label>viewer-freq</label><input id="p-viewerFreq" type="number" /></div>
-          <p class="help"><span class="unit">iterations between preview refreshes</span></p>
-          <div class="tip" role="tooltip">How often the preview images and site overlay update between log ticks. Only affects the viewer, not training.</div>
+          <div class="row"><label>refresh every</label><input id="p-logFreq" type="number" /></div>
+          <p class="help"><span class="unit">iterations between refreshes</span></p>
+          <div class="tip" role="tooltip">How often training pauses to read back the render and update PSNR, gradient stats, the plots, the preview images and the site overlay. Smaller = finer curves and a livelier view, slower runs. Doesn't change what is learned.</div>
         </div>
 
         <h3 class="has-tip" tabindex="0">Site growth<span class="tip" role="tooltip">Instead of a fixed count, start small and add a site only where it pays for its bits on the rate–distortion curve: where it would remove more error than λ × 128 bits is worth. Growth runs coarse to fine and stops by itself, so λ picks the operating point (bpp vs PSNR) and the site count follows. Sites are never removed.</span></h3>
@@ -662,6 +647,16 @@
 
         <h3 class="has-tip" tabindex="0">Learning rates<span class="tip" role="tooltip">Adam step sizes. Adam moves a parameter by about its rate per iteration, in that parameter's units, so each unit below is "per iteration". Rate used = base below × <b>LR mult</b> × the warmup/decay schedule (e.g. pos 0.025 × 3 = up to 0.075 px per iteration).</span></h3>
         <div class="param">
+          <div class="row"><label>warmup iters</label><input id="p-warmupIters" type="number" /></div>
+          <p class="help"><span class="unit">iterations</span></p>
+          <div class="tip" role="tooltip">Every learning rate ramps linearly from 0 to full over this many iterations. Run length = warmup + decay.</div>
+        </div>
+        <div class="param">
+          <div class="row"><label>decay iters</label><input id="p-decayIters" type="number" /></div>
+          <p class="help"><span class="unit">iterations</span></p>
+          <div class="tip" role="tooltip">After warmup, the learning rates fall to 0 on a cosine curve over this many iterations.</div>
+        </div>
+        <div class="param">
           <div class="row"><label>LR mult</label><input id="p-lrMult" type="number" step="0.1" /></div>
           <p class="help"><span class="unit">unitless multiplier</span></p>
           <div class="tip" role="tooltip">Scales every base rate below: the quickest single knob for faster but riskier (higher) or calmer (lower) training.</div>
@@ -722,6 +717,6 @@
       </section>
     </div>
 
-    <script type="module" src="train.js?v=help-20261017"></script>
+    <script type="module" src="train.js?v=fields-20261017"></script>
   </body>
 </html>
