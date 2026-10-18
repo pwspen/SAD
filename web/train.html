@@ -194,6 +194,25 @@
         box-shadow: 0 0 0 3px var(--focus);
       }
       .row input[type="checkbox"] { accent-color: var(--accent); }
+      /* Explanations under each advanced param, and a lead-in per section. */
+      .help {
+        margin: -2px 0 8px;
+        font-size: 11px;
+        line-height: 1.45;
+        color: var(--text-soft);
+      }
+      .help b { color: var(--text-dim); font-weight: 600; }
+      .help .unit {
+        display: block;
+        color: var(--text-dim);
+        font-weight: 600;
+      }
+      .section-help {
+        margin: 0 0 8px;
+        font-size: 11px;
+        line-height: 1.45;
+        color: var(--text-dim);
+      }
       .file-inline {
         display: flex;
         align-items: center;
@@ -500,6 +519,7 @@
             <span class="file-name" id="maskLabel">none</span>
           </div>
         </div>
+        <p class="help"><span class="unit">image, same size as the target; on/off per pixel</span> Pixels that aren't pure black count toward the loss and PSNR. Black pixels are ignored by sites, growth and the score.</p>
         <div class="row">
           <label>init sites</label>
           <div class="file-inline">
@@ -507,42 +527,72 @@
             <span class="file-name" id="initLabel">gradient init</span>
           </div>
         </div>
+        <p class="help"><span class="unit">a saved sites.txt</span> Start from these sites instead of the default placement (sites sampled where the image has edges). Positions are rescaled to the target size and every site's τ is reset. The file's site count replaces <b>sites</b> (or <b>start sites</b> when growth is on).</p>
 
         <h3>Sites &amp; iterations</h3>
         <div class="row"><label>warmup iters</label><input id="p-warmupIters" type="number" /></div>
+        <p class="help"><span class="unit">iterations</span> Every learning rate ramps linearly from 0 to full over this many iterations. Run length = warmup + decay.</p>
         <div class="row"><label>decay iters</label><input id="p-decayIters" type="number" /></div>
+        <p class="help"><span class="unit">iterations</span> After warmup, the learning rates fall to 0 on a cosine curve over this many iterations.</p>
         <div class="row"><label>sites</label><input id="p-sites" type="number" /></div>
+        <p class="help"><span class="unit">sites (128 bits each)</span> Growth off: the exact count for the whole run. Growth on: the <b>maximum</b>. Bits per pixel = sites × 128 / (width × height).</p>
         <div class="row"><label>log-freq</label><input id="p-logFreq" type="number" /></div>
+        <p class="help"><span class="unit">iterations between log ticks</span> At each tick training pauses to read back the render and update PSNR, gradient stats and the plots. Smaller = finer curves, slower runs.</p>
         <div class="row"><label>viewer-freq</label><input id="p-viewerFreq" type="number" /></div>
+        <p class="help"><span class="unit">iterations between preview refreshes</span> How often the preview images and site overlay update between log ticks. Only affects the viewer, not training.</p>
+
+        <h3>Site growth</h3>
+        <p class="section-help">Instead of a fixed count, start small and add a site only where it pays for its bits on the rate–distortion curve: where it would remove more error than λ × 128 bits is worth. Growth runs coarse to fine and stops by itself, so λ picks the operating point (bpp vs PSNR) and the site count follows. Sites are never removed.</p>
+        <div class="row"><label>λ (0 = off)</label><input id="p-growLambda" type="number" step="10" /></div>
+        <p class="help"><span class="unit">squared error per bit: 8-bit levels² (summed over R, G, B and pixels) per bit</span> One site costs 128 bits, so a new site must remove more than λ × 128 levels² of error. Example: λ = 400 → 51,200 levels², e.g. 100 pixels each off by about 13 levels in all three channels. <b>Higher λ → fewer sites, lower bpp, lower PSNR.</b> On Kodak, 1600 gave about 1–4k sites, 400 about 4–9k, 100 about 9–30k. 0 = growth off.</p>
+        <div class="row"><label>start sites</label><input id="p-growInitSites" type="number" /></div>
+        <p class="help"><span class="unit">sites</span> Count at iteration 0, placed by the default edge-based init. Growth only adds, so this is also the minimum. 256 beat 16 in tests (tiny starts waste the first checks).</p>
+        <div class="row"><label>every iters</label><input id="p-growEvery" type="number" /></div>
+        <p class="help"><span class="unit">iterations between growth checks</span> Each check adds at most one site per site-spacing cell, so the count at most about doubles per check. Longer gaps let the fit settle and end with fewer sites; 10 gave the best quality per site.</p>
+        <div class="row"><label>end iter</label><input id="p-growEndIter" type="number" placeholder="60% of iters" /></div>
+        <p class="help"><span class="unit">iteration number (blank = 60% of the run)</span> No sites are added from this iteration on; the rest of the run refines the sites it has. Growth usually stops on its own well before.</p>
+        <div class="row"><label>blur × spacing</label><input id="p-growBlur" type="number" step="0.05" /></div>
+        <p class="help"><span class="unit">multiple of the site spacing (unitless); σ in px = this × √(mask pixels / sites)</span> While growing, train against the image blurred with that Gaussian σ (e.g. 0.375 × 20 px spacing = 7.5 px). The blur shrinks as sites are added and stops at <b>end iter</b>. 0 = off (recommended): it cost 0.5–2 dB in tests, since sites draw edges far finer than their spacing.</p>
 
         <h3>Candidates</h3>
+        <p class="section-help">Each pixel blends only its 8 best-scoring sites, kept in a per-pixel candidate list. These settings control how the lists are searched as sites move: better search means more accurate renders and gradients, at more cost per iteration. "Pass" below = one search sweep over every candidate pixel.</p>
         <div class="row"><label>freq</label><input id="p-candFreq" type="number" /></div>
+        <p class="help"><span class="unit">iterations between list refreshes</span> 1 = refresh every iteration (most accurate); larger is faster, but lists go stale as sites move.</p>
         <div class="row"><label>passes</label><input id="p-candUpdatePasses" type="number" /></div>
+        <p class="help"><span class="unit">passes per refresh</span> Each pass merges in neighbouring pixels' lists; the first passes of a run reach far (jump flooding), later ones only adjacent pixels.</p>
         <div class="row"><label>downscale</label><input id="p-candDownscale" type="number" /></div>
+        <p class="help"><span class="unit">image pixels per candidate cell, per side (integer)</span> 2 = one shared list per 2×2 pixels. Faster and lighter, but sites smaller than a cell can be missed. 1 = one list per pixel.</p>
         <div class="row"><label>radius scale</label><input id="p-candRadiusScale" type="number" step="1" /></div>
+        <p class="help"><span class="unit">candidate cells per 1024 cells of grid width</span> Distance of the radius probes below; scales with the grid, e.g. 64 → 48 cells on a 768-wide grid.</p>
         <div class="row"><label>radius probes</label><input id="p-candRadiusProbes" type="number" /></div>
+        <p class="help"><span class="unit">probes per pixel per pass</span> Also merge the lists of this many cells in random directions at the distance above, so large sites reach far pixels. 0 = off.</p>
         <div class="row"><label>inject count</label><input id="p-candInjectCount" type="number" /></div>
+        <p class="help"><span class="unit">random sites per pixel per pass</span> Also try this many sites picked at random from all sites: a global safety net so no site stays undiscovered.</p>
         <div class="row"><label>hilbert window</label><input id="p-candHilbertWindow" type="number" /></div>
+        <p class="help"><span class="unit">± positions in the Hilbert-sorted site list</span> Sites are sorted along a Hilbert curve, which keeps nearby sites close in the list; Hilbert probes pick within this many places either side of the pixel's best site. 0 = off.</p>
         <div class="row"><label>hilbert probes</label><input id="p-candHilbertProbes" type="number" /></div>
+        <p class="help"><span class="unit">sites per pixel per pass</span> How many of those Hilbert neighbours each pixel tries. 0 = off.</p>
 
         <h3>Color</h3>
         <div class="row"><label>space</label><select id="p-colorSpace" aria-label="Site color space"></select></div>
+        <p class="help"><span class="unit">choice; sets the units of the color numbers</span> What a site's three color numbers mean while optimizing. <b>RGB</b>: red, green, blue on 0–1 (1 = 255 levels). <b>Log intensity + chroma</b>: mean natural-log brightness, then log(R/G) and log(B/G), so a pure brightness change moves one number. Blending, the loss and saved files are always RGB.</p>
 
         <h3>Learning rates</h3>
+        <p class="section-help">Adam step sizes. Adam moves a parameter by about its rate per iteration, in that parameter's units, so each unit below is "per iteration". Rate used = base below × <b>LR mult</b> × the warmup/decay schedule (e.g. pos 0.025 × 3 = up to 0.075 px per iteration).</p>
         <div class="row"><label>LR mult</label><input id="p-lrMult" type="number" step="0.1" /></div>
+        <p class="help"><span class="unit">unitless multiplier</span> Scales every base rate below: the quickest single knob for faster but riskier (higher) or calmer (lower) training.</p>
         <div class="row"><label>pos</label><input id="p-lrPosBase" type="number" step="0.001" /></div>
+        <p class="help"><span class="unit">pixels per iteration</span> Site position.</p>
         <div class="row"><label>tau</label><input id="p-lrTauBase" type="number" step="0.001" /></div>
+        <p class="help"><span class="unit">natural-log units of τ per iteration</span> τ is edge sharpness, measured per image long side: a site's edge blends over roughly (long side ÷ τ) px. E.g. log τ = 5 (τ ≈ 148) on a 768 px image ≈ 5 px edges; a step of 0.03 changes τ by about 3%.</p>
         <div class="row"><label>radius</label><input id="p-lrRadiusBase" type="number" step="0.001" /></div>
+        <p class="help"><span class="unit">pixels per iteration</span> Radius is an offset in pixels that lets a site claim more (or less) area than its neighbours. Only differences between neighbouring sites matter.</p>
         <div class="row"><label>color</label><input id="p-lrColorBase" type="number" step="0.001" /></div>
+        <p class="help"><span class="unit">color-space units per iteration</span> RGB: 0–1 per channel, so 0.01 ≈ 2.5 levels. Log intensity + chroma: natural-log units, so 0.01 ≈ a 1% change.</p>
         <div class="row"><label>dir</label><input id="p-lrDirBase" type="number" step="0.001" /></div>
+        <p class="help"><span class="unit">unit-vector components per iteration (≈ radians for small turns)</span> Direction of the site's stretch. Frozen for the first 50 iterations.</p>
         <div class="row"><label>aniso</label><input id="p-lrAnisoBase" type="number" step="0.001" /></div>
-
-        <h3>Site growth</h3>
-        <div class="row" title="Rate-distortion slope: squared error (8-bit levels², RGB) a site must remove per bit it costs. 0 = fixed site count; otherwise 'sites' is the cap."><label>λ (0 = off)</label><input id="p-growLambda" type="number" step="10" /></div>
-        <div class="row"><label>start sites</label><input id="p-growInitSites" type="number" /></div>
-        <div class="row"><label>every iters</label><input id="p-growEvery" type="number" /></div>
-        <div class="row"><label>end iter</label><input id="p-growEndIter" type="number" placeholder="60% of iters" /></div>
-        <div class="row" title="Blur the fit target to sigma = this × site spacing while growing (0 = off)."><label>blur × spacing</label><input id="p-growBlur" type="number" step="0.05" /></div>
+        <p class="help"><span class="unit">natural log of the aspect ratio per iteration</span> Anisotropy: 0 = round, ±1 ≈ 2.7:1, clamped to ±2 ≈ 7.4:1. Frozen for the first 50 iterations.</p>
       </aside>
 
       <section class="view">
@@ -569,6 +619,6 @@
       </section>
     </div>
 
-    <script type="module" src="train.js?v=noflow-20261017"></script>
+    <script type="module" src="train.js?v=help-20261017"></script>
   </body>
 </html>
