@@ -4,8 +4,8 @@ The WebGPU optimizer: the training loop, Adam schedule, GPU buffers and kernel d
 It has no DOM dependencies, so the browser pages in `web/` and the Node runner in `node/`
 both import it. Hyperparameter defaults come from `training_config.json`.
 
-By default the site count is fixed for the whole run. With `growLambda > 0` the trainer adds
-sites by rate-distortion: every `growEvery` iterations, each site-spacing cell gets a site if
+By default (`growLambda` 400) the trainer adds sites by rate-distortion; `growLambda = 0` keeps
+the site count fixed for the whole run. With growth on: every `growEvery` iterations, each site-spacing cell gets a site if
 the best error one site could remove there (scored over the cell's dyadic sub-blocks) beats
 `growLambda × BITS_PER_SITE`, so growth runs coarse to fine and stops when sites no longer pay
 for their bits. `sites` is then the cap. Sites are never removed (no prune).

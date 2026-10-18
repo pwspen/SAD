@@ -5,7 +5,7 @@
 
 import { loadShaders, tileSlotsForLimit } from "../trainer/shader_loader.js?v=shared-wgsl-20261017";
 import { requestTrainingDevice } from "../trainer/device.js?v=shared-wgsl-20261017";
-import { Trainer, buildArgs, GRAD_GROUPS, lrSchedule } from "../trainer/trainer.js?v=noflow-20261017";
+import { Trainer, buildArgs, GRAD_GROUPS, lrSchedule } from "../trainer/trainer.js?v=grow-default-20261017";
 import { loadImageToFloat32, loadMaskRgba32Float, whiteMaskRgba32Float } from "../trainer/textures.js?v=shared-wgsl-20261017";
 import { loadSitesFromFile, serializeSitesTxt, triggerDownload, floatImageToRgba8, computeBpp, BITS_PER_SITE } from "../trainer/io.js?v=shared-wgsl-20261017";
 import { SITE_FLOATS } from "../trainer/params.js?v=shared-wgsl-20261017";

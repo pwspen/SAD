@@ -109,7 +109,8 @@ export function buildArgs(config, overrides = {}) {
     // Total iters = warmupIters + decayIters; an explicit "iters" override
     // (e.g. from sweeps) sets the total and shortens the decay phase to fit.
     warmupIters: Math.max(0, Math.floor(Number(pick("warmupIters", "WARMUP_ITERS", 100)))),
-    sites: Number(pick("sites", null, 1000)),
+    // Fixed site count, or with growth on (the default) the cap.
+    sites: Number(pick("sites", null, 20000)),
     candFreq: Number(pick("candFreq", "CAND_UPDATE_FREQ", 1)),
     candHilbertWindow: Number(pick("candHilbertWindow", "CAND_HILBERT_WINDOW", 0)),
     candHilbertProbes: Number(pick("candHilbertProbes", "CAND_HILBERT_PROBES", 0)),
@@ -139,8 +140,10 @@ export function buildArgs(config, overrides = {}) {
     // Site growth (rate-distortion). growLambda is the final slope -dD/dR: the
     // squared error (8-bit levels², summed over RGB) a site must remove per bit
     // it costs (BITS_PER_SITE bits). 0 = off: the site count stays fixed. With
-    // growth on, `sites` is the cap and runs start from growInitSites.
-    growLambda: Number(pick("growLambda", "GROW_LAMBDA", 0)),
+    // growth on, `sites` is the cap and runs start from growInitSites. 400
+    // lands around 4-9k sites on Kodak; there is no single best λ, it picks
+    // the bpp/PSNR operating point.
+    growLambda: Number(pick("growLambda", "GROW_LAMBDA", 400)),
     growInitSites: Math.max(1, Math.floor(Number(pick("growInitSites", "GROW_INIT_SITES", 256)))),
     growEvery: Math.max(1, Math.floor(Number(pick("growEvery", "GROW_EVERY", 10)))),
     // While growing, the fit target is blurred with sigma = growBlur × site
