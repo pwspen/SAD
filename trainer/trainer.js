@@ -66,7 +66,7 @@ import {
   HilbertEncoder,
   GrowEncoder,
   SiteStatsEncoder,
-} from "./encoders.js?v=gn-20261018";
+} from "./encoders.js?v=loss-20261018";
 
 import { RadixSortUInt2 } from "./radix_sort.js?v=shared-wgsl-20261017";
 import { BITS_PER_SITE } from "./io.js";
@@ -82,6 +82,13 @@ const MAX_PREVIEW_IMAGE_READBACKS = 2;
 // schedule as max(10, PRUNE_START / 2) = 50 with the shared config.
 const ANI_START_ITER = 50;
 const MAX_PREVIEW_SITE_READBACKS = 8;
+
+// Training losses (args.loss): label, and the LOSS id gradients_tiled.wgsl
+// switches on. Growth, λ and PSNR measure squared error either way.
+export const LOSSES = {
+  l1: { label: "L1 (absolute error)", id: 1 },
+  l2: { label: "L2 (squared error)", id: 0 },
+};
 
 // LR schedules (args.lrSchedule). All start with a linear warmup to 1 over
 // `warmupIters`; the run lasts warmupIters + decayIters.
@@ -154,6 +161,7 @@ export function buildArgs(config, overrides = {}) {
     // Site color parameterization (a key of COLOR_SPACES in color_spaces.js).
     // Sites stay RGB outside the trainer; only the optimized params change.
     colorSpace: String(pick("colorSpace", "COLOR_SPACE", "rgb")),
+    loss: String(pick("loss", "LOSS", "l1")),
     lrPosBase: Number(pick("lrPosBase", "LR_POS_BASE", 0.05)),
     lrTauBase: Number(pick("lrTauBase", "LR_TAU_BASE", 0.01)),
     lrRadiusBase: Number(pick("lrRadiusBase", "LR_RADIUS_BASE", 0.02)),
@@ -200,6 +208,9 @@ export function buildArgs(config, overrides = {}) {
   const growEnd = pick("growEndIter", "GROW_END_ITER", null);
   args.growEndIter = growEnd == null || growEnd === "" ? args.iters : Math.max(0, Math.floor(Number(growEnd)));
   colorSpaceFor(args.colorSpace); // fail early on an unknown name
+  if (!LOSSES[args.loss]) {
+    throw new Error(`loss must be one of ${Object.keys(LOSSES).join(", ")} (got "${args.loss}")`);
+  }
   if (!Number.isFinite(args.initLogTau) || !Number.isFinite(args.initRadius)) {
     throw new Error("training_config.json missing INIT_LOG_TAU / INIT_RADIUS (required).");
   }
@@ -236,7 +247,7 @@ export class Trainer {
     this.renderEnc = new RenderEncoder(device, shaders);
     this.renderHashedEnc = new RenderHashedEncoder(device, shaders);
     this.renderTauEnc = new RenderTauHeatmapEncoder(device, shaders);
-    this.gradsEnc = new GradientsEncoder(device, shaders);
+    this.gradsEnc = new GradientsEncoder(device, shaders, { loss: LOSSES[args.loss].id });
     this.adamEnc = new AdamEncoder(device, shaders);
     this.tauEnc = new TauEncoder(device, shaders);
     this.clearI32Enc = new ClearBufferEncoder(device, shaders, { useI32: true });

@@ -228,11 +228,12 @@ export class RenderEncoder {
 
 export class GradientsEncoder {
   // gaussNewton: build the GN_MODE variant (per-site Gauss–Newton diagonal,
-  // see gradients_tiled.wgsl) instead of the loss gradient.
-  constructor(device, shaders, { gaussNewton = false } = {}) {
+  // see gradients_tiled.wgsl) instead of the loss gradient. loss: the LOSS
+  // id (0 = L2, 1 = L1).
+  constructor(device, shaders, { gaussNewton = false, loss = 0 } = {}) {
     this.device = device;
     this.pipeline = makePipeline(device, shaders.GRADIENTS_TILED, "main",
-      gaussNewton ? { GN_MODE: 1 } : undefined);
+      { GN_MODE: gaussNewton ? 1 : 0, LOSS: loss });
     this._views = new Map();
     this._bgs = new Map();
   }

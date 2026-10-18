@@ -683,6 +683,12 @@
           <div class="tip" role="tooltip">What a site's three color numbers mean while optimizing. <b>RGB</b>: red, green, blue on 0–1 (1 = 255 levels). <b>Log intensity + chroma</b>: mean natural-log brightness, then log(R/G) and log(B/G), so a pure brightness change moves one number. Blending, the loss and saved files are always RGB.</div>
         </div>
 
+        <h3>Loss</h3>
+        <div class="param">
+          <div class="row"><label>loss</label><select id="p-loss" aria-label="Training loss"></select></div>
+          <div class="tip" role="tooltip">What training minimizes, per color channel. <b>L2</b> (squared error): each site's color is the mean of the pixels it covers, so a cell straddling black and white goes grey. <b>L1</b> (absolute error): the median instead, so a mostly-white cell goes white and the boundaries are pushed onto the edges. PSNR, growth and λ use squared error either way, so L1 runs score a little lower.</div>
+        </div>
+
         <h3 class="has-tip" tabindex="0">Learning rates<span class="tip" role="tooltip">Adam step sizes. Adam moves a parameter by about its rate per iteration, in that parameter's units, so each unit below is "per iteration". Rate used = base below × <b>LR mult</b> × the LR schedule (set under <b>Schedule</b>), e.g. pos 0.025 × 3 = up to 0.075 px per iteration.</span></h3>
         <div class="param">
           <div class="row"><label>LR mult</label><input id="p-lrMult" type="number" step="0.1" /></div>
@@ -745,6 +751,6 @@
       </section>
     </div>
 
-    <script type="module" src="train.js?v=tuned-20261018"></script>
+    <script type="module" src="train.js?v=loss-20261018"></script>
   </body>
 </html>
