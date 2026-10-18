@@ -107,6 +107,8 @@ const state = {
   spectra: null,         // spectra of the latest render (see currentSpectra())
   siteMI: null,          // { sites, mi } parameter mutual information for the latest readback
   snapAnalysis: null,    // { sites, status, result, error, promise } for the latest sites (see snapAnalysis())
+  sensitivity: null,     // { sites, promise } of Trainer.siteSensitivity() for the latest sites (sensitivityOf())
+  sensitivityHist: null, // { sites, status, result, error } for the sensitivity histogram (sensitivityJob())
   importanceImage: null, // RGBA8 importance map for the current target + mask
   layoutName: null,      // active key in LAYOUTS
   editing: false,        // layout edit mode (drag to move, add / remove, rows & cols)
@@ -459,6 +461,14 @@ const VIEWS = {
                       "the same if every site shared one value of that parameter (its weighted mean), others " +
                       "unchanged; near 0 means the parameter is slack. Predictions are second order, so they " +
                       "overshoot for large snaps." },
+  sensitivity: { label: "Site sensitivity (Gauss–Newton)", kind: "plot", source: "derived", on: ["render", "run"],
+                draw: drawSensitivity,
+                note: "After a run: per parameter group, how many sites (y) have each Gauss–Newton sensitivity " +
+                      "(x, log bins): F = Σ over pixels of (∂render/∂θ)², summed over RGB and the group's " +
+                      "parameters (colors decoded to RGB, 0..1), so nudging θ by δ raises the summed squared " +
+                      "error by about F·δ². Units differ per group (pixels for position, log units for τ and " +
+                      "anisotropy), so compare sites within a panel, not across panels. Sites with F = 0 (no " +
+                      "pixels, or not reachable) are counted in the title." },
   clusterMap: { label: `Snap clusters on the image (k = ${SNAP_MAP_K})`, kind: "image", source: "derived",
                 blank: "#f1f1ec", on: ["render"], draw: drawClusterMap,
                 note: "The latest render, washed out, with each site's centroid in its cluster's color from the " +
@@ -493,8 +503,8 @@ const LAYOUTS = {
   },
   siteStats: {
     label: "Site stats",
-    areas: `"preview    siteMI"
-            "clusterMap siteClusters"`,
+    areas: `"preview    siteMI        sensitivity"
+            "clusterMap siteClusters sensitivity"`,
   },
   editor: {
     label: "Site editor",
@@ -2113,11 +2123,20 @@ function snapAnalysis() {
 function drawSnapViews() {
   if (VIEWS.siteClusters.canvas) drawSnapAnalysis(VIEWS.siteClusters);
   drawClusterMap();
+  if (VIEWS.sensitivity.canvas) drawSensitivity(VIEWS.sensitivity);
+}
+
+// Gauss–Newton diagonal of `sites` (Trainer.siteSensitivity), computed once per
+// sites and shared by the snap analysis and the sensitivity histogram, so the
+// GPU pass runs before the snap analysis starts swapping sites in to re-render.
+function sensitivityOf(trainer, sites) {
+  if (state.sensitivity?.sites !== sites) state.sensitivity = { sites, promise: trainer.siteSensitivity() };
+  return state.sensitivity.promise;
 }
 
 async function runSnapAnalysis(job, trainer) {
   const sites = job.sites;
-  const { F, samples } = await trainer.siteSensitivity();
+  const { F, samples } = await sensitivityOf(trainer, sites);
   const d = SNAP_PARAMS.length;
   const bases = [];
   for (let i = 0; i < state.lastSiteCount; i += 1) if (sites[i * SITE_FLOATS] >= 0) bases.push(i * SITE_FLOATS);
@@ -2221,6 +2240,107 @@ function drawSnapAnalysis(view) {
   ctx.textBaseline = "bottom";
   ctx.fillText(`PSNR loss (dB) from snapping: predicted, re-rendered · ${r.n} sites · base ${r.basePsnr.toFixed(2)} dB`,
                w / 2, h - 8);
+}
+
+// ---- Site sensitivity histogram ----
+// Per GRAD_GROUPS parameter group, a histogram over active sites of the
+// summed Gauss–Newton diagonal F (log bins from the 2nd percentile up; lower
+// values count in the first bin); y = number of sites per bin.
+
+const SENS_BINS = 16;
+
+function sensitivityJob() {
+  const sites = state.lastSites;
+  if (state.sensitivityHist?.sites === sites) return state.sensitivityHist;
+  if (!sites || !state.trainer || state.running) return null;
+  const job = { sites, status: "running", result: null, error: null };
+  const count = state.lastSiteCount;
+  sensitivityOf(state.trainer, sites)
+    .then(({ F }) => { job.result = sensitivityHistograms(F, sites, count); job.status = "done"; })
+    .catch((err) => { job.error = err.message; job.status = "error"; console.error(err); })
+    .finally(() => { if (state.sensitivityHist === job && VIEWS.sensitivity.canvas) drawSensitivity(VIEWS.sensitivity); });
+  state.sensitivityHist = job;
+  return job;
+}
+
+// [{ label, zero, lo, hi, counts }] per group: log10-spaced bins between the
+// smallest and largest positive F over active sites.
+function sensitivityHistograms(F, sites, count) {
+  return GRAD_GROUPS.map(({ label, channels }) => {
+    const vals = [];
+    let zero = 0;
+    for (let i = 0; i < count; i += 1) {
+      if (!(sites[i * SITE_FLOATS] >= 0)) continue;
+      let f = 0;
+      for (const c of channels) f += F[i * 10 + c];
+      if (f > 0 && Number.isFinite(f)) vals.push(Math.log10(f)); else zero += 1;
+    }
+    // Bins span the 2nd percentile to the max; lower values go in the first.
+    vals.sort((a, b) => a - b);
+    let lo = vals.length ? vals[Math.floor(vals.length * 0.02)] : 0, hi = vals.length ? vals.at(-1) : 1;
+    if (hi - lo < 1e-6) { lo -= 0.5; hi += 0.5; }
+    const counts = new Array(SENS_BINS).fill(0);
+    for (const v of vals) counts[Math.max(0, Math.min(SENS_BINS - 1, Math.floor(((v - lo) / (hi - lo)) * SENS_BINS)))] += 1;
+    return { label, zero, lo, hi, counts };
+  });
+}
+
+function drawSensitivity(view) {
+  const p = beginPlot(view);
+  if (!p) return;
+  const { ctx, col, w, h } = p;
+  const job = sensitivityJob();
+  const msg = state.running ? "Runs when training stops"
+    : !job ? "Sites appear after the first render"
+    : job.status === "running" ? "Computing…"
+    : job.status === "error" ? `Failed: ${job.error}` : null;
+  if (msg) {
+    drawEmpty(p, plotBox(p), msg);
+    return;
+  }
+  const groups = job.result;
+  const cols = w > h * 1.2 ? 3 : 2;
+  const rows = Math.ceil(groups.length / cols);
+  const head = PLOT_PAD.top; // below the card's label
+  const cw = w / cols, ch = (h - head) / rows;
+  groups.forEach((g, k) => {
+    const x0 = (k % cols) * cw, y0 = head + Math.floor(k / cols) * ch;
+    const box = { left: x0 + 34, right: x0 + cw - 8, top: y0 + 22, bottom: y0 + ch - 22 };
+    const yMax = Math.max(1, ...g.counts);
+    const yTicks = niceTicks(0, yMax, Math.max(2, Math.floor((box.bottom - box.top) / 22)));
+    const top = Math.max(yMax, yTicks.at(-1));
+    const yOf = (v) => box.bottom - (v / top) * (box.bottom - box.top);
+    ctx.font = PLOT_FONT;
+    ctx.textAlign = "right";
+    ctx.textBaseline = "middle";
+    for (const v of yTicks) {
+      const y = Math.round(yOf(v)) + 0.5;
+      ctx.strokeStyle = col.line;
+      ctx.beginPath(); ctx.moveTo(box.left, y); ctx.lineTo(box.right, y); ctx.stroke();
+      ctx.fillStyle = col.soft;
+      ctx.fillText(String(v), box.left - 4, y);
+    }
+    const bw = (box.right - box.left) / SENS_BINS;
+    ctx.fillStyle = SERIES_COLORS[0];
+    g.counts.forEach((c, b) => {
+      if (!c) return;
+      const y = yOf(c);
+      ctx.fillRect(box.left + b * bw + 0.5, y, Math.max(1, bw - 1), box.bottom - y);
+    });
+    ctx.strokeStyle = col.soft;
+    ctx.beginPath(); ctx.moveTo(box.left, box.bottom + 0.5); ctx.lineTo(box.right, box.bottom + 0.5); ctx.stroke();
+    // x labels: F at the range ends (log scale between).
+    ctx.fillStyle = col.soft;
+    ctx.textBaseline = "top";
+    ctx.textAlign = "left";
+    ctx.fillText(`≤${fmtExp(10 ** g.lo)}`, box.left, box.bottom + 4);
+    ctx.textAlign = "right";
+    ctx.fillText(fmtExp(10 ** g.hi), box.right, box.bottom + 4);
+    ctx.fillStyle = col.dim;
+    ctx.textAlign = "left";
+    ctx.textBaseline = "bottom";
+    ctx.fillText(g.label + (g.zero ? ` · ${g.zero} at 0` : ""), box.left, box.top - 6);
+  });
 }
 
 // The reconstruction, washed out, with each site's centroid in the color of
