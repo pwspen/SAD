@@ -132,7 +132,11 @@ export function buildArgs(config, overrides = {}) {
     // tuned for the other backends' densify/prune schedule, which JS doesn't run.
     // Total iters = warmupIters + decayIters; an explicit "iters" override
     // (e.g. from sweeps) sets the total and shortens the decay phase to fit.
-    warmupIters: Math.max(0, Math.floor(Number(pick("warmupIters", "WARMUP_ITERS", 100)))),
+    // The schedule, LR and growth defaults (and LR_POS_BASE / LR_TAU_BASE in
+    // training_config.json) were tuned for growing 1 -> 100 sites over 1000
+    // iterations, by mean final PSNR over 8 Kodak images, then checked on the
+    // other 16.
+    warmupIters: Math.max(0, Math.floor(Number(pick("warmupIters", "WARMUP_ITERS", 200)))),
     // Site count in "fixed" siteMode (ignored when growing; see below).
     sites: Number(pick("sites", null, 1000)),
     candFreq: Number(pick("candFreq", "CAND_UPDATE_FREQ", 1)),
@@ -145,8 +149,8 @@ export function buildArgs(config, overrides = {}) {
     candInjectCount: Number(pick("candInjectCount", "CAND_INJECT_COUNT", 16)),
     logFreq: Math.max(1, Number(pick("logFreq", null, 50))),
     viewerFreq: Math.max(1, Number(pick("viewerFreq", null, 50))),
-    lrMult: Number(pick("lrMult", "LR_MULT", 3)),
-    lrSchedule: String(pick("lrSchedule", "LR_SCHEDULE", "warmup-cosine")),
+    lrMult: Number(pick("lrMult", "LR_MULT", 8)),
+    lrSchedule: String(pick("lrSchedule", "LR_SCHEDULE", "fixed")),
     // Site color parameterization (a key of COLOR_SPACES in color_spaces.js).
     // Sites stay RGB outside the trainer; only the optimized params change.
     colorSpace: String(pick("colorSpace", "COLOR_SPACE", "rgb")),
@@ -169,17 +173,17 @@ export function buildArgs(config, overrides = {}) {
     // over RGB) a new site must remove per bit it costs (BITS_PER_SITE bits).
     // 0 = no early stop (any positive gain still qualifies).
     growLambda: Math.max(0, Number(pick("growLambda", "GROW_LAMBDA", 400))),
-    growMaxSites: Math.max(1, Math.floor(Number(pick("growMaxSites", "GROW_MAX_SITES", 64)))),
+    growMaxSites: Math.max(1, Math.floor(Number(pick("growMaxSites", "GROW_MAX_SITES", 100)))),
     growInitSites: Math.max(1, Math.floor(Number(pick("growInitSites", "GROW_INIT_SITES", 1)))),
-    growEvery: Math.max(1, Math.floor(Number(pick("growEvery", "GROW_EVERY", 25)))),
-    growFactor: Number(pick("growFactor", "GROW_FACTOR", 2)),
+    growEvery: Math.max(1, Math.floor(Number(pick("growEvery", "GROW_EVERY", 10)))),
+    growFactor: Number(pick("growFactor", "GROW_FACTOR", 3)),
     // While growing, the fit target is blurred with sigma = growBlur × site
     // spacing √(mask area / sites); 0 = always fit the original.
     growBlur: Math.max(0, Number(pick("growBlur", "GROW_BLUR", 0))),
   };
   args.decayIters = Math.max(0, Math.floor(Number(overrides.iters !== undefined && overrides.decayIters === undefined
     ? overrides.iters - args.warmupIters
-    : pick("decayIters", "DECAY_ITERS", 500))));
+    : pick("decayIters", "DECAY_ITERS", 800))));
   args.iters = args.warmupIters + args.decayIters;
   // "fixed": exactly `sites` for the whole run. "grow": rate-distortion growth.
   const siteMode = pick("siteMode", "SITE_MODE", "grow");

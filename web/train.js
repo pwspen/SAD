@@ -192,7 +192,7 @@ function updatePlanSummary() {
       lines.push(`Growth: none, start sites (${start}) ≥ max sites.`);
     } else if (growEnd < n) {
       lines.push(`Growth: ${seqText} — ${counts.length} steps of ×${args.growFactor} every ${args.growEvery}, ` +
-                 `done at iter <b>${growEnd}</b> (earlier if λ (stop) ends it).`);
+                 `done at iter <b>${growEnd}</b> if every step is full (λ (stop) can trim steps, which adds more, or end growth early).`);
     } else {
       const reached = seq[Math.min(seq.length - 1, Math.floor((n - 1) / args.growEvery))];
       lines.push(`Growth: ${seqText} would finish at iter ${growEnd}, ` +
