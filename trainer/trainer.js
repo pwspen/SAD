@@ -180,6 +180,61 @@ export function growthCounts(start, factor, max) {
   return counts;
 }
 
+// How the site budget is spent over the run (args.growSchedule).
+export const GROW_SCHEDULES = {
+  decay: "cooling (rate decays)", // rate falls exponentially; the budget is used up by growEndIter
+  geometric: "× factor per step",   // × growFactor every step until max sites
+};
+
+// "decay" schedule: sites are added at a rate r(t) = r0·e^(-t/τ) that spends
+// the budget (max - start) over the horizon H (growEndIter, the run's end by
+// default). growFrontLoad = r0 / (budget / H), the starting rate as a multiple
+// of the average one: 1 is linear, 10 adds ~2/3 of the budget in the first
+// ~H/10. Returns τ/H, solving f·τ·(1 - e^(-1/τ)) = 1 (Infinity for f ≤ 1).
+function decayTau(frontLoad) {
+  if (!(frontLoad > 1)) return Infinity;
+  let lo = 1e-6, hi = 1e6;
+  for (let i = 0; i < 100; i += 1) {
+    const mid = Math.sqrt(lo * hi);
+    if (frontLoad * mid * -Math.expm1(-1 / mid) < 1) lo = mid; else hi = mid;
+  }
+  return Math.sqrt(lo * hi);
+}
+
+// Fraction of the budget the "decay" schedule has added by t/H = x.
+function decayFraction(x, tau) {
+  x = Math.min(1, Math.max(0, x));
+  return Number.isFinite(tau) ? Math.expm1(-x / tau) / Math.expm1(-1 / tau) : x;
+}
+
+// Site count the schedule wants after the growth step at iteration `it`, from
+// the run's start count `start` and the current count `n`. "geometric" is
+// relative to n (so steps λ trimmed are made up later); "decay" follows its
+// curve from `start`.
+export function growTarget(args, start, n, it) {
+  const max = args.growMaxSites;
+  if (args.growSchedule === "geometric") return growthCounts(n, args.growFactor, max)[0] ?? n;
+  const budget = Math.max(0, max - start);
+  const frac = decayFraction(it / Math.max(1, args.growEndIter), decayTau(args.growFrontLoad));
+  return Math.min(max, start + Math.ceil(budget * frac - 1e-9));
+}
+
+// The planned growth steps, every step full: [{ it, count }] for each step
+// that adds sites. "geometric" isn't cut at the run's end (callers check);
+// "decay" ends by growEndIter.
+export function growthPlan(args, start) {
+  if (args.growSchedule === "geometric") {
+    return growthCounts(start, args.growFactor, args.growMaxSites)
+      .map((count, k) => ({ it: (k + 1) * args.growEvery, count }));
+  }
+  const plan = [];
+  for (let it = args.growEvery, n = start; it < args.growEndIter && n < args.growMaxSites; it += args.growEvery) {
+    const target = growTarget(args, start, n, it);
+    if (target > n) plan.push({ it, count: (n = target) });
+  }
+  return plan;
+}
+
 // Collect default args from a training_config.json-style object + user
 // overrides. Overrides use the argument name (e.g. "iters") and take precedence
 // over the matching config-style key (e.g. "DEFAULT_ITERS").
@@ -231,8 +286,11 @@ export function buildArgs(config, overrides = {}) {
     eps: Number(pick("eps", "EPS", 1e-8)),
     maxDim: Number(pick("maxDim", "MAX_DIM", 2048)),
     // Site growth, used when siteMode is "grow": start from growInitSites and
-    // every growEvery iterations multiply the count by growFactor (at least +1)
-    // up to growMaxSites (which also sizes the GPU buffers). growLambda stops it
+    // every growEvery iterations add sites up to growMaxSites (which also sizes
+    // the GPU buffers), on the growSchedule curve: "decay" (default) adds them
+    // at a rate starting at growFrontLoad × the average and cooling
+    // exponentially so the budget is spent by growEndIter; "geometric"
+    // multiplies the count by growFactor (at least +1). growLambda stops it
     // early: the slope -dD/dR, i.e. the squared error (8-bit levels², summed
     // over RGB) a new site must remove per bit it costs (BITS_PER_SITE bits).
     // 0 = no early stop (any positive gain still qualifies).
@@ -240,6 +298,8 @@ export function buildArgs(config, overrides = {}) {
     growMaxSites: Math.max(1, Math.floor(Number(pick("growMaxSites", "GROW_MAX_SITES", 100)))),
     growInitSites: Math.max(1, Math.floor(Number(pick("growInitSites", "GROW_INIT_SITES", 1)))),
     growEvery: Math.max(1, Math.floor(Number(pick("growEvery", "GROW_EVERY", 10)))),
+    growSchedule: String(pick("growSchedule", "GROW_SCHEDULE", "decay")),
+    growFrontLoad: Number(pick("growFrontLoad", "GROW_FRONT_LOAD", 10)),
     growFactor: Number(pick("growFactor", "GROW_FACTOR", 3)),
     // While growing, the fit target is blurred with sigma = growBlur × site
     // spacing √(mask area / sites); 0 = always fit the original.
@@ -264,11 +324,15 @@ export function buildArgs(config, overrides = {}) {
     throw new Error(`siteMode must be "fixed" or "grow" (got "${args.siteMode}")`);
   }
   if (!(args.growFactor > 1)) throw new Error(`growFactor must be > 1 (got ${args.growFactor})`);
+  if (!GROW_SCHEDULES[args.growSchedule]) {
+    throw new Error(`growSchedule must be one of ${Object.keys(GROW_SCHEDULES).join(", ")} (got "${args.growSchedule}")`);
+  }
+  if (!(args.growFrontLoad >= 1)) throw new Error(`growFrontLoad must be ≥ 1 (got ${args.growFrontLoad})`);
   if (!(args.lrSchedule in LR_SCHEDULES)) {
     throw new Error(`lrSchedule must be one of ${Object.keys(LR_SCHEDULES).join(", ")} (got "${args.lrSchedule}")`);
   }
   // Hidden safety stop for growth (not in the UI): growth normally ends at
-  // growMaxSites or by λ. Default: never.
+  // growMaxSites or by λ. Default: the run's end. Also the "decay" horizon.
   const growEnd = pick("growEndIter", "GROW_END_ITER", null);
   args.growEndIter = growEnd == null || growEnd === "" ? args.iters : Math.max(0, Math.floor(Number(growEnd)));
   colorSpaceFor(args.colorSpace); // fail early on an unknown name
@@ -511,6 +575,7 @@ export class Trainer {
     // Growth state: the iteration it ended (null while growing) and why.
     this.growDoneIter = this.usesGrow ? null : 0;
     this.growGen = 0; // growth steps that added sites (see growLrDecay)
+    this.growStartCount = initSiteCount; // where the "decay" schedule's curve starts
     // CPU copy of each site's birth growth step (adam[21]), for per-site LRs.
     this.siteBirthGen = new Uint32Array(this.bufferCapacity);
     this.growSteps = 0; // growth steps taken (growPatience)
@@ -830,8 +895,8 @@ export class Trainer {
   }
 
   // ---- Site growth ----
-  // Rate-distortion growth in batches. Every growEvery iterations the count is
-  // multiplied by growFactor (growthCounts). growMode "split": each existing
+  // Rate-distortion growth in batches. Every growEvery iterations the count
+  // goes up to the growSchedule curve's next value (growTarget). growMode "split": each existing
   // site is scored by the error a two-way split of its cell would remove
   // (siteSplit, from site_stats.wgsl's moments) and the best cells are split,
   // one new site each. growMode "insert": new sites are picked one at a time
@@ -1026,6 +1091,9 @@ export class Trainer {
     if (this.siteCount >= this.bufferCapacity) { this._endGrowth(it, "reached max sites"); return; }
     if (it >= args.growEndIter) { this._endGrowth(it, "growEndIter safety stop"); return; }
     if (it === 0 || it % args.growEvery !== 0) return;
+    const n0 = this.siteCount;
+    const target = growTarget(args, this.growStartCount, n0, it);
+    if (target <= n0) return; // "decay" late in the run: nothing due this step
     if (args.growPatience > 0 && this.best && this.growSteps - this.best.growStep >= args.growPatience) {
       this._restoreBest(`no better ${args.keepBest} score in ${args.growPatience} growth step(s)`);
       this._endGrowth(it, `patience: ${args.growPatience} growth step(s) without a better ${args.keepBest} score`);
@@ -1037,8 +1105,6 @@ export class Trainer {
 
     const device = this.device;
     const queue = device.queue;
-    const n0 = this.siteCount;
-    const target = growthCounts(n0, args.growFactor, this.bufferCapacity)[0];
     const mdl = args.growCriterion === "mdl";
     if (mdl) {
       const bits = cellMdlBits(stats, n0, this.activeEstimate, this.samples);
@@ -1109,7 +1175,8 @@ export class Trainer {
 
     this._updateFitTarget();
     this._log(`Grow @${it}: +${k} → ${n1} sites` +
-              (k < target - n0 ? ` (${target - n0} wanted; the rest under λ)` : "") +
+              (k < target - n0 ? ` (${target - n0} wanted; the rest under λ` +
+                (args.growMode === "split" && target - n0 > n0 ? " or no cell left to split)" : ")") : "") +
               ` | best ${args.growMode === "insert" ? "insertion" : "split"} ` +
               `${fmtLambda(batch.best / BITS_PER_SITE)} ${this._gainUnit()}/bit` +
               (this.fitSigma ? ` | blur σ ${this.fitSigma.toFixed(1)}px` : ""));

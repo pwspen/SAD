@@ -5,7 +5,7 @@
 
 import { loadShaders, tileSlotsForLimit } from "../trainer/shader_loader.js?v=shared-wgsl-20261017";
 import { requestTrainingDevice } from "../trainer/device.js?v=shared-wgsl-20261017";
-import { Trainer, buildArgs, GRAD_GROUPS, lrSchedule, LR_SCHEDULES, LOSSES, GROW_MODES, GROW_CRITERIA, KEEP_BEST, growthCounts } from "../trainer/trainer.js?v=no-warmup-20261018";
+import { Trainer, buildArgs, GRAD_GROUPS, lrSchedule, LR_SCHEDULES, LOSSES, GROW_MODES, GROW_CRITERIA, KEEP_BEST, GROW_SCHEDULES, growthPlan } from "../trainer/trainer.js?v=grow-decay-20261018";
 import { loadImageToFloat32, loadMaskRgba32Float, whiteMaskRgba32Float } from "../trainer/textures.js?v=shared-wgsl-20261017";
 import { loadSitesFromFile, serializeSitesTxt, triggerDownload, floatImageToRgba8, computeBpp, BITS_PER_SITE } from "../trainer/io.js?v=shared-wgsl-20261017";
 import { SITE_FLOATS } from "../trainer/params.js?v=shared-wgsl-20261017";
@@ -61,6 +61,8 @@ const UI_FIELDS = [
   ["growLambda", "p-growLambda"],
   ["growInitSites", "p-growInitSites"],
   ["growMaxSites", "p-growMaxSites"],
+  ["growSchedule", "p-growSchedule"],
+  ["growFrontLoad", "p-growFrontLoad"],
   ["growFactor", "p-growFactor"],
   ["growEvery", "p-growEvery"],
   ["growBlur", "p-growBlur"],
@@ -170,6 +172,8 @@ function applyConfigToForm(config, overrides = {}) {
     .replaceChildren(...Object.entries(LOSSES).map(([key, loss]) => new Option(loss.label, key)));
   document.getElementById("p-growMode")
     .replaceChildren(...Object.entries(GROW_MODES).map(([key, label]) => new Option(label, key)));
+  document.getElementById("p-growSchedule")
+    .replaceChildren(...Object.entries(GROW_SCHEDULES).map(([key, label]) => new Option(label, key)));
   document.getElementById("p-growCriterion")
     .replaceChildren(...Object.entries(GROW_CRITERIA).map(([key, label]) => new Option(label, key)));
   document.getElementById("p-keepBest")
@@ -220,12 +224,18 @@ function updatePlanSummary() {
   let growEnd = 0;
   if (args.siteMode === "grow") {
     const start = state.initSites ? state.initSites.count : args.growInitSites;
-    const counts = growthCounts(start, args.growFactor, args.growMaxSites);
-    growEnd = counts.length * args.growEvery;
+    const plan = growthPlan(args, start);
+    const counts = plan.map((p) => p.count);
+    growEnd = plan.length ? plan.at(-1).it : 0;
     const seq = [start, ...counts];
     const seqText = seq.length > 7 ? `${seq.slice(0, 4).join(", ")}, …, ${seq.at(-1)}` : seq.join(", ");
     if (!counts.length) {
       lines.push(`Growth: none, start sites (${start}) ≥ max sites.`);
+    } else if (args.growSchedule === "decay") {
+      const half = plan.find((p) => p.count - start >= (args.growMaxSites - start) / 2);
+      lines.push(`Growth: ${seqText} — cooling from ${args.growFrontLoad}× the average rate, ` +
+                 `half the budget by iter ${half ? half.it : growEnd}, all of it by iter <b>${growEnd}</b> ` +
+                 `if every step is full (λ (stop) can end growth early).`);
     } else if (growEnd < n) {
       lines.push(`Growth: ${seqText} — ${counts.length} steps of ×${args.growFactor} every ${args.growEvery}, ` +
                  `done at iter <b>${growEnd}</b> if every step is full (λ (stop) can trim steps, which adds more, or end growth early).`);
@@ -261,6 +271,7 @@ function updatePlanSummary() {
 function syncSiteFields() {
   const mode = document.getElementById("p-siteMode").value;
   ui.paramsPanel.dataset.siteMode = mode;
+  ui.paramsPanel.dataset.growSchedule = document.getElementById("p-growSchedule").value;
   const locked = mode === "grow" ? "p-growInitSites" : "p-sites";
   for (const id of ["p-sites", "p-growInitSites"]) {
     const el = document.getElementById(id);
@@ -2607,12 +2618,12 @@ async function startTraining() {
   state.growthGain = [];
   state.lrHistory = [];
   state.snapAnalysis = null;
-  // Growth multiplies the count by growFactor every growEvery iterations, so
-  // its end (where "decay after growth" starts decaying) is predictable unless
-  // λ stops it early; the plan is corrected once the trainer reports the real end.
+  // Growth follows growSchedule, so its end (where "decay after growth"
+  // starts decaying) is predictable unless λ stops it early; the plan is
+  // corrected once the trainer reports the real end.
   const startCount = init ? init.count : args.growInitSites;
   const plannedGrowEnd = args.siteMode !== "grow" ? 0
-    : Math.min(args.growEndIter, growthCounts(startCount, args.growFactor, args.growMaxSites).length * args.growEvery);
+    : Math.min(args.growEndIter, growthPlan(args, startCount).at(-1)?.it ?? 0);
   state.runSiteMode = args.siteMode;
   state.lastGrowth = null;
   state.lrPlan = { iters: args.iters, lrMult: args.lrMult,
@@ -2625,7 +2636,9 @@ async function startTraining() {
   await refreshViews("run");
 
   const sitesDesc = args.siteMode === "grow"
-    ? `grow ${startCount} → ${Math.max(args.growMaxSites, startCount)} by ${GROW_MODES[args.growMode]}, ×${args.growFactor} every ${args.growEvery} iters ` +
+    ? `grow ${startCount} → ${Math.max(args.growMaxSites, startCount)} by ${GROW_MODES[args.growMode]}, ` +
+      (args.growSchedule === "decay" ? `cooling from ${args.growFrontLoad}× avg rate` : `×${args.growFactor}`) +
+      ` every ${args.growEvery} iters ` +
       `(λ stop ${args.growLambda})` + (args.growLrDecay !== 1 ? `, older sites' LR ×${args.growLrDecay} per step` : "")
     : `${initSiteCount} fixed`;
   appendLog(`Target: ${width}×${height} | sites: ${sitesDesc} | iters: ${args.iters} | lr ×${args.lrMult} ${LR_SCHEDULES[args.lrSchedule]} | color: ${COLOR_SPACES[args.colorSpace].label} | loss: ${LOSSES[args.loss].label} | refresh: ${args.logFreq}`);
@@ -3318,6 +3331,7 @@ async function main() {
   ui.initSitesInput.addEventListener("change", handleInitSitesInput);
   ui.initSitesClear.addEventListener("click", clearInitSites);
   document.getElementById("p-siteMode").addEventListener("change", syncSiteFields);
+  document.getElementById("p-growSchedule").addEventListener("change", syncSiteFields);
   ui.paramsPanel.addEventListener("input", updatePlanSummary);
   ui.startBtn.addEventListener("click", startTraining);
   ui.stopBtn.addEventListener("click", stopTraining);

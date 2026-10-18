@@ -6,8 +6,11 @@ both import it. Hyperparameter defaults come from `training_config.json`.
 
 `siteMode` picks how many sites a run uses:
 
-- `"grow"` (default): start from `growInitSites` and every `growEvery` iterations multiply the
-  count by `growFactor` (at least +1), up to `growMaxSites`. Each batch splits the cells whose color
+- `"grow"` (default): start from `growInitSites` and every `growEvery` iterations add sites, up
+  to `growMaxSites`, following `growSchedule`: `"decay"` (default) adds them at a rate that
+  starts at `growFrontLoad` × the average rate (budget / run length; 1 = linear) and cools
+  exponentially so the whole budget is spent by the run's end (`growEndIter`); `"geometric"`
+  multiplies the count by `growFactor` (at least +1) each step. Each batch splits the cells whose color
   structure a second site would explain best (the variance explained by a linear color ramp
   across the cell): the site moves to one half, a new site takes the other. Only splits whose
   gain beats `growLambda × BITS_PER_SITE` qualify (0 = any positive gain), so λ can
