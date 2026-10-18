@@ -99,6 +99,7 @@ const state = {
   layoutName: null,      // active key in LAYOUTS
   editing: false,        // layout edit mode (drag to move, add / remove, rows & cols)
   dragId: null,          // view being dragged in edit mode
+  showCentroids: true,   // centroid dots over the preview (its card's checkbox)
 };
 
 const ui = {
@@ -318,7 +319,7 @@ const VIEWS = {
                 note: `The target image, downscaled to at most ${DEMO_MAX_IMAGE_SIDE} px per side.` },
   preview:    { label: "Reconstruction + centroids", kind: "image", source: "model", overlay: true, blank: "#0a0a0f",
                 on: ["render"], draw: drawPreview,
-                note: "The trainer's latest render, with site centroids blinking on top." },
+                note: "The trainer's latest render, with site centroids on top (the dots checkbox hides them)." },
   residual:   { label: "Residual |recon − target|", kind: "image", source: "derived", blank: "#000004",
                 on: ["render"], draw: drawResidual,
                 note: "Mean |recon − target| over RGB on a fixed 0–0.25 scale." },
@@ -492,9 +493,23 @@ function buildCards(name) {
     const canvas = document.createElement("canvas");
     card.append(label, canvas);
     if (view.overlay) {
-      view.overlayCanvas = document.createElement("canvas");
-      view.overlayCanvas.className = "overlay-canvas";
-      card.append(view.overlayCanvas);
+      const overlay = document.createElement("canvas");
+      overlay.className = "overlay-canvas";
+      overlay.hidden = !state.showCentroids;
+      card.append(overlay);
+      view.overlayCanvas = overlay;
+      const toggle = document.createElement("label");
+      toggle.className = "overlay-toggle";
+      toggle.title = "Show site centroids";
+      const box = document.createElement("input");
+      box.type = "checkbox";
+      box.checked = state.showCentroids;
+      box.addEventListener("change", () => {
+        state.showCentroids = box.checked;
+        overlay.hidden = !box.checked;
+      });
+      toggle.append(box, "dots");
+      card.append(toggle);
     }
     if (view.hit) attachPlotHover(view, card, canvas);
     if (state.editing) {

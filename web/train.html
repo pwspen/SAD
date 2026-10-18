@@ -341,12 +341,26 @@
       .canvas-card .overlay-canvas {
         position: absolute;
         pointer-events: none;
-        /* Centroid dots toggle on/off every second so the render underneath is visible. */
-        animation: overlay-blink 2s step-end infinite;
       }
-      @keyframes overlay-blink {
-        50% { visibility: hidden; }
+      .canvas-card .overlay-canvas[hidden] { display: none; }
+      .overlay-toggle {
+        position: absolute;
+        bottom: 10px;
+        right: 12px;
+        z-index: 1;
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        cursor: pointer;
+        font-size: 10.5px;
+        color: var(--text-dim);
+        background: rgba(255, 255, 255, 0.82);
+        padding: 3px 8px;
+        border-radius: 4px;
+        backdrop-filter: blur(6px);
+        border: 1px solid var(--line-soft);
       }
+      .overlay-toggle input { margin: 0; accent-color: var(--accent); cursor: pointer; }
       .canvas-card.plot canvas {
         width: 100%;
         height: 100%;
@@ -751,6 +765,6 @@
       </section>
     </div>
 
-    <script type="module" src="train.js?v=loss-20261018"></script>
+    <script type="module" src="train.js?v=dots-toggle2-20261018"></script>
   </body>
 </html>
