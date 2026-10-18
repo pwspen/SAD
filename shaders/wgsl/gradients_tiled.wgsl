@@ -17,7 +17,7 @@
 // `if (guard) { work }` with no return inside.
 //
 // GN_MODE (a pipeline-overridable constant) turns the same pass into the
-// Gauss–Newton diagonal of the squared-error loss: per site and parameter,
+// Gauss–Newton diagonal of squared error (not the L1 training loss): per site and parameter,
 // Σ_pixels Σ_rgb (∂pred/∂θ)², with color taken in decoded RGB. That is the
 // predicted rise in summed squared error per unit² change of θ, used by the
 // viewer's site-clustering analysis; training never runs it. GN sums skip the
@@ -163,7 +163,10 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>,
           }
         }
         let tgt = textureLoad(targetTex, vec2<i32>(gid.xy), 0).rgb;
-        let dL_dpred = 2.0 * (pred - tgt);
+        // L1 loss Σ |pred − tgt|: each site's color settles at the weighted
+        // median of its pixels rather than the mean, so a cell that is mostly
+        // one color takes that color instead of a blend. sign(0) = 0.
+        let dL_dpred = sign(pred - tgt);
         let dL_ok = !is_bad3(dL_dpred);
         if (dL_ok) {
           for (var i = 0u; i < 8u; i = i + 1u) {
