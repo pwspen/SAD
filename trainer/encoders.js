@@ -459,3 +459,26 @@ export class GrowEncoder {
     dispatch1D(encoder, this.gainPipeline, bg, Math.ceil(cellCount / 64));
   }
 }
+
+// Site growth: per-site owner moments and removal deltas (site_stats.wgsl).
+export class SiteStatsEncoder {
+  constructor(device, shaders) {
+    this.device = device;
+    this.pipeline = makePipeline(device, shaders.SITE_STATS);
+    this._views = new Map();
+  }
+  encode(encoder, sitesBuffer, statsParams, cand0, cand1, fitTex, maskTex, statsBuffer, width, height) {
+    const view = (t) => getTextureView(this._views, t);
+    const bg = this.device.createBindGroup({ layout: this.pipeline.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: { buffer: sitesBuffer } },
+      { binding: 1, resource: { buffer: statsParams } },
+      { binding: 2, resource: view(cand0) },
+      { binding: 3, resource: view(cand1) },
+      { binding: 4, resource: view(fitTex) },
+      { binding: 5, resource: view(maskTex) },
+      { binding: 6, resource: { buffer: statsBuffer } },
+    ] });
+    encoder.clearBuffer(statsBuffer);
+    dispatch2D(encoder, this.pipeline, bg, Math.ceil(width / 16), Math.ceil(height / 16));
+  }
+}

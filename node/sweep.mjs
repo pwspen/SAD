@@ -202,7 +202,7 @@ async function runOne(ctx, run) {
     }
     return {
       name, ...run, startedAt, status: "ok",
-      finalPsnr, bestPsnr: final.bestPsnr, sites: final.count, growStop: final.growStop, growDoneIter: final.growDoneIter,
+      finalPsnr, bestPsnr: final.bestPsnr, sites: final.count, growStop: final.growStop, growDoneIter: final.growDoneIter, growthGain: final.growthGain,
       bpp: computeBpp(final.count, final.width, final.height), bitsPerSite: BITS_PER_SITE,
       trainSeconds, itPerSecond: args.iters / Math.max(trainSeconds, 1e-6),
       args, curve,

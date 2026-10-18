@@ -5,7 +5,7 @@
 
 import { loadShaders, tileSlotsForLimit } from "../trainer/shader_loader.js?v=shared-wgsl-20261017";
 import { requestTrainingDevice } from "../trainer/device.js?v=shared-wgsl-20261017";
-import { Trainer, buildArgs, GRAD_GROUPS, lrSchedule, LR_SCHEDULES, growthCounts } from "../trainer/trainer.js?v=schedule-20261017";
+import { Trainer, buildArgs, GRAD_GROUPS, lrSchedule, LR_SCHEDULES, growthCounts } from "../trainer/trainer.js?v=gain-20261018";
 import { loadImageToFloat32, loadMaskRgba32Float, whiteMaskRgba32Float } from "../trainer/textures.js?v=shared-wgsl-20261017";
 import { loadSitesFromFile, serializeSitesTxt, triggerDownload, floatImageToRgba8, computeBpp, BITS_PER_SITE } from "../trainer/io.js?v=shared-wgsl-20261017";
 import { SITE_FLOATS } from "../trainer/params.js?v=shared-wgsl-20261017";
@@ -79,6 +79,7 @@ const state = {
   bppRuns: [],           // [{ sites, bpp, colorSpace, points: [{ it, psnr }] }] per run on this target; last is current
   gradHistory: [],       // [{ it, stats }] per-param |grad| mean/max from log ticks
   lrHistory: [],         // [{ it, lr }] LR multiplier (schedule × LR mult) from log ticks
+  growthGain: [],        // [{ step, addedAt, measuredAt, points: [{ site, predicted, realized }] }] per growth batch
   lrPlan: null,          // { warmupIters, decayIters, lrMult, kind, growDoneIter } of the current run
   lastGrowth: null,      // { mode, doneIter, stop, sites, it, iters } at the latest log tick (Schedule summary)
   runSiteMode: null,     // siteMode of the current/last run
@@ -332,6 +333,13 @@ const VIEWS = {
                 draw: drawLrPlot, hit: hitLr,
                 note: "LR multiplier (warmup / cosine-decay schedule × LR mult) the trainer applied to every base " +
                       "LR at each log tick. Dashed: the run's full planned schedule." },
+  growGain:   { label: "Site gain: predicted vs real", kind: "plot", source: "train", on: ["growth", "run"],
+                draw: drawGrowGainPlot, hit: hitGrowGain,
+                note: "One dot per site added by growth. x: the error it was predicted to remove when placed; y: " +
+                      "the error that would come back if it were removed one growth step later, others unchanged " +
+                      "(8-bit levels², summed over RGB and pixels). Diagnostic only; growth never uses it. The " +
+                      "realized side is biased high: by then the site and its neighbours have adapted to each other. " +
+                      "Sites at the bottom edge are worth nothing or harm the fit. Dashed: realized = predicted." },
   bandSnr:    { label: "Band SNR vs iteration", kind: "plot", source: "derived", on: ["render", "run"],
                 draw: drawBandSnrPlot, hit: hitBandSnr,
                 note: "Per luma Laplacian band: 10·log₁₀(Σ L_k(target)² / Σ L_k(recon − target)²), mask-weighted. " +
@@ -375,7 +383,7 @@ const LAYOUTS = {
   plots: {
     label: "Plots",
     areas: `"psnr bpp  lr"
-            "grad grad grad"`,
+            "grad grad growGain"`,
   },
   spectral: {
     label: "Spectral",
@@ -1293,6 +1301,74 @@ function drawLrPlot(view) {
   }
 }
 
+// ---- Predicted vs realized gain of grown sites (diagnostic) ----
+
+function growGainPoints() {
+  const n = state.growthGain.length;
+  return state.growthGain.flatMap((b, bi) => b.points.map((pt) => ({ ...pt, step: b.step, addedAt: b.addedAt, age: n - 1 - bi })));
+}
+
+function drawGrowGainPlot(view) {
+  const p = beginPlot(view);
+  if (!p) return;
+  const pts = growGainPoints();
+  let lo = Infinity, hi = -Infinity;
+  for (const pt of pts) for (const v of [pt.predicted, pt.realized]) if (v > 0) { lo = Math.min(lo, v); hi = Math.max(hi, v); }
+  const r = decadeRange(lo, hi, [1e3, 1e8]);
+  const g = view.geom = plotAxes(plotBox(p), r, { ...r });
+  drawAxes(p, g, { xTitle: "predicted gain (levels²)", yTitle: "realized (levels²)", xFmt: fmtLogTick, yFmt: fmtLogTick,
+                   xSpacing: 44, ySpacing: 26 });
+  if (!pts.length) {
+    drawEmpty(p, g, state.running ? "Waiting for the first growth step…" : "Train in grow mode to see this");
+    return;
+  }
+  drawLine(p, g, [[r.min, r.min], [r.max, r.max]], p.col.soft, { dash: [4, 4], width: 1 });
+  // Newest batch strongest; sites worth ≤ 0 sit on the bottom edge, hollow.
+  const yOf = (pt) => (pt.realized > 0 ? pt.realized : r.min);
+  for (const pt of [...pts].sort((a, b) => b.age - a.age)) {
+    const alpha = Math.max(0.2, 1 - pt.age * 0.15);
+    const x = g.x(pt.predicted), y = g.y(yOf(pt));
+    if (!g.ok(pt.predicted, yOf(pt))) continue;
+    p.ctx.beginPath();
+    p.ctx.arc(x, y, 3, 0, Math.PI * 2);
+    p.ctx.globalAlpha = alpha;
+    if (pt.realized > 0) { p.ctx.fillStyle = PSNR_LINE_COLOR; p.ctx.fill(); }
+    else { p.ctx.strokeStyle = PSNR_LINE_COLOR; p.ctx.lineWidth = 1.5; p.ctx.stroke(); }
+    p.ctx.globalAlpha = 1;
+  }
+  const last = state.growthGain.at(-1);
+  const sum = (b, k) => b.points.reduce((a, q) => a + q[k], 0);
+  const worthless = last.points.filter((q) => q.realized <= 0).length;
+  p.ctx.font = PLOT_FONT;
+  p.ctx.fillStyle = p.col.dim;
+  p.ctx.textAlign = "right";
+  p.ctx.textBaseline = "top";
+  p.ctx.fillText(`step ${last.step}: realized/predicted ${(sum(last, "realized") / sum(last, "predicted")).toFixed(2)} · ` +
+                 `${worthless}/${last.points.length} worth ≤ 0`, g.right, g.top + 2);
+  const hover = view.hoverKey != null ? pts[view.hoverKey] : null;
+  if (!hover) return;
+  drawMarker(p, g, hover.predicted, yOf(hover), PSNR_LINE_COLOR, 5);
+  drawTooltip(p, g, g.x(hover.predicted), g.y(yOf(hover)), {
+    header: [`site ${hover.site} · step ${hover.step} (iter ${hover.addedAt})`, ""],
+    rows: [
+      { cells: ["predicted", fmtExp(hover.predicted)] },
+      { cells: ["realized", hover.realized > 0 ? fmtExp(hover.realized) : `${hover.realized.toExponential(1)} (≤ 0)`] },
+      { cells: ["ratio", (hover.realized / hover.predicted).toFixed(2)] },
+    ],
+  });
+}
+
+function hitGrowGain(g, mx, my) {
+  const pts = growGainPoints();
+  const lo = g.yr.min;
+  let best = null, bestD = 144; // within 12 px
+  pts.forEach((pt, i) => {
+    const d = (g.x(pt.predicted) - mx) ** 2 + (g.y(pt.realized > 0 ? pt.realized : lo) - my) ** 2;
+    if (d < bestD) { bestD = d; best = i; }
+  });
+  return best;
+}
+
 function hitLr(g, mx) {
   return nearestX(g, state.lrHistory, (d) => d.it, mx);
 }
@@ -1934,6 +2010,7 @@ async function startTraining() {
   state.psnrIters = args.iters;
   state.gradHistory = [];
   state.bandHistory = [];
+  state.growthGain = [];
   state.lrHistory = [];
   // Growth multiplies the count by growFactor every growEvery iterations, so
   // its end (where "decay after growth" starts decaying) is predictable unless
@@ -2009,6 +2086,9 @@ async function startTraining() {
           `image iter ${info.it + 1}/${info.iters} · ${info.itsPerSec.toFixed(1)} it/s · ${info.elapsedSec.toFixed(1)}s`);
         renderMetrics(info);
         await refreshViews("render");
+      } else if (info.type === "growthGain") {
+        state.growthGain.push({ step: info.step, addedAt: info.addedAt, measuredAt: info.measuredAt, points: info.points });
+        await refreshViews("growth");
       } else if (info.type === "sites") {
         state.lastSites = info.sitesData;
         state.lastSiteCount = info.totalSites;

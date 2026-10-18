@@ -66,7 +66,8 @@ import {
   ClearBufferEncoder,
   HilbertEncoder,
   GrowEncoder,
-} from "./encoders.js?v=noflow-20261017";
+  SiteStatsEncoder,
+} from "./encoders.js?v=gain-20261018";
 
 import { RadixSortUInt2 } from "./radix_sort.js?v=shared-wgsl-20261017";
 import { BITS_PER_SITE } from "./io.js";
@@ -239,6 +240,7 @@ export class Trainer {
     this.hilbertEnc = this.usesHilbert ? new HilbertEncoder(device, shaders) : null;
     this.usesGrow = args.siteMode === "grow";
     this.growEnc = this.usesGrow ? new GrowEncoder(device, shaders) : null;
+    this.statsEnc = this.usesGrow ? new SiteStatsEncoder(device, shaders) : null;
   }
 
   async prepare({ width, height, targetRgba32f, maskRgba32f, maskSum, initSites, initSiteCount }) {
@@ -353,6 +355,15 @@ export class Trainer {
       }
       this.growCellsBuf = null;
       this.growCellsCap = 0;
+      this.siteStatsParams = createUniform32(device);
+      this.siteStatsBuf = device.createBuffer({
+        size: this.bufferCapacity * SITE_STAT_CH * 4,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+      });
+      // Predicted vs realized gain (diagnostic only; never feeds back into
+      // growth): the last batch's predicted gains, scored at the next step.
+      this.growPending = null;
+      this.growGainHistory = [];
     }
 
     // Initialize sites
@@ -671,6 +682,44 @@ export class Trainer {
     this.fitTex = this.blurTex;
   }
 
+  // Per-site stats of the current state (site_stats.wgsl): Float32Array of
+  // SITE_STAT_CH per site, for sites [0, siteCount).
+  async _siteStats() {
+    const device = this.device;
+    const n = this.siteCount;
+    const u = new Uint32Array(8);
+    u[0] = n;
+    new Float32Array(u.buffer)[4] = this.invScaleSq;
+    device.queue.writeBuffer(this.siteStatsParams, 0, u);
+    const bytes = n * SITE_STAT_CH * 4;
+    const staging = device.createBuffer({ size: bytes, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    const encoder = device.createCommandEncoder();
+    this.statsEnc.encode(encoder, this.sitesBuf, this.siteStatsParams, this.cand0A, this.cand1A,
+      this.fitTex, this.maskTex, this.siteStatsBuf, this.width, this.height);
+    encoder.copyBufferToBuffer(this.siteStatsBuf, 0, staging, 0, bytes);
+    device.queue.submit([encoder.finish()]);
+    await staging.mapAsync(GPUMapMode.READ);
+    const out = new Float32Array(staging.getMappedRange()).slice();
+    staging.unmap();
+    staging.destroy();
+    return out;
+  }
+
+  // Diagnostic: realized gain of the last batch's sites = the error that would
+  // come back if each were removed now, others unchanged (in 8-bit levels²,
+  // like the predicted gain). Reported, never used for decisions.
+  _reportGrowthGain(it, stats) {
+    const batch = this.growPending;
+    if (!batch) return;
+    this.growPending = null;
+    const points = batch.sites.map(({ id, predicted }) => ({
+      site: id, predicted, realized: stats[id * SITE_STAT_CH + 17] * 255 * 255,
+    }));
+    const entry = { step: this.growGainHistory.length + 1, addedAt: batch.it, measuredAt: it, points };
+    this.growGainHistory.push(entry);
+    if (this.onLog) this.onLog({ type: "growthGain", ...entry });
+  }
+
   _endGrowth(it, reason) {
     this.growDoneIter = it;
     this.growStop = reason;
@@ -680,10 +729,17 @@ export class Trainer {
 
   async _growStep(it) {
     const args = this.args;
-    if (this.growDoneIter !== null) return;
+    if (this.growDoneIter !== null) {
+      // One more measurement for the final batch, a growth step after it.
+      if (this.growPending && it >= this.growPending.it + args.growEvery) {
+        this._reportGrowthGain(it, await this._siteStats());
+      }
+      return;
+    }
     if (this.siteCount >= this.bufferCapacity) { this._endGrowth(it, "reached max sites"); return; }
     if (it >= args.growEndIter) { this._endGrowth(it, "growEndIter safety stop"); return; }
     if (it === 0 || it % args.growEvery !== 0) return;
+    this._reportGrowthGain(it, await this._siteStats());
 
     const device = this.device;
     const queue = device.queue;
@@ -747,6 +803,7 @@ export class Trainer {
     const adam = new Float32Array(k * ADAM_FLOATS);
     for (let i = 0; i < k; i += 1) adam[i * ADAM_FLOATS + 20] = it;
     queue.writeBuffer(this.adamBuf, n0 * ADAM_FLOATS * 4, adam);
+    this.growPending = { it, sites: picked.map((blk, i) => ({ id: n0 + i, predicted: blk.gain })) };
 
     const n1 = n0 + k;
     this.siteCount = n1;
@@ -1005,6 +1062,7 @@ export class Trainer {
       bestPsnr: this.bestPsnr,
       growDoneIter: this.growDoneIter,
       growStop: this.growStop,
+      growthGain: this.growGainHistory || [],
       trainSeconds: (performance.now() - this.trainStartMs) / 1000,
     };
   }
@@ -1025,7 +1083,7 @@ export class Trainer {
       this.countParams, this.gradCountParams, this.tauParams,
       this.dummyHilbertBuf, this.hilbertParams, this._tauHeatBuf,
       this.blurTex, this.blurTmpTex, this.growBlurParams, this.growGainParams, this.growSeedParams,
-      this.growCellsBuf, ...(this.growJfaParams || []),
+      this.growCellsBuf, ...(this.growJfaParams || []), this.siteStatsParams, this.siteStatsBuf,
     ];
     if (this.hilbertRes) {
       owned.push(this.hilbertRes.pairs, this.hilbertRes.order, this.hilbertRes.pos);
@@ -1055,6 +1113,7 @@ const fmtLambda = (v) => (v >= 100 ? v.toFixed(0) : v.toPrecision(2));
 // suppression across all scales). Returns [{ gain, size, x, y, color, tau,
 // radius, ownerW }], best first.
 const GROW_MAX_CELL = 32;
+const SITE_STAT_CH = 18; // channels per site in site_stats.wgsl's output
 
 export function growthBlocks(cells, cellsX, cellsY, cell, maxBlock, threshold, count, minDist) {
   const L2 = 255 * 255;
