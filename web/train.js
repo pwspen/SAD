@@ -78,7 +78,7 @@ const state = {
   lastActiveSites: 0,    // active sites at the last log tick (site-spacing reference lines)
   psnrHistory: [],       // [{ it, psnr }] from log ticks, plotted in the PSNR card
   psnrIters: 0,
-  bppRuns: [],           // [{ sites, bpp, colorSpace, points: [{ it, psnr }] }] per run on this target; last is current
+  bppRuns: [],           // [{ sites, bpp, colorSpace, points: [{ it, psnr, sites, bpp }] }] per run on this target; last is current
   gradHistory: [],       // [{ it, stats }] per-param |grad| mean/max from log ticks
   lrHistory: [],         // [{ it, lr }] LR multiplier (schedule × LR mult) from log ticks
   growthGain: [],        // [{ step, addedAt, measuredAt, points: [{ site, predicted, realized }] }] per growth batch
@@ -1148,8 +1148,8 @@ function hitPsnr(g, mx) {
 // ---- PSNR vs bpp (log x) ----
 // Raw rate: active sites × BITS_PER_SITE / pixels. Runs on the current target
 // accumulate: earlier runs show as their final point (joined in bpp order, an
-// RD curve per site color space); the current run shows its log-tick trail at
-// its fixed bpp.
+// RD curve per site color space); the current run shows its log-tick trail,
+// each tick at the bpp of the sites active then (grow mode moves it right).
 
 const BPP_PAST_COLOR = "#66666e";
 
@@ -1159,17 +1159,18 @@ function colorSpaceColor(key) {
   return i <= 0 ? BPP_PAST_COLOR : SERIES_COLORS[(i - 1) % SERIES_COLORS.length];
 }
 
-// Plotted points: { x: bpp, y: psnr, run, point, current }.
+// Plotted points: { x: bpp, y: psnr, sites, run, point, current }.
 function bppPlotPoints() {
   const runs = state.bppRuns;
   const pts = [];
   runs.forEach((r, ri) => {
     const current = ri === runs.length - 1;
     if (current) {
-      r.points.forEach((p, pi) => pts.push({ x: r.bpp, y: p.psnr, run: ri, point: pi, current }));
+      r.points.forEach((p, pi) => pts.push({ x: p.bpp, y: p.psnr, sites: p.sites, run: ri, point: pi, current }));
     } else if (r.points.length) {
       const pi = r.points.length - 1;
-      pts.push({ x: r.bpp, y: r.points[pi].psnr, run: ri, point: pi, current });
+      const p = r.points[pi];
+      pts.push({ x: p.bpp, y: p.psnr, sites: p.sites, run: ri, point: pi, current });
     }
   });
   return pts;
@@ -1180,8 +1181,12 @@ function drawBppPlot(view) {
   if (!p) return;
   const pts = bppPlotPoints();
   let xMin = Infinity, xMax = -Infinity, lo = Infinity, hi = -Infinity;
-  for (const r of state.bppRuns) { xMin = Math.min(xMin, r.bpp); xMax = Math.max(xMax, r.bpp); }
-  for (const pt of pts) { lo = Math.min(lo, pt.y); hi = Math.max(hi, pt.y); }
+  const cur0 = state.bppRuns[state.bppRuns.length - 1];
+  if (cur0) { xMin = xMax = cur0.bpp; }
+  for (const pt of pts) {
+    xMin = Math.min(xMin, pt.x); xMax = Math.max(xMax, pt.x);
+    lo = Math.min(lo, pt.y); hi = Math.max(hi, pt.y);
+  }
   if (!(xMin > 0)) { xMin = 0.1; xMax = 10; }
   // At least a decade of x range, centred on the data.
   const span = Math.max(1, Math.log10(xMax / xMin) * 1.2);
@@ -1208,11 +1213,10 @@ function drawBppPlot(view) {
     for (const pt of past) drawMarker(p, g, pt.x, pt.y, color, 3.5);
   }
 
-  // Current run: vertical trail of log ticks, latest marked
+  // Current run: trail of log ticks in iteration order, latest marked
   const cur = pts.filter((pt) => pt.current);
   if (cur.length) {
-    const ys = cur.map((pt) => pt.y);
-    drawLine(p, g, [[cur[0].x, Math.min(...ys)], [cur[0].x, Math.max(...ys)]], PSNR_LINE_COLOR);
+    if (cur.length > 1) drawLine(p, g, cur.map((pt) => [pt.x, pt.y]), PSNR_LINE_COLOR);
     const last = cur[cur.length - 1];
     drawMarker(p, g, last.x, last.y, PSNR_LINE_COLOR);
   }
@@ -1222,7 +1226,7 @@ function drawBppPlot(view) {
   const run = state.bppRuns[hover.run];
   drawMarker(p, g, hover.x, hover.y, hover.current ? PSNR_LINE_COLOR : colorSpaceColor(run.colorSpace), 5);
   drawTooltip(p, g, g.x(hover.x), g.y(hover.y), {
-    rows: [{ cells: [`${run.sites} sites · ${fmtSig(hover.x)} bpp · ${hover.y.toFixed(2)} dB · ${COLOR_SPACES[run.colorSpace].label}`] }],
+    rows: [{ cells: [`${hover.sites} sites · ${fmtSig(hover.x)} bpp · ${hover.y.toFixed(2)} dB · ${COLOR_SPACES[run.colorSpace].label}`] }],
   });
 }
 
@@ -2372,7 +2376,7 @@ async function startTraining() {
           const run = state.bppRuns[state.bppRuns.length - 1];
           run.sites = info.activeSites;
           run.bpp = computeBpp(info.activeSites, info.width, info.height);
-          run.points.push({ it: info.it, psnr: info.psnr });
+          run.points.push({ it: info.it, psnr: info.psnr, sites: run.sites, bpp: run.bpp });
         }
         if (info.gradStats) state.gradHistory.push({ it: info.it, stats: info.gradStats });
         if (Number.isFinite(info.lrScale)) state.lrHistory.push({ it: info.it, lr: info.lrScale });
