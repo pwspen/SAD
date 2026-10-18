@@ -5,7 +5,7 @@
 
 import { loadShaders, tileSlotsForLimit } from "../trainer/shader_loader.js?v=shared-wgsl-20261017";
 import { requestTrainingDevice } from "../trainer/device.js?v=shared-wgsl-20261017";
-import { Trainer, buildArgs, GRAD_GROUPS, lrSchedule, LR_SCHEDULES } from "../trainer/trainer.js?v=greedy-20261017";
+import { Trainer, buildArgs, GRAD_GROUPS, lrSchedule, LR_SCHEDULES, growthCounts } from "../trainer/trainer.js?v=batch-20261017";
 import { loadImageToFloat32, loadMaskRgba32Float, whiteMaskRgba32Float } from "../trainer/textures.js?v=shared-wgsl-20261017";
 import { loadSitesFromFile, serializeSitesTxt, triggerDownload, floatImageToRgba8, computeBpp, BITS_PER_SITE } from "../trainer/io.js?v=shared-wgsl-20261017";
 import { SITE_FLOATS } from "../trainer/params.js?v=shared-wgsl-20261017";
@@ -50,6 +50,7 @@ const UI_FIELDS = [
   ["growLambda", "p-growLambda"],
   ["growInitSites", "p-growInitSites"],
   ["growMaxSites", "p-growMaxSites"],
+  ["growFactor", "p-growFactor"],
   ["growEvery", "p-growEvery"],
   ["growBlur", "p-growBlur"],
 ];
@@ -1876,12 +1877,12 @@ async function startTraining() {
   state.gradHistory = [];
   state.bandHistory = [];
   state.lrHistory = [];
-  // Growth adds one site per growEvery iterations, so its end (where
-  // "decay after growth" starts decaying) is predictable unless λ stops it
-  // early; the plan is corrected once the trainer reports the real end.
+  // Growth multiplies the count by growFactor every growEvery iterations, so
+  // its end (where "decay after growth" starts decaying) is predictable unless
+  // λ stops it early; the plan is corrected once the trainer reports the real end.
   const startCount = init ? init.count : args.growInitSites;
   const plannedGrowEnd = args.siteMode !== "grow" ? 0
-    : Math.min(args.growEndIter, Math.max(0, args.growMaxSites - startCount) * args.growEvery);
+    : Math.min(args.growEndIter, growthCounts(startCount, args.growFactor, args.growMaxSites).length * args.growEvery);
   state.lrPlan = { warmupIters: args.warmupIters, decayIters: args.decayIters, lrMult: args.lrMult,
                    kind: args.lrSchedule, growDoneIter: plannedGrowEnd };
   state.lastActiveSites = initSiteCount;
@@ -1892,7 +1893,7 @@ async function startTraining() {
   await refreshViews("run");
 
   const sitesDesc = args.siteMode === "grow"
-    ? `grow ${startCount} → ${Math.max(args.growMaxSites, startCount)}, +1 every ${args.growEvery} iters ` +
+    ? `grow ${startCount} → ${Math.max(args.growMaxSites, startCount)}, ×${args.growFactor} every ${args.growEvery} iters ` +
       `(λ stop ${args.growLambda})`
     : `${initSiteCount} fixed`;
   appendLog(`Target: ${width}×${height} | sites: ${sitesDesc} | iters: ${args.warmupIters} warmup + ${args.decayIters} decay | lr ×${args.lrMult} ${LR_SCHEDULES[args.lrSchedule]} | color: ${COLOR_SPACES[args.colorSpace].label} | refresh: ${args.logFreq}`);

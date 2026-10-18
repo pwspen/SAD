@@ -6,10 +6,11 @@ both import it. Hyperparameter defaults come from `training_config.json`.
 
 `siteMode` picks how many sites a run uses:
 
-- `"grow"` (default): start from `growInitSites` and add one site every `growEvery` iterations,
-  greedily at the single best place (the dyadic block where one site would remove the most
-  error), until `growMaxSites`. `growLambda` stops growth early once the best gain falls under
-  `growLambda × BITS_PER_SITE` (0 = no early stop). Sites are never removed.
+- `"grow"` (default): start from `growInitSites` and every `growEvery` iterations multiply the
+  count by `growFactor` (at least +1), up to `growMaxSites`. Each batch goes to the dyadic blocks
+  where one site would remove the most error, kept at least the new site spacing apart. Only
+  blocks whose gain beats `growLambda × BITS_PER_SITE` qualify (0 = any positive gain), so λ can
+  shrink a batch or end growth early. Sites are never removed.
 - `"fixed"`: exactly `sites` for the whole run.
 
 `lrSchedule` is `"warmup-cosine"` (default), `"fixed"` (constant after warmup) or

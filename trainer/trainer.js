@@ -104,6 +104,17 @@ export function lrSchedule(it, warmupIters, decayIters, kind = "warmup-cosine", 
   return 0.5 * (1 + Math.cos(Math.PI * t));
 }
 
+// Site count after each growth step: start × factor^k (at least +1 per step),
+// capped at max. Returns the counts after steps 1, 2, ... (empty if start ≥ max).
+export function growthCounts(start, factor, max) {
+  const counts = [];
+  for (let n = start; n < max;) {
+    n = Math.min(max, Math.max(n + 1, Math.ceil(n * factor)));
+    counts.push(n);
+  }
+  return counts;
+}
+
 // Collect default args from a training_config.json-style object + user
 // overrides. Overrides use the argument name (e.g. "iters") and take precedence
 // over the matching config-style key (e.g. "DEFAULT_ITERS").
@@ -152,15 +163,16 @@ export function buildArgs(config, overrides = {}) {
     eps: Number(pick("eps", "EPS", 1e-8)),
     maxDim: Number(pick("maxDim", "MAX_DIM", 2048)),
     // Site growth, used when siteMode is "grow": start from growInitSites and
-    // add one site every growEvery iterations, at the single best place, until
-    // growMaxSites (which also sizes the GPU buffers). growLambda stops it
+    // every growEvery iterations multiply the count by growFactor (at least +1)
+    // up to growMaxSites (which also sizes the GPU buffers). growLambda stops it
     // early: the slope -dD/dR, i.e. the squared error (8-bit levels², summed
     // over RGB) a new site must remove per bit it costs (BITS_PER_SITE bits).
     // 0 = no early stop (any positive gain still qualifies).
     growLambda: Math.max(0, Number(pick("growLambda", "GROW_LAMBDA", 400))),
     growMaxSites: Math.max(1, Math.floor(Number(pick("growMaxSites", "GROW_MAX_SITES", 64)))),
     growInitSites: Math.max(1, Math.floor(Number(pick("growInitSites", "GROW_INIT_SITES", 1)))),
-    growEvery: Math.max(1, Math.floor(Number(pick("growEvery", "GROW_EVERY", 5)))),
+    growEvery: Math.max(1, Math.floor(Number(pick("growEvery", "GROW_EVERY", 25)))),
+    growFactor: Number(pick("growFactor", "GROW_FACTOR", 2)),
     // While growing, the fit target is blurred with sigma = growBlur × site
     // spacing √(mask area / sites); 0 = always fit the original.
     growBlur: Math.max(0, Number(pick("growBlur", "GROW_BLUR", 0))),
@@ -175,6 +187,7 @@ export function buildArgs(config, overrides = {}) {
   if (args.siteMode !== "fixed" && args.siteMode !== "grow") {
     throw new Error(`siteMode must be "fixed" or "grow" (got "${args.siteMode}")`);
   }
+  if (!(args.growFactor > 1)) throw new Error(`growFactor must be > 1 (got ${args.growFactor})`);
   if (!(args.lrSchedule in LR_SCHEDULES)) {
     throw new Error(`lrSchedule must be one of ${Object.keys(LR_SCHEDULES).join(", ")} (got "${args.lrSchedule}")`);
   }
@@ -625,13 +638,15 @@ export class Trainer {
   }
 
   // ---- Site growth ----
-  // Greedy rate-distortion growth, one site at a time. Every growEvery
-  // iterations, every dyadic block of a grid finer than the site spacing is
-  // scored by the error one new site taking it over would remove
-  // (bestGrowthBlock); the single best block gets a site. Growth ends at
-  // growMaxSites, when the best gain no longer beats λ·BITS_PER_SITE (the cost
-  // of a site's bits; λ = 0 only requires a positive gain), or at the hidden
-  // growEndIter safety stop. Optionally (growBlur > 0) the fit target is the
+  // Rate-distortion growth in batches. Every growEvery iterations the count is
+  // multiplied by growFactor (growthCounts). Every dyadic block of a grid finer
+  // than the site spacing is scored by the error one new site taking it over
+  // would remove (growthBlocks), and the batch goes to the best blocks, skipping
+  // any closer than the new spacing to one already picked, so a batch never
+  // stacks sites on one spot. Only blocks whose gain beats λ·BITS_PER_SITE (the
+  // cost of a site's bits; λ = 0 only requires a positive gain) qualify; growth
+  // ends at growMaxSites, when no block qualifies, or at the hidden growEndIter
+  // safety stop. Optionally (growBlur > 0) the fit target is the
   // image blurred to the current spacing until growth ends; in tests that cost
   // 0.5-2 dB at a matched site count, since sites place edges far finer than
   // their spacing.
@@ -701,43 +716,49 @@ export class Trainer {
     staging.unmap();
     staging.destroy();
 
-    const best = bestGrowthBlock(cells, cellsX, cellsY, cell, Math.max(cell, spacing));
+    const target = growthCounts(n0, args.growFactor, this.bufferCapacity)[0];
+    const minDist = Math.sqrt(this.maskArea / target);
     const threshold = args.growLambda * BITS_PER_SITE;
-    if (!best || !(best.gain > threshold)) {
-      const g = best ? Math.max(0, best.gain) : 0;
-      this._endGrowth(it, `λ: best site would remove ${fmtLambda(g / BITS_PER_SITE)} levels²/bit, ` +
-                          `under λ = ${args.growLambda}`);
+    const picked = growthBlocks(cells, cellsX, cellsY, cell, Math.max(cell, spacing), threshold,
+      target - n0, minDist);
+    if (!picked.length) {
+      this._endGrowth(it, `λ: no new site would remove more than λ × ${BITS_PER_SITE} = ` +
+                          `${fmtLambda(threshold)} levels²`);
       return;
     }
 
-    // New site: error centroid of the block, its mean fit color, its owners'
+    // New sites: error centroid of each block, its mean fit color, its owners'
     // tau and radius (so it competes as an equal), isotropic. A small jitter
-    // keeps it off an existing position.
-    const data = new Float32Array(SITE_FLOATS);
-    data[0] = Math.min(this.width - 1, Math.max(0, best.x + (Math.random() - 0.5) * 0.5));
-    data[1] = Math.min(this.height - 1, Math.max(0, best.y + (Math.random() - 0.5) * 0.5));
-    data[2] = best.ownerW > 0 ? best.tau / best.ownerW : args.initLogTau;
-    data[3] = best.ownerW > 0 ? best.radius / best.ownerW : args.initRadius;
-    data.set(best.color, 4);
-    data[7] = 1;
-    queue.writeBuffer(this.sitesBuf, n0 * SITE_FLOATS * 4, encodeSiteColors(data, 1, this.colorSpace));
+    // keeps them off existing positions.
+    const k = picked.length;
+    const data = new Float32Array(k * SITE_FLOATS);
+    picked.forEach((blk, i) => {
+      const o = i * SITE_FLOATS;
+      data[o] = Math.min(this.width - 1, Math.max(0, blk.x + (Math.random() - 0.5) * 0.5));
+      data[o + 1] = Math.min(this.height - 1, Math.max(0, blk.y + (Math.random() - 0.5) * 0.5));
+      data[o + 2] = blk.ownerW > 0 ? blk.tau / blk.ownerW : args.initLogTau;
+      data[o + 3] = blk.ownerW > 0 ? blk.radius / blk.ownerW : args.initRadius;
+      data.set(blk.color, o + 4);
+      data[o + 7] = 1;
+    });
+    queue.writeBuffer(this.sitesBuf, n0 * SITE_FLOATS * 4, encodeSiteColors(data, k, this.colorSpace));
     // Fresh Adam moments, with the birth step for per-site bias correction.
-    const adam = new Float32Array(ADAM_FLOATS);
-    adam[20] = it;
+    const adam = new Float32Array(k * ADAM_FLOATS);
+    for (let i = 0; i < k; i += 1) adam[i * ADAM_FLOATS + 20] = it;
     queue.writeBuffer(this.adamBuf, n0 * ADAM_FLOATS * 4, adam);
 
-    const n1 = n0 + 1;
+    const n1 = n0 + k;
     this.siteCount = n1;
     this.actualSites = n1;
-    this.activeEstimate += 1;
+    this.activeEstimate += k;
     updateClearParamsBuffer(queue, this.countParams, n1);
     updateGradParamsBuffer(queue, this.gradParams, n1, this.invScaleSq);
 
-    // Seed the new site into its home candidate pixel, then run a full
-    // jump-flood sequence of candidate passes (long jumps down to 1 px) so it
-    // claims its whole region now. Left to the regular updates (every candFreq
-    // iterations, 1 px steps by then) it would barely spread before the next
-    // check, which would then see the same error and pick the same spot.
+    // Seed the new sites into their home candidate pixels, then run a full
+    // jump-flood sequence of candidate passes (long jumps down to 1 px) so they
+    // claim their regions now. Left to the regular updates (every candFreq
+    // iterations, 1 px steps by then) they would barely spread before the next
+    // step, which would then see the same error in the same places.
     updateParamsBuffer(queue, this.growSeedParams, this._paramsArgs(n1, n0, 0));
     const stages = Math.max(1, Math.ceil(Math.log2(Math.max(this.candWidth, this.candHeight, 2))));
     this.growJfaParams ??= [];
@@ -749,7 +770,7 @@ export class Trainer {
     const seedEnc = device.createCommandEncoder();
     seedEnc.copyTextureToTexture({ texture: this.cand0A }, { texture: this.cand0B },
       [this.candWidth, this.candHeight, 1]);
-    this.seedEnc.encode(seedEnc, this.sitesBuf, this.growSeedParams, this.cand0A, this.cand0B, 1);
+    this.seedEnc.encode(seedEnc, this.sitesBuf, this.growSeedParams, this.cand0A, this.cand0B, k);
     [this.cand0A, this.cand0B] = [this.cand0B, this.cand0A];
     this._maybeRefreshHilbert(seedEnc, n1);
     this.packEnc.encode(seedEnc, this.sitesBuf, this.packedSitesBuf, this.countParams, n1);
@@ -763,8 +784,8 @@ export class Trainer {
     queue.submit([seedEnc.finish()]);
 
     this._updateFitTarget();
-    this._log(`Grow @${it}: site ${n1} at (${best.x.toFixed(0)}, ${best.y.toFixed(0)}) | ` +
-              `gain ${fmtLambda(best.gain / BITS_PER_SITE)} levels²/bit | block ${best.size}px` +
+    this._log(`Grow @${it}: +${k} → ${n1} sites` + (k < target - n0 ? ` (${target - n0} wanted; no other spot both beats λ and is a spacing away)` : "") +
+              ` | best gain ${fmtLambda(picked[0].gain / BITS_PER_SITE)} levels²/bit | spacing ${minDist.toFixed(0)}px` +
               (this.fitSigma ? ` | blur σ ${this.fitSigma.toFixed(1)}px` : ""));
     if (n1 >= this.bufferCapacity) this._endGrowth(it, "max sites");
   }
@@ -1021,17 +1042,20 @@ export class Trainer {
 
 const fmtLambda = (v) => (v >= 100 ? v.toFixed(0) : v.toPrecision(2));
 
-// The best place for one new site, from grow_gain.wgsl's per-cell stats
+// Places for up to `count` new sites, from grow_gain.wgsl's per-cell stats
 // (`cells`, 12 floats per cell of `cell` px). Cells are merged 2×2 into a
 // pyramid of aligned dyadic blocks, up to `maxBlock` px (about one site
 // spacing), and each block is scored by the error a site taking it over with
 // the block's mean color would remove: sum|fit - pred|² - sum|fit - mean|²,
 // in 8-bit levels² summed over RGB. Scoring sub-spacing blocks matters
 // because the remaining error concentrates at edges finer than the spacing.
-// Returns { gain, size, x, y, color, tau, radius, ownerW } or null.
+// Blocks whose gain beats `threshold` are taken best first, skipping any whose
+// site would land within `minDist` px of one already taken (non-maximum
+// suppression across all scales). Returns [{ gain, size, x, y, color, tau,
+// radius, ownerW }], best first.
 const GROW_MAX_CELL = 32;
 
-export function bestGrowthBlock(cells, cellsX, cellsY, cell, maxBlock) {
+export function growthBlocks(cells, cellsX, cellsY, cell, maxBlock, threshold, count, minDist) {
   const L2 = 255 * 255;
   // Per block: weight, color sum, variance sum (about the block's own mean),
   // error energy, energy-weighted absolute position, owner tau/radius sums.
@@ -1050,12 +1074,12 @@ export function bestGrowthBlock(cells, cellsX, cellsY, cell, maxBlock) {
       };
     }
   }
-  let best = null;
+  const cands = [];
   for (let size = cell; ; size *= 2) {
     for (const blk of lvl) {
-      if (!blk) continue;
+      if (!blk || !(blk.e > 0)) continue;
       const gain = (blk.e - blk.v) * L2;
-      if (Number.isFinite(gain) && (!best || gain > best.gain)) best = { blk, gain, size };
+      if (gain > threshold) cands.push({ blk, gain, size });
     }
     if (size * 2 > maxBlock || (w === 1 && h === 1)) break;
     // Merge 2×2; pooled variance = within-child spread + spread of child means.
@@ -1085,13 +1109,32 @@ export function bestGrowthBlock(cells, cellsX, cellsY, cell, maxBlock) {
     }
     lvl = next; w = w2; h = h2;
   }
-  if (!best) return null;
-  const { blk, gain, size } = best;
-  return {
-    gain, size,
-    x: blk.e > 0 ? blk.ex / blk.e : NaN, y: blk.e > 0 ? blk.ey / blk.e : NaN,
-    color: blk.c.map((v) => v / blk.n), tau: blk.tau, radius: blk.rad, ownerW: blk.ow,
-  };
+  cands.sort((a, b) => b.gain - a.gain);
+  // Greedy suppression, with picks bucketed in a minDist grid so each test
+  // only looks at the 3×3 neighbouring buckets.
+  const out = [];
+  const grid = new Map();
+  const r2 = minDist * minDist;
+  for (const { blk, gain, size } of cands) {
+    if (out.length >= count) break;
+    const x = blk.ex / blk.e, y = blk.ey / blk.e;
+    const gx = Math.floor(x / minDist), gy = Math.floor(y / minDist);
+    let near = false;
+    for (let dy = -1; dy <= 1 && !near; dy += 1) {
+      for (let dx = -1; dx <= 1 && !near; dx += 1) {
+        for (const p of grid.get(`${gx + dx},${gy + dy}`) || []) {
+          if ((p.x - x) ** 2 + (p.y - y) ** 2 < r2) { near = true; break; }
+        }
+      }
+    }
+    if (near) continue;
+    const pick = { gain, size, x, y, color: blk.c.map((v) => v / blk.n), tau: blk.tau, radius: blk.rad, ownerW: blk.ow };
+    out.push(pick);
+    const key = `${gx},${gy}`;
+    if (!grid.has(key)) grid.set(key, []);
+    grid.get(key).push(pick);
+  }
+  return out;
 }
 
 // Gradient groups over the consolidated grads[idx*10+ch] channels. Multi-channel

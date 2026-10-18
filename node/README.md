@@ -10,8 +10,8 @@ node sweep.mjs --image /path/to/image.png --set siteMode=fixed --set sites=500,1
 node sweep.mjs --image /path/to/image.png --grid grid.json --repeat 3 --save-dir results/sweep
 ```
 
-- Site growth is on by default (`siteMode=grow`: one site every `growEvery` iterations from
-  `growInitSites` to `growMaxSites`, λ as an early stop); `sites` only applies with
+- Site growth is on by default (`siteMode=grow`: × `growFactor` every `growEvery` iterations
+  from `growInitSites` to `growMaxSites`, λ as an early stop); `sites` only applies with
   `--set siteMode=fixed`. Each run reports where and why growth ended (`growStop`,
   `growDoneIter` in the JSON).
 - `--set key=v1,v2` sweeps a trainer arg (camelCase, as in `buildArgs` in `trainer/trainer.js`) or a

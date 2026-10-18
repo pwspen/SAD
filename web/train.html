@@ -561,11 +561,11 @@
           <div class="tip" role="tooltip">Start from these sites instead of the default placement (sites sampled where the image has edges). Positions are rescaled to the target size and every site's τ is reset. Its site count becomes the starting count: it replaces <b>sites</b> (fixed) or <b>start sites</b> (grow), and that field is locked to show it until the file is cleared.</div>
         </div>
 
-        <h3 class="has-tip" tabindex="0">Site count<span class="tip" role="tooltip">How many sites the run uses. <b>Fixed</b>: exactly the number you give, for the whole run. <b>Grow</b>: start from a few sites and add one at a time, each at the single place where it removes the most error, until <b>max sites</b> (or earlier, once a new site isn't worth its bits at λ). Sites are never removed. Each site costs 128 bits: bpp = sites × 128 / (width × height).</span></h3>
+        <h3 class="has-tip" tabindex="0">Site count<span class="tip" role="tooltip">How many sites the run uses. <b>Fixed</b>: exactly the number you give, for the whole run. <b>Grow</b>: start from a few sites and multiply the count by a factor on a regular schedule, placing each batch where new sites remove the most error, until <b>max sites</b> (or earlier, once new sites aren't worth their bits at λ). Sites are never removed. Each site costs 128 bits: bpp = sites × 128 / (width × height).</span></h3>
         <div class="param">
           <div class="row"><label>mode</label><select id="p-siteMode" aria-label="Site count mode"><option value="grow">grow</option><option value="fixed">fixed</option></select></div>
           <p class="help"><span class="unit">choice</span></p>
-          <div class="tip" role="tooltip"><b>grow</b>: start sites → max sites, one site per <b>add every</b> iterations. <b>fixed</b>: the count is <b>sites</b>. Only the fields for the chosen mode are shown.</div>
+          <div class="tip" role="tooltip"><b>grow</b>: start sites → max sites, × <b>factor</b> every <b>grow every</b> iterations. <b>fixed</b>: the count is <b>sites</b>. Only the fields for the chosen mode are shown.</div>
         </div>
         <div class="param" data-site-mode="fixed">
           <div class="row"><label>sites</label><input id="p-sites" type="number" /></div>
@@ -578,19 +578,24 @@
           <div class="tip" role="tooltip">Count at iteration 0, placed by the default edge-based init. 1 works. Growth only adds, so this is also the minimum.</div>
         </div>
         <div class="param" data-site-mode="grow">
-          <div class="row"><label>add every</label><input id="p-growEvery" type="number" min="1" /></div>
-          <p class="help"><span class="unit">iterations per site</span></p>
-          <div class="tip" role="tooltip">Every this many iterations, add exactly one site at the best place (the block where one site would remove the most error). So site n arrives at iteration (n − start sites) × this, e.g. 1 → 64 sites with 5 finishes adding at iteration 315. Larger gives each site more time to settle before the next one is placed.</div>
+          <div class="row"><label>factor</label><input id="p-growFactor" type="number" step="0.1" min="1.0001" /></div>
+          <p class="help"><span class="unit">× sites per step (above 1)</span></p>
+          <div class="tip" role="tooltip">Each step multiplies the count by this (rounded up, at least +1), capped at <b>max sites</b>. 2 doubles: 1, 2, 4, 8, …; 1.5 gives 1, 2, 3, 5, 8, 12, …. Within a step, new sites go to the best-scoring spots and are kept at least the new site spacing apart, so a batch never stacks up on one spot. A factor just above 1 adds one site per step.</div>
+        </div>
+        <div class="param" data-site-mode="grow">
+          <div class="row"><label>grow every</label><input id="p-growEvery" type="number" min="1" /></div>
+          <p class="help"><span class="unit">iterations between steps</span></p>
+          <div class="tip" role="tooltip">Time for each batch to settle before the next is placed. Too short and the next step still sees the old error where the last batch landed. Growth finishes after (number of steps) × this, e.g. 1 → 64 with factor 2 and 25 takes 6 steps, done at iteration 150.</div>
         </div>
         <div class="param" data-site-mode="grow">
           <div class="row"><label>max sites</label><input id="p-growMaxSites" type="number" min="1" /></div>
           <p class="help"><span class="unit">sites</span></p>
-          <div class="tip" role="tooltip">Growth stops when the count reaches this; the rest of the run refines the sites it has. Make the run longer than (max − start) × <b>add every</b> iterations to leave time for that.</div>
+          <div class="tip" role="tooltip">Growth stops when the count reaches this; the rest of the run refines the sites it has. Leave the run long enough after the last step for that.</div>
         </div>
         <div class="param" data-site-mode="grow">
           <div class="row"><label>λ (stop)</label><input id="p-growLambda" type="number" step="10" min="0" /></div>
           <p class="help"><span class="unit">squared error per bit: 8-bit levels² (summed over R, G, B and pixels) per bit</span></p>
-          <div class="tip" role="tooltip">Early stop: growth ends before <b>max sites</b> once the best new site would remove less than λ × 128 levels² of error (a site costs 128 bits). Example: λ = 400 → 51,200 levels², e.g. 100 pixels each off by about 13 levels in all three channels. Higher λ stops sooner. 0 = never stop early (any site that helps at all is added). The log says which limit ended growth.</div>
+          <div class="tip" role="tooltip">Only spots where a new site would remove more than λ × 128 levels² of error (a site costs 128 bits) get one; a step adds fewer sites if fewer qualify, and growth ends early once none do. Example: λ = 400 → 51,200 levels², e.g. 100 pixels each off by about 13 levels in all three channels. Higher λ stops sooner. 0 = never stop early (any site that helps at all qualifies). The log says which limit ended growth.</div>
         </div>
         <div class="param" data-site-mode="grow">
           <div class="row"><label>blur × spacing</label><input id="p-growBlur" type="number" step="0.05" /></div>
@@ -731,6 +736,6 @@
       </section>
     </div>
 
-    <script type="module" src="train.js?v=greedy-20261017"></script>
+    <script type="module" src="train.js?v=batch-20261017"></script>
   </body>
 </html>
