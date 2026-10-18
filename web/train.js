@@ -225,7 +225,10 @@ function updatePlanSummary() {
   const n = args.iters;
   lines.push(`Run: <b>${n}</b> iterations.`);
   let growEnd = 0;
-  if (args.siteMode === "grow") {
+  if (args.siteMode === "sawtooth") {
+    lines.push(`Sites: sawtooth, ×${args.growFactor} every ${args.growEvery} up to ${args.growMaxSites}, then merges every ` +
+               `${args.pruneEvery || 5 * args.growEvery} until a batch doesn't pay, then again; cycles end by 70% of the run.`);
+  } else if (args.siteMode === "grow") {
     const start = state.initSites ? state.initSites.count : args.growInitSites;
     const plan = growthPlan(args, start);
     const counts = plan.map((p) => p.count);
@@ -254,6 +257,8 @@ function updatePlanSummary() {
   }
   if (args.lrSchedule === "fixed") {
     lines.push(`LR: full throughout.`);
+  } else if (args.lrSchedule === "decay-after-growth" && args.siteMode === "sawtooth") {
+    lines.push(`LR: full while growing, then down toward 0 by ${n}; back to full each time a cycle grows again.`);
   } else if (args.lrSchedule === "decay-after-growth" && growEnd > 0) {
     lines.push(`LR: full until growth ends (iter ${growEnd}), then down to 0 by ${n}.`);
   } else {
@@ -273,9 +278,10 @@ function updatePlanSummary() {
 // restoring the typed value once the file is cleared.
 function syncSiteFields() {
   const mode = document.getElementById("p-siteMode").value;
-  ui.paramsPanel.dataset.siteMode = mode;
-  ui.paramsPanel.dataset.growSchedule = document.getElementById("p-growSchedule").value;
-  const locked = mode === "grow" ? "p-growInitSites" : "p-sites";
+  // Sawtooth shows the grow fields, with geometric growth (its factor).
+  ui.paramsPanel.dataset.siteMode = mode === "sawtooth" ? "grow" : mode;
+  ui.paramsPanel.dataset.growSchedule = mode === "sawtooth" ? "geometric" : document.getElementById("p-growSchedule").value;
+  const locked = mode !== "fixed" ? "p-growInitSites" : "p-sites";
   for (const id of ["p-sites", "p-growInitSites"]) {
     const el = document.getElementById(id);
     const lock = id === locked && state.initSites != null;
@@ -2743,8 +2749,9 @@ async function startTraining() {
   // starts decaying) is predictable unless λ stops it early; the plan is
   // corrected once the trainer reports the real end.
   const startCount = init ? init.count : args.growInitSites;
-  const plannedGrowEnd = args.siteMode !== "grow" ? 0
-    : Math.min(args.growEndIter, growthPlan(args, startCount).at(-1)?.it ?? 0);
+  const plannedGrowEnd = args.siteMode === "fixed" ? 0
+    : Math.min(args.growEndIter, growthPlan(args.siteMode === "sawtooth" ? { ...args, growSchedule: "geometric" } : args,
+                                            startCount).at(-1)?.it ?? 0);
   state.runSiteMode = args.siteMode;
   state.lastGrowth = null;
   state.lrPlan = { iters: args.iters, lrMult: args.lrMult,
@@ -2756,7 +2763,10 @@ async function startTraining() {
   for (const view of Object.values(VIEWS)) view.hoverKey = null;
   await refreshViews("run");
 
-  const sitesDesc = args.siteMode === "grow"
+  const sitesDesc = args.siteMode === "sawtooth"
+    ? `sawtooth ${startCount} → ${args.growMaxSites} by ${GROW_MODES[args.growMode]}, ×${args.growFactor} every ` +
+      `${args.growEvery} iters, merge every ${args.pruneEvery || 5 * args.growEvery}`
+    : args.siteMode === "grow"
     ? `grow ${startCount} → ${Math.max(args.growMaxSites, startCount)} by ${GROW_MODES[args.growMode]}, ` +
       (args.growSchedule === "decay" ? `cooling from ${args.growFrontLoad}× avg rate` : `×${args.growFactor}`) +
       ` every ${args.growEvery} iters ` +

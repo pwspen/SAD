@@ -19,6 +19,13 @@ both import it. Hyperparameter defaults come from `training_config.json`.
   (`insert.js`): new sites are placed one at a time where they cut the training loss most,
   computed exactly from the current fit (candidate positions, median colors), and
   existing sites are left alone; λ is then in the training loss's units.
+- `"sawtooth"`: grow geometrically (× `growFactor` every `growEvery`) up to `growMaxSites`, then merge
+  sites that don't pay for their bits (see `pruneEvery`, 5 × `growEvery` if 0) until a batch doesn't
+  pay, compact the survivors, and grow again. Merging waits 2 merge intervals after growth and takes at
+  most a quarter of the sites per step; cycles stop when the last merge phase removed nothing or the
+  next wouldn't end by 70% of the run. On Kodak at 256 px (max 800) it ended at ~510 sites with a
+  lower description length than keeping 800 (16.30 vs 16.42 bpp); on MNIST (max 64) it beat a fixed
+  16 but not a single grow-then-prune (18.83 vs 17.42).
 - `"fixed"`: exactly `sites` for the whole run.
 
 `growCriterion` picks what ends growth early: `"lambda"` (default, predicted gain against

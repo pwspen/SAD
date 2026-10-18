@@ -324,8 +324,8 @@ export function buildArgs(config, overrides = {}) {
   // "fixed": exactly `sites` for the whole run. "grow": rate-distortion growth.
   const siteMode = pick("siteMode", "SITE_MODE", "grow");
   args.siteMode = String(siteMode);
-  if (args.siteMode !== "fixed" && args.siteMode !== "grow") {
-    throw new Error(`siteMode must be "fixed" or "grow" (got "${args.siteMode}")`);
+  if (!["fixed", "grow", "sawtooth"].includes(args.siteMode)) {
+    throw new Error(`siteMode must be "fixed", "grow" or "sawtooth" (got "${args.siteMode}")`);
   }
   if (!(args.growFactor > 1)) throw new Error(`growFactor must be > 1 (got ${args.growFactor})`);
   if (!GROW_SCHEDULES[args.growSchedule]) {
@@ -393,7 +393,8 @@ export class Trainer {
     this.tauEnc = new TauEncoder(device, shaders);
     this.clearI32Enc = new ClearBufferEncoder(device, shaders, { useI32: true });
     this.hilbertEnc = this.usesHilbert ? new HilbertEncoder(device, shaders) : null;
-    this.usesGrow = args.siteMode === "grow";
+    this.usesGrow = args.siteMode === "grow" || args.siteMode === "sawtooth";
+    this.sawtooth = args.siteMode === "sawtooth";
     this.growEnc = this.usesGrow ? new GrowEncoder(device, shaders) : null;
     this.statsEnc = this.usesGrow ? new SiteStatsEncoder(device, shaders) : null;
   }
@@ -588,6 +589,8 @@ export class Trainer {
     this.prunePending = null;
     this.pruneStop = null;
     this.pruneMerged = 0;
+    this.cycle = 0; // sawtooth: cycles started after the first
+    this.cycleMerged = 0; // sawtooth: sites merged away in the current cycle
     this.growStop = null;
     if (this.usesGrow) this._updateFitTarget();
 
@@ -742,7 +745,7 @@ export class Trainer {
       }
 
       if (this.usesGrow) await this._growStep(it);
-      if (args.pruneEvery > 0) await this._pruneStep(it);
+      if (args.pruneEvery > 0 || this.sawtooth) await this._pruneStep(it);
       const siteCount = this.siteCount;
       const activeSites = this.activeEstimate;
       const updateCandidates = (it % candUpdateFreq === 0);
@@ -1079,10 +1082,21 @@ export class Trainer {
   // ends when no merge pays. An accepted batch restarts keepBest, which
   // would otherwise go back to a state with more sites.
 
+  // Iterations between merge steps: pruneEvery, or 5 × growEvery for a
+  // sawtooth run without one.
+  _pruneInterval() {
+    const args = this.args;
+    return args.pruneEvery > 0 ? args.pruneEvery : this.sawtooth ? 5 * args.growEvery : 0;
+  }
+
   async _pruneStep(it) {
     const args = this.args;
-    if (this.pruneStop || it === 0 || it % args.pruneEvery !== 0) return;
-    if (this.usesGrow && (this.growDoneIter === null || it - this.growDoneIter < args.pruneEvery)) return;
+    const every = this._pruneInterval();
+    if (!every || this.pruneStop || it === 0 || it % every !== 0) return;
+    // Sawtooth waits twice as long: right after growth the fit is far from
+    // settled and merges look cheap against it.
+    const settle = this.sawtooth ? SAW_SETTLE * every : every;
+    if (this.usesGrow && (this.growDoneIter === null || it - this.growDoneIter < settle)) return;
     const n = this.siteCount;
     const sites = await this._readSitesRgb(n);
     const moments = cellMoments({
@@ -1097,16 +1111,18 @@ export class Trainer {
     if (pending) {
       if (!(bits < pending.bits)) {
         this._restorePruneSnapshot();
-        this._endPrune(it, `the last ${pending.k} merge(s) didn't pay for their bits ` +
+        await this._endPrune(it, `the last ${pending.k} merge(s) didn't pay for their bits ` +
           `(${(pending.bits / 8192).toFixed(2)} → ${(bits / 8192).toFixed(2)} KiB), undone`);
         return;
       }
       this.pruneMerged += pending.k;
+      this.cycleMerged += pending.k;
       this.best = null; // keepBest restarts from the pruned state
     }
-    if (it > args.iters - args.pruneEvery) { this._endPrune(it, "too close to the end of the run"); return; }
+    if (it > args.iters - every) { await this._endPrune(it, "too close to the end of the run"); return; }
     const merges = pickMerges(moments, this.samples, BITS_PER_SITE);
-    if (!merges.length) { this._endPrune(it, "no merge would pay for its bits"); return; }
+    if (this.sawtooth) merges.length = Math.min(merges.length, Math.ceil(SAW_MAX_MERGE * this.activeEstimate));
+    if (!merges.length) { await this._endPrune(it, "no merge would pay for its bits"); return; }
 
     const device = this.device;
     const queue = device.queue;
@@ -1138,7 +1154,7 @@ export class Trainer {
     this._rebuildCandidates(n);
     this.prunePending = { it, bits, k: merges.length };
     this._log(`Prune @${it}: merged ${merges.length} pair(s) → ${this.activeEstimate} sites ` +
-              `| cheapest ${fmtLambda(merges[0].cost * 255 * 255)} levels², on trial until iter ${it + args.pruneEvery}`);
+              `| cheapest ${fmtLambda(merges[0].cost * 255 * 255)} levels², on trial until iter ${it + every}`);
   }
 
   // Mean training loss per sample of the current state (renders and reads back).
@@ -1162,10 +1178,77 @@ export class Trainer {
     this._rebuildCandidates(this.siteCount);
   }
 
-  _endPrune(it, reason) {
+  async _endPrune(it, reason) {
     // A batch still on trial at the end of the run stays (keepBest decides).
     this.pruneStop = reason;
     this._log(`Pruning done at iter ${it}: ${this.activeEstimate} sites, ${this.pruneMerged} merged (${reason}).`);
+    if (this.sawtooth) await this._nextCycle(it);
+  }
+
+  // ---- Sawtooth (siteMode "sawtooth") ----
+  // Merge steps wait SAW_SETTLE intervals after growth, merge at most
+  // SAW_MAX_MERGE of the active sites at a time, and cycles must end by
+  // SAW_END of the run, leaving the rest to refine.
+  // Grow (geometrically, up to max sites), then merge until a batch doesn't
+  // pay or nothing does, then grow again, and so on. A new cycle starts only
+  // if the last merge phase removed something and a whole cycle (its growth
+  // steps, two merge steps and one more to settle) still fits in the run.
+  // Before growing, the surviving sites are compacted to the front of the
+  // buffers so growth has room again.
+
+  async _nextCycle(it) {
+    const args = this.args;
+    const every = this._pruneInterval();
+    const steps = growthCounts(this.activeEstimate, args.growFactor, this.bufferCapacity).length;
+    const need = steps * args.growEvery + (SAW_SETTLE + 2) * every;
+    if (!(this.cycleMerged > 0)) { this._log(`Sawtooth done: the last merge phase removed nothing.`); return; }
+    if (it + need > SAW_END * args.iters) {
+      this._log(`Sawtooth done: another cycle (~${need} iterations) wouldn't end by ${Math.round(SAW_END * 100)}% of the run.`);
+      return;
+    }
+    await this._compactSites();
+    this.cycle += 1;
+    this.cycleMerged = 0;
+    this.growDoneIter = null;
+    this.growStop = null;
+    this.growMdlBits = undefined;
+    this.pruneStop = null;
+    this.prunePending = null;
+    this._log(`Sawtooth cycle ${this.cycle + 1} @${it}: growing again from ${this.activeEstimate} sites.`);
+  }
+
+  // Moves the active sites (and their Adam moments) to the front, in order,
+  // marks the rest inactive, and rebuilds the candidate lists.
+  async _compactSites() {
+    const device = this.device;
+    const n = this.siteCount;
+    const sites = await readSites(device, this.sitesBuf, n);
+    const adamBytes = n * ADAM_FLOATS * 4;
+    const staging = device.createBuffer({ size: adamBytes, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    const encoder = device.createCommandEncoder();
+    encoder.copyBufferToBuffer(this.adamBuf, 0, staging, 0, adamBytes);
+    device.queue.submit([encoder.finish()]);
+    await staging.mapAsync(GPUMapMode.READ);
+    const adam = new Float32Array(staging.getMappedRange()).slice();
+    staging.unmap();
+    staging.destroy();
+    const outSites = new Float32Array(n * SITE_FLOATS);
+    const outAdam = new Float32Array(n * ADAM_FLOATS);
+    let m = 0;
+    for (let i = 0; i < n; i += 1) {
+      if (!(sites[i * SITE_FLOATS] >= 0)) continue;
+      outSites.set(sites.subarray(i * SITE_FLOATS, (i + 1) * SITE_FLOATS), m * SITE_FLOATS);
+      outAdam.set(adam.subarray(i * ADAM_FLOATS, (i + 1) * ADAM_FLOATS), m * ADAM_FLOATS);
+      m += 1;
+    }
+    for (let i = m; i < n; i += 1) { outSites[i * SITE_FLOATS] = -1; outSites[i * SITE_FLOATS + 1] = -1; }
+    device.queue.writeBuffer(this.sitesBuf, 0, outSites);
+    device.queue.writeBuffer(this.adamBuf, 0, outAdam);
+    this.siteCount = this.actualSites = this.activeEstimate = m;
+    updateClearParamsBuffer(device.queue, this.countParams, m);
+    updateGradParamsBuffer(device.queue, this.gradParams, m, this.invScaleSq);
+    this.growPending = null; // site ids changed
+    this._rebuildCandidates(m);
   }
 
   // Insertion growth (insert.js): up to `count` new sites picked greedily by
@@ -1210,7 +1293,10 @@ export class Trainer {
     if (it >= args.growEndIter) { this._endGrowth(it, "growEndIter safety stop"); return; }
     if (it === 0 || it % args.growEvery !== 0) return;
     const n0 = this.siteCount;
-    const target = growTarget(args, this.growStartCount, n0, it);
+    // Sawtooth: every cycle grows geometrically from where pruning left off.
+    const target = this.sawtooth
+      ? growthCounts(n0, args.growFactor, this.bufferCapacity)[0] ?? n0
+      : growTarget(args, this.growStartCount, n0, it);
     if (target <= n0) return; // "decay" late in the run: nothing due this step
     if (args.growPatience > 0 && this.best && this.growSteps - this.best.growStep >= args.growPatience) {
       this._restoreBest(`no better ${args.keepBest} score in ${args.growPatience} growth step(s)`);
@@ -1610,6 +1696,7 @@ export class Trainer {
       restoredBest: this.restoredBest,
       pruneStop: this.pruneStop,
       pruneMerged: this.pruneMerged,
+      cycles: this.sawtooth ? this.cycle + 1 : 0,
       activeSites: this.activeEstimate,
       trainSeconds: (performance.now() - this.trainStartMs) / 1000,
     };
@@ -1709,6 +1796,10 @@ export function siteSplit(stats, i) {
 }
 
 const SITE_STAT_CH = 18; // channels per site in site_stats.wgsl's output
+
+const SAW_SETTLE = 2;      // sawtooth: merge intervals to wait after growth
+const SAW_MAX_MERGE = 0.25; // sawtooth: most merges per step, as a fraction of active sites
+const SAW_END = 0.7;       // sawtooth: cycles must end by this fraction of the run
 
 // Description length in bits of sites [0, n)'s cells, each at its mean color
 // (site_stats.wgsl's owner moments): `sites` × BITS_PER_SITE plus `samples`

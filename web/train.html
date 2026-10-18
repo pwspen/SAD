@@ -678,8 +678,8 @@
 
         <h3 class="has-tip" tabindex="0">Site count<span class="tip" role="tooltip">How many sites the run uses. <b>Fixed</b>: exactly the number you give, for the whole run. <b>Grow</b>: start from a few sites and multiply the count by a factor on a regular schedule, splitting the cells where a second site would explain the most color structure, until <b>max sites</b> (or earlier, once new sites aren't worth their bits at λ). Sites are never removed. Each site costs 128 bits: bpp = sites × 128 / (width × height).</span></h3>
         <div class="param">
-          <div class="row"><label>mode</label><select id="p-siteMode" aria-label="Site count mode"><option value="grow">grow</option><option value="fixed">fixed</option></select></div>
-          <div class="tip" role="tooltip"><b>grow</b>: start sites → max sites, × <b>factor</b> every <b>grow every</b> iterations. <b>fixed</b>: the count is <b>sites</b>. Only the fields for the chosen mode are shown.</div>
+          <div class="row"><label>mode</label><select id="p-siteMode" aria-label="Site count mode"><option value="grow">grow</option><option value="sawtooth">sawtooth</option><option value="fixed">fixed</option></select></div>
+          <div class="tip" role="tooltip"><b>grow</b>: start sites → max sites, × <b>factor</b> every <b>grow every</b> iterations. <b>sawtooth</b>: grow × <b>factor</b> up to max sites, then merge sites that don't pay for their bits (as <b>prune every</b>, which defaults to 5 × grow every here) until a batch doesn't pay, then grow again, and so on. Merging waits 2 merge intervals after growth, takes at most a quarter of the sites per step, and cycles stop once one wouldn't end within 70% of the run. On Kodak at 256 px (max 800) it ended at ~510 sites with a better description length than 800; on MNIST it beat a fixed 16 but not a single grow-then-prune. <b>fixed</b>: the count is <b>sites</b>. Only the fields for the chosen mode are shown.</div>
         </div>
         <div class="param" data-site-mode="fixed">
           <div class="row"><label>sites</label><input id="p-sites" type="number" /></div>
