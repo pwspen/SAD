@@ -511,6 +511,8 @@ export class Trainer {
     // Growth state: the iteration it ended (null while growing) and why.
     this.growDoneIter = this.usesGrow ? null : 0;
     this.growGen = 0; // growth steps that added sites (see growLrDecay)
+    // CPU copy of each site's birth growth step (adam[21]), for per-site LRs.
+    this.siteBirthGen = new Uint32Array(this.bufferCapacity);
     this.growSteps = 0; // growth steps taken (growPatience)
     this.growMdlBits = undefined; // cellMdlBits at the last growth step ("mdl" criterion)
     this.growStop = null;
@@ -547,7 +549,7 @@ export class Trainer {
     this.device.queue.submit([encoder.finish()]);
     this.best = {
       it, score, err, psnr, sites, siteCount: this.siteCount, growGen: this.growGen,
-      growStep: this.growSteps,
+      growStep: this.growSteps, siteBirthGen: this.siteBirthGen.slice(),
     };
   }
 
@@ -564,6 +566,7 @@ export class Trainer {
     this.siteCount = this.actualSites = b.siteCount;
     this.activeEstimate = b.sites;
     this.growGen = b.growGen;
+    this.siteBirthGen.set(b.siteBirthGen);
     updateClearParamsBuffer(queue, this.countParams, b.siteCount);
     updateGradParamsBuffer(queue, this.gradParams, b.siteCount, this.invScaleSq);
     this._rebuildCandidates(b.siteCount);
@@ -788,6 +791,7 @@ export class Trainer {
             type: "iter",
             it, iters,
             lrScale,
+            siteLr: this._siteLrs(lrScale, sitesData, siteCount),
             psnr,
             gradStats,
             activeSites,
@@ -898,6 +902,20 @@ export class Trainer {
     if (this.onLog) this.onLog({ type: "growthGain", ...entry });
   }
 
+  // LR multiplier of each site this step: lrScale × growLrDecay^age, as in
+  // adam.wgsl (age = growth steps since the site's birth). NaN for removed
+  // sites. `sites` is the RGB readback (SITE_FLOATS each).
+  _siteLrs(lrScale, sites, n) {
+    const out = new Float32Array(n);
+    for (let i = 0; i < n; i += 1) {
+      const age = this.growGen - this.siteBirthGen[i];
+      out[i] = sites[i * SITE_FLOATS] >= 0
+        ? lrScale * (age > 0 ? this.args.growLrDecay ** age : 1)
+        : NaN;
+    }
+    return out;
+  }
+
   _endGrowth(it, reason) {
     this.growDoneIter = it;
     this.growStop = reason;
@@ -950,6 +968,7 @@ export class Trainer {
       const enc = encodeSiteColors(old, 1, this.colorSpace);
       queue.writeBuffer(this.sitesBuf, sp.site * SITE_FLOATS * 4, enc);
       queue.writeBuffer(this.adamBuf, sp.site * ADAM_FLOATS * 4, adam);
+      this.siteBirthGen[sp.site] = this.growGen;
     });
     return { data, k, predicted: splits.map((sp) => sp.gain), best: splits[0].gain };
   }
@@ -1049,6 +1068,7 @@ export class Trainer {
       adamNew[j * ADAM_FLOATS + 21] = this.growGen;
     }
     queue.writeBuffer(this.adamBuf, n0 * ADAM_FLOATS * 4, adamNew);
+    this.siteBirthGen.fill(this.growGen, n0, n0 + k);
     this.growPending = { it, sites: batch.predicted.map((predicted, j) => ({ id: n0 + j, predicted })) };
 
     const n1 = n0 + k;

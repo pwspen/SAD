@@ -90,7 +90,7 @@ const state = {
   lastPsnr: null,        // persists between log ticks so preview updates don't blank the PSNR
   lastLrScale: null,     // schedule × LR mult at the last log tick
   lastActiveSites: 0,    // active sites at the last log tick (site-spacing reference lines)
-  psnrHistory: [],       // [{ it, psnr, sites }] from log ticks, plotted in the PSNR card
+  psnrHistory: [],       // [{ it, psnr, sites, siteLr }] from log ticks, plotted in the PSNR card
   psnrIters: 0,
   bppRuns: [],           // [{ sites, bpp, colorSpace, points: [{ it, psnr, sites, bpp }] }] per run on this target; last is current
   gradHistory: [],       // [{ it, stats }] per-param |grad| mean/max from log ticks
@@ -387,7 +387,7 @@ const VIEWS = {
                 note: "Per-site tau as a heatmap (extra GPU render pass)." },
   psnr:       { label: "PSNR vs iteration", kind: "plot", source: "train", on: ["log", "run"],
                 draw: drawPsnrPlot, hit: hitPsnr,
-                note: "Masked PSNR the trainer computes at each log tick, with the active site count on the right axis." },
+                note: "Masked PSNR the trainer computes at each log tick, with the active site count and each site's LR multiplier (schedule × growth LR decay) on the right axes." },
   bpp:        { label: "PSNR vs bpp", kind: "plot", source: "derived", on: ["log", "run", "target"],
                 draw: drawBppPlot, hit: hitBpp,
                 note: `Estimated rate: active sites × ${BITS_PER_SITE} bits / pixels. The bits per site are an ` +
@@ -1195,45 +1195,68 @@ function iterRange() {
   return { min: 0, max: Math.max(1, state.psnrIters, last) };
 }
 
-// Right-hand y axis for a second series on the same box (labels and title
-// only; the grid follows the left axis). Integer ticks only.
-function drawRightAxis(p, g, { title, spacing = 48 }) {
+// Right-hand y axis for another series on the same box (labels and title
+// only; the grid follows the left axis), `offset` px right of the plot.
+// Linear axes label integer ticks only.
+function drawRightAxis(p, g, { title, offset = 0, fmt = String, spacing = 48 }) {
   const { ctx, col } = p;
   ctx.font = PLOT_FONT;
   ctx.textAlign = "left";
   ctx.textBaseline = "middle";
   ctx.fillStyle = col.soft;
   for (const v of axisTicks(g.yr, g.bottom - g.top, spacing)) {
-    if (Number.isInteger(v)) ctx.fillText(String(v), g.right + 6, Math.round(g.y(v)) + 0.5);
+    if (g.yr.log || Number.isInteger(v)) ctx.fillText(fmt(v), g.right + offset + 6, Math.round(g.y(v)) + 0.5);
   }
   ctx.save();
   ctx.fillStyle = col.dim;
   ctx.textAlign = "center";
-  ctx.translate(p.w - 12, (g.top + g.bottom) / 2);
+  ctx.translate(g.right + offset + 38, (g.top + g.bottom) / 2);
   ctx.rotate(Math.PI / 2);
   ctx.fillText(title, 0, 0);
   ctx.restore();
 }
 
 const SITES_LINE_COLOR = SERIES_COLORS[0];
-const PSNR_PAD = { ...LEGEND_PAD, right: 46 }; // room for the sites axis
+const SITE_LR_COLOR = SERIES_COLORS[2];
+const SITE_LR_AXIS_OFFSET = 46; // the LR axis sits outside the sites axis
+const PSNR_PAD = { ...LEGEND_PAD, right: 96 }; // room for the sites and LR axes
 
 function drawPsnrPlot(view) {
   const p = beginPlot(view);
   if (!p) return;
   const data = state.psnrHistory;
-  let lo = Infinity, hi = -Infinity, maxSites = 1;
-  for (const d of data) { lo = Math.min(lo, d.psnr); hi = Math.max(hi, d.psnr); maxSites = Math.max(maxSites, d.sites); }
-  const top = drawLegend(p, [{ label: "PSNR", color: PSNR_LINE_COLOR }, { label: "sites", color: SITES_LINE_COLOR }]) + 10;
+  let lo = Infinity, hi = -Infinity, maxSites = 1, lrLo = Infinity, lrHi = -Infinity, nSites = 0;
+  for (const d of data) {
+    lo = Math.min(lo, d.psnr); hi = Math.max(hi, d.psnr); maxSites = Math.max(maxSites, d.sites);
+    if (!d.siteLr) continue;
+    nSites = Math.max(nSites, d.siteLr.length);
+    for (const v of d.siteLr) if (v > 0) { lrLo = Math.min(lrLo, v); lrHi = Math.max(lrHi, v); }
+  }
+  const top = drawLegend(p, [
+    { label: "PSNR", color: PSNR_LINE_COLOR },
+    { label: "sites", color: SITES_LINE_COLOR },
+    { label: "LR (one line per site)", color: SITE_LR_COLOR },
+  ]) + 10;
   const box = plotBox(p, top, PSNR_PAD);
   const g = view.geom = plotAxes(box, iterRange(), linRange(lo, hi, [0, 40]));
   const gs = plotAxes(box, g.xr, { min: 0, max: Math.ceil(maxSites * 1.08) });
+  const gl = plotAxes(box, g.xr, decadeRange(lrLo, lrHi, [1e-3, 10]));
   drawAxes(p, g, { xTitle: "iteration", yTitle: "PSNR (dB)", xFmt: fmtIter });
   drawRightAxis(p, gs, { title: "sites" });
+  drawRightAxis(p, gl, { title: "LR multiplier", offset: SITE_LR_AXIS_OFFSET, fmt: fmtLogTick });
   if (!data.length) {
     drawEmpty(p, g, state.running ? "Waiting for first log tick…" : "Train to see PSNR");
     return;
   }
+  // Each site's line starts at the first tick it exists at.
+  p.ctx.save();
+  p.ctx.globalAlpha = 0.6;
+  for (let i = 0; i < nSites; i += 1) {
+    const pts = [];
+    for (const d of data) if (d.siteLr && i < d.siteLr.length) pts.push([d.it, d.siteLr[i]]);
+    drawLine(p, gl, pts, SITE_LR_COLOR, { width: 1 });
+  }
+  p.ctx.restore();
   // Sites change in steps at growth; draw them as a step line.
   drawLine(p, gs, data.flatMap((d, i) => (i && d.sites !== data[i - 1].sites
     ? [[d.it, data[i - 1].sites], [d.it, d.sites]] : [[d.it, d.sites]])), SITES_LINE_COLOR, { width: 1.5 });
@@ -1244,10 +1267,17 @@ function drawPsnrPlot(view) {
   drawMarker(p, gs, mark.it, mark.sites, SITES_LINE_COLOR);
   drawMarker(p, g, mark.it, mark.psnr, PSNR_LINE_COLOR);
   if (hover) {
-    drawTooltip(p, g, g.x(hover.it), g.y(hover.psnr),
-      { rows: [{ cells: [`iter ${hover.it} · ${hover.psnr.toFixed(2)} dB · ${hover.sites} sites`] }] });
+    const lrs = hover.siteLr ? [...hover.siteLr].filter(Number.isFinite) : [];
+    const lrText = !lrs.length ? []
+      : [`LR ${fmtSig3(Math.min(...lrs))}${Math.min(...lrs) !== Math.max(...lrs) ? ` – ${fmtSig3(Math.max(...lrs))}` : ""}`];
+    drawTooltip(p, g, g.x(hover.it), g.y(hover.psnr), {
+      rows: [{ cells: [`iter ${hover.it} · ${hover.psnr.toFixed(2)} dB · ${hover.sites} sites`] },
+             ...lrText.map((t) => ({ color: SITE_LR_COLOR, cells: [t] }))],
+    });
   }
 }
+
+const fmtSig3 = (v) => String(Number(v.toPrecision(3)));
 
 function hitPsnr(g, mx) {
   return nearestX(g, state.psnrHistory, (d) => d.it, mx);
@@ -2595,7 +2625,7 @@ async function startTraining() {
                              sites: info.totalSites, it: info.it, iters: info.iters };
         updatePlanSummary();
         if (Number.isFinite(info.psnr)) {
-          state.psnrHistory.push({ it: info.it, psnr: info.psnr, sites: info.activeSites });
+          state.psnrHistory.push({ it: info.it, psnr: info.psnr, sites: info.activeSites, siteLr: info.siteLr });
           const run = state.bppRuns[state.bppRuns.length - 1];
           run.sites = info.activeSites;
           run.bpp = computeBpp(info.activeSites, info.width, info.height);
