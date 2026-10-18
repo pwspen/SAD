@@ -1,0 +1,31 @@
+{
+  "_note": "Trainer settings (camelCase = buildArgs args, UPPER_CASE = training_config.json keys, as in node/sweep.mjs --set) tuned on Kodak 768x512: growing 1 -> 100 sites over 1000 iterations, by mean final PSNR over 8 Kodak images, checked on the other 16 (commit adfadf0). Tuned with squared-error loss, before the loss option existed; growLrDecay 1 = off. Everything not listed comes from training_config.json.",
+  "args": {
+    "warmupIters": 200,
+    "decayIters": 800,
+    "lrMult": 8,
+    "lrSchedule": "fixed",
+    "loss": "l2",
+    "colorSpace": "rgb",
+    "lrPosBase": 0.1,
+    "lrTauBase": 0.005,
+    "lrRadiusBase": 0.01,
+    "lrColorBase": 0.01,
+    "lrDirBase": 0.0025,
+    "lrAnisoBase": 0.025,
+    "INIT_LOG_TAU": 5,
+    "INIT_RADIUS": 4,
+    "siteMode": "grow",
+    "growInitSites": 1,
+    "growMaxSites": 100,
+    "growEvery": 10,
+    "growFactor": 3,
+    "growLambda": 400,
+    "growBlur": 0,
+    "growLrDecay": 1,
+    "candFreq": 8,
+    "candHilbertWindow": 32,
+    "candHilbertProbes": 1,
+    "candInjectCount": 4
+  }
+}
