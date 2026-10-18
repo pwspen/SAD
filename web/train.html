@@ -760,6 +760,11 @@
           <p class="help"><span class="unit">growth steps without a better score</span></p>
           <div class="tip" role="tooltip">With <b>keep best</b> on: if this many growth steps in a row haven't produced a better score, growth ends, the run goes back to the best state and spends the remaining iterations refining it. 0 = never (grow to <b>max sites</b> or λ, and only go back at the end of the run).</div>
         </div>
+        <div class="param">
+          <div class="row"><label>prune every</label><input id="p-pruneEvery" type="number" min="0" /></div>
+          <p class="help"><span class="unit">iterations between merge steps (0 = off)</span></p>
+          <div class="tip" role="tooltip">Once growth is over (any time with a fixed count), merge neighbouring sites that don't pay for their 128 bits. Each step scores every pair of neighbouring cells by how much squared error merging them would add with the merged cell at its mean color (Ward's criterion), and merges the cheapest pairs whose cost is below what a site's bits are worth. The merged site is the pixel-count-weighted average of both sites' parameters (anisotropy axes averaged as orientations). The next step keeps the batch only if the render's description length (as <b>keep best → description length</b>) went down; otherwise it's undone and pruning ends. In tests on MNIST, growing to 64 and pruning ended at ~18 sites, better in both sites and error than a fixed 16; on Kodak at 256 px it kept all 800.</div>
+        </div>
 
         <h3>Logging</h3>
         <div class="param">

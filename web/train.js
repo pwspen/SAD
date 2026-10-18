@@ -70,6 +70,7 @@ const UI_FIELDS = [
   ["growMode", "p-growMode"],
   ["keepBest", "p-keepBest"],
   ["growCriterion", "p-growCriterion"],
+  ["pruneEvery", "p-pruneEvery"],
   ["growPatience", "p-growPatience"],
 ];
 
@@ -2730,7 +2731,7 @@ async function startTraining() {
     state.lastHeatmap = null;
     recordBandSnr(args.iters);
     await refreshViews("render");
-    appendLog(`Done. Best PSNR: ${final.bestPsnr.toFixed(2)} dB | time: ${final.trainSeconds.toFixed(2)} s | active: ${final.count}`);
+    appendLog(`Done. Best PSNR: ${final.bestPsnr.toFixed(2)} dB | time: ${final.trainSeconds.toFixed(2)} s | active: ${final.activeSites ?? final.count}`);
     updateProgress(args.iters, args.iters,
       `done · best ${final.bestPsnr.toFixed(2)} dB · ${final.trainSeconds.toFixed(1)}s`);
     ui.saveBtn.disabled = false;

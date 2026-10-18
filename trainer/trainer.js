@@ -71,6 +71,7 @@ import {
 import { RadixSortUInt2 } from "./radix_sort.js?v=shared-wgsl-20261017";
 import { BITS_PER_SITE } from "./io.js";
 import { insertionField, pickInsertions } from "./insert.js?v=insert-20261018";
+import { cellMoments, pickMerges, mergedSite } from "./merge.js?v=merge-20261018";
 import {
   colorSpaceFor,
   specializeShaders,
@@ -316,6 +317,9 @@ export function buildArgs(config, overrides = {}) {
     // While growing: end growth and go back to the best state once that many
     // growth steps in a row haven't beaten it (keepBest score; 0 = never).
     growPatience: Math.max(0, Math.floor(Number(pick("growPatience", "GROW_PATIENCE", 0)))),
+    // Merge neighbouring sites that don't pay for their bits (merge.js) every
+    // this many iterations once growth is over (0 = never); see _pruneStep.
+    pruneEvery: Math.max(0, Math.floor(Number(pick("pruneEvery", "PRUNE_EVERY", 0)))),
   };
   // "fixed": exactly `sites` for the whole run. "grow": rate-distortion growth.
   const siteMode = pick("siteMode", "SITE_MODE", "grow");
@@ -580,6 +584,10 @@ export class Trainer {
     this.siteBirthGen = new Uint32Array(this.bufferCapacity);
     this.growSteps = 0; // growth steps taken (growPatience)
     this.growMdlBits = undefined; // cellMdlBits at the last growth step ("mdl" criterion)
+    // Pruning: the merge batch on trial ({ it, bits, k }) and why pruning ended.
+    this.prunePending = null;
+    this.pruneStop = null;
+    this.pruneMerged = 0;
     this.growStop = null;
     if (this.usesGrow) this._updateFitTarget();
 
@@ -734,6 +742,7 @@ export class Trainer {
       }
 
       if (this.usesGrow) await this._growStep(it);
+      if (args.pruneEvery > 0) await this._pruneStep(it);
       const siteCount = this.siteCount;
       const activeSites = this.activeEstimate;
       const updateCandidates = (it % candUpdateFreq === 0);
@@ -1038,16 +1047,13 @@ export class Trainer {
     return { data, k, predicted: splits.map((sp) => sp.gain), best: splits[0].gain };
   }
 
-  // Insertion growth (insert.js): up to `count` new sites picked greedily by
-  // their exact gain in the training loss; existing sites are untouched.
-  async _insertBatch(n0, count, threshold) {
-    const device = this.device;
-    const sitesRgb = await this._readSitesRgb(n0);
-    // Candidate textures are rgba32uint; the float readback copies their bytes
-    // unchanged (same-type typed-array copies are bitwise).
+  // The candidate lists as 8 u32 site ids per candidate pixel. The textures
+  // are rgba32uint; the float readback copies their bytes unchanged
+  // (same-type typed-array copies are bitwise).
+  async _readCandidates() {
     const [c0, c1] = await Promise.all([
-      readRgba32FloatTexture(device, this.cand0A, this.candWidth, this.candHeight),
-      readRgba32FloatTexture(device, this.cand1A, this.candWidth, this.candHeight),
+      readRgba32FloatTexture(this.device, this.cand0A, this.candWidth, this.candHeight),
+      readRgba32FloatTexture(this.device, this.cand1A, this.candWidth, this.candHeight),
     ]);
     const u0 = new Uint32Array(c0.buffer), u1 = new Uint32Array(c1.buffer);
     const cand = new Uint32Array(this.candWidth * this.candHeight * 8);
@@ -1055,6 +1061,118 @@ export class Trainer {
       cand.set(u0.subarray(i * 4, i * 4 + 4), i * 8);
       cand.set(u1.subarray(i * 4, i * 4 + 4), i * 8 + 4);
     }
+    return cand;
+  }
+
+  // ---- Pruning (args.pruneEvery) ----
+  // Every pruneEvery iterations after growth (any time in fixed mode), until
+  // pruneEvery before the end: the last merge batch, refined since, is kept
+  // only if the render's description length (selectionScore "mdl": sites ×
+  // BITS_PER_SITE + the training loss's residual bits) went down, else it's
+  // undone and pruning ends. Ward costs on cells at their mean colors
+  // underestimate what a merge costs the soft render, so they only pick the
+  // candidates: judged on the cell model instead, Kodak at 256 px went from
+  // 800 to 300 sites for a worse render score than keeping all 800. Then the
+  // merges that pay for their bits are applied (pickMerges): the larger cell's site becomes
+  // the pixel-weighted average of the pair, the other is deactivated, both
+  // get fresh Adam moments, and the candidate lists are rebuilt. Pruning also
+  // ends when no merge pays. An accepted batch restarts keepBest, which
+  // would otherwise go back to a state with more sites.
+
+  async _pruneStep(it) {
+    const args = this.args;
+    if (this.pruneStop || it === 0 || it % args.pruneEvery !== 0) return;
+    if (this.usesGrow && (this.growDoneIter === null || it - this.growDoneIter < args.pruneEvery)) return;
+    const n = this.siteCount;
+    const sites = await this._readSitesRgb(n);
+    const moments = cellMoments({
+      width: this.width, height: this.height, sites, n, cand: await this._readCandidates(),
+      candWidth: this.candWidth, candHeight: this.candHeight, target: this.target, mask: this.maskCpu,
+    });
+    const bits = selectionScore("mdl", {
+      err: await this._renderLoss(), sites: this.activeEstimate, samples: this.samples, loss: args.loss,
+    });
+    const pending = this.prunePending;
+    this.prunePending = null;
+    if (pending) {
+      if (!(bits < pending.bits)) {
+        this._restorePruneSnapshot();
+        this._endPrune(it, `the last ${pending.k} merge(s) didn't pay for their bits ` +
+          `(${(pending.bits / 8192).toFixed(2)} → ${(bits / 8192).toFixed(2)} KiB), undone`);
+        return;
+      }
+      this.pruneMerged += pending.k;
+      this.best = null; // keepBest restarts from the pruned state
+    }
+    if (it > args.iters - args.pruneEvery) { this._endPrune(it, "too close to the end of the run"); return; }
+    const merges = pickMerges(moments, this.samples, BITS_PER_SITE);
+    if (!merges.length) { this._endPrune(it, "no merge would pay for its bits"); return; }
+
+    const device = this.device;
+    const queue = device.queue;
+    const snap = device.createCommandEncoder();
+    this.pruneSitesBuf ??= device.createBuffer({ size: this.bufferCapacity * SITE_FLOATS * 4,
+      usage: GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
+    this.pruneAdamBuf ??= device.createBuffer({ size: this.bufferCapacity * ADAM_FLOATS * 4,
+      usage: GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
+    snap.copyBufferToBuffer(this.sitesBuf, 0, this.pruneSitesBuf, 0, this.bufferCapacity * SITE_FLOATS * 4);
+    snap.copyBufferToBuffer(this.adamBuf, 0, this.pruneAdamBuf, 0, this.bufferCapacity * ADAM_FLOATS * 4);
+    queue.submit([snap.finish()]);
+    this.pruneSnapshot = { active: this.activeEstimate, growGen: this.growGen };
+
+    this.growGen += 1;
+    const adam = new Float32Array(ADAM_FLOATS);
+    adam[20] = it;
+    adam[21] = this.growGen;
+    const inactive = new Float32Array(SITE_FLOATS);
+    inactive[0] = -1;
+    inactive[1] = -1;
+    for (const { keep, drop } of merges) {
+      const merged = mergedSite(sites, keep, drop, moments.count[keep], moments.count[drop]);
+      queue.writeBuffer(this.sitesBuf, keep * SITE_FLOATS * 4, encodeSiteColors(merged, 1, this.colorSpace));
+      queue.writeBuffer(this.sitesBuf, drop * SITE_FLOATS * 4, inactive);
+      queue.writeBuffer(this.adamBuf, keep * ADAM_FLOATS * 4, adam);
+      queue.writeBuffer(this.adamBuf, drop * ADAM_FLOATS * 4, adam);
+    }
+    this.activeEstimate -= merges.length;
+    this._rebuildCandidates(n);
+    this.prunePending = { it, bits, k: merges.length };
+    this._log(`Prune @${it}: merged ${merges.length} pair(s) → ${this.activeEstimate} sites ` +
+              `| cheapest ${fmtLambda(merges[0].cost * 255 * 255)} levels², on trial until iter ${it + args.pruneEvery}`);
+  }
+
+  // Mean training loss per sample of the current state (renders and reads back).
+  async _renderLoss() {
+    updateParamsBuffer(this.device.queue, this.renderParams, this._paramsArgs(this.siteCount, 0, 0));
+    const encoder = this.device.createCommandEncoder();
+    this.renderEnc.encode(encoder, this.sitesBuf, this.renderParams,
+      this.cand0A, this.cand1A, this.renderTex, this.width, this.height);
+    this.device.queue.submit([encoder.finish()]);
+    const rgba = await readRgba32FloatTexture(this.device, this.renderTex, this.width, this.height);
+    return computeLoss(rgba, this.target, this.width, this.height, this.maskCpu, this.args.loss);
+  }
+
+  _restorePruneSnapshot() {
+    const encoder = this.device.createCommandEncoder();
+    encoder.copyBufferToBuffer(this.pruneSitesBuf, 0, this.sitesBuf, 0, this.bufferCapacity * SITE_FLOATS * 4);
+    encoder.copyBufferToBuffer(this.pruneAdamBuf, 0, this.adamBuf, 0, this.bufferCapacity * ADAM_FLOATS * 4);
+    this.device.queue.submit([encoder.finish()]);
+    this.activeEstimate = this.pruneSnapshot.active;
+    this.growGen = this.pruneSnapshot.growGen;
+    this._rebuildCandidates(this.siteCount);
+  }
+
+  _endPrune(it, reason) {
+    // A batch still on trial at the end of the run stays (keepBest decides).
+    this.pruneStop = reason;
+    this._log(`Pruning done at iter ${it}: ${this.activeEstimate} sites, ${this.pruneMerged} merged (${reason}).`);
+  }
+
+  // Insertion growth (insert.js): up to `count` new sites picked greedily by
+  // their exact gain in the training loss; existing sites are untouched.
+  async _insertBatch(n0, count, threshold) {
+    const sitesRgb = await this._readSitesRgb(n0);
+    const cand = await this._readCandidates();
     const field = insertionField({
       width: this.width, height: this.height, sites: sitesRgb, siteCount: n0,
       cand, candWidth: this.candWidth, candHeight: this.candHeight,
@@ -1490,6 +1608,9 @@ export class Trainer {
       growthGain: this.growGainHistory || [],
       best: this.best,
       restoredBest: this.restoredBest,
+      pruneStop: this.pruneStop,
+      pruneMerged: this.pruneMerged,
+      activeSites: this.activeEstimate,
       trainSeconds: (performance.now() - this.trainStartMs) / 1000,
     };
   }
@@ -1512,6 +1633,7 @@ export class Trainer {
       this.blurTex, this.blurTmpTex, this.growBlurParams, this.growSeedParams,
       ...(this.growJfaParams || []), this.siteStatsParams, this.siteStatsBuf,
       this.bestSitesBuf, this.bestAdamBuf, this.rebuildParams, this.editSeedParams,
+      this.pruneSitesBuf, this.pruneAdamBuf,
     ];
     if (this.hilbertRes) {
       owned.push(this.hilbertRes.pairs, this.hilbertRes.order, this.hilbertRes.pos);

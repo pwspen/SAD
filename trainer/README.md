@@ -27,6 +27,14 @@ both import it. Hyperparameter defaults come from `training_config.json`.
 8-bit precision), and growth ends once a batch hasn't lowered it. Judged on realized gains, so it can stop early
 where a new batch needs longer than `growEvery` to pay off (MNIST stops at ~2 sites).
 
+`pruneEvery` (0 = off) merges neighbouring sites that don't pay for their bits, every that many
+iterations once growth is over (`merge.js`). Pairs are scored by Ward's criterion on cells at their
+mean colors and merged cheapest first while the cost stays under a site's bits; the merged site is
+the pixel-weighted average of every parameter (anisotropy axes as doubled angles). Each batch is
+kept only if the render's description length went down by the next step, else undone and pruning
+ends. On MNIST, growing to 64 and pruning ended at ~18 sites, better in sites and error than a
+fixed 16; on Kodak at 256 px it kept all 800, as the description length says it should.
+
 `keepBest` scores every log tick and ends the run on the best state seen, restored exactly
 (sites and Adam moments, candidate lists rebuilt): `"loss"` (default, lowest training loss),
 `"mdl"` (description length: sites × `BITS_PER_SITE` plus the residual coded at 8-bit precision
