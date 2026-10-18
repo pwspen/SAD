@@ -126,6 +126,23 @@ export function selectionScore(kind, { err, sites, samples, loss }) {
   return sites * BITS_PER_SITE + samples * Math.max(0, perSample);
 }
 
+// When growth stops early (args.growCriterion).
+// "lambda": a new site's predicted gain must beat λ × BITS_PER_SITE
+// (growLambda), in the gain's units.
+// "mdl": growth goes on while each batch pays for its bits. At every growth
+// step the current cells are scored by description length,
+// sites × BITS_PER_SITE + (S/2)·log2(2πe·σ²) with σ² the squared error per
+// sample of every cell at its mean color (S samples; cellMdlBits), and growth
+// ends once a batch, after growEvery iterations to settle, hasn't lowered it.
+// Scoring the cells at their best colors leaves out the error the fit simply
+// hasn't removed yet. Predicted gains can't be used here: at small counts they
+// miss most of what a new site does once optimized (a ramp across a centred
+// digit explains almost nothing), and an MDL bar on them stops MNIST at 1 site.
+export const GROW_CRITERIA = {
+  lambda: "λ (predicted gain per bit)",
+  mdl: "description length (realized)",
+};
+
 // How growth adds sites (args.growMode).
 export const GROW_MODES = {
   split: "split cells",       // split the cells a linear color ramp explains best (siteSplit)
@@ -234,6 +251,9 @@ export function buildArgs(config, overrides = {}) {
     // existed before it (split parents count as new) by this; 1 = off.
     growLrDecay: Math.max(0, Number(pick("growLrDecay", "GROW_LR_DECAY", 1))),
     growMode: String(pick("growMode", "GROW_MODE", "split")),
+    // What a new site's gain must beat (GROW_CRITERIA); growLambda applies
+    // only to "lambda".
+    growCriterion: String(pick("growCriterion", "GROW_CRITERION", "lambda")),
     // Keep the best log tick by this score (KEEP_BEST) and end on it.
     keepBest: String(pick("keepBest", "KEEP_BEST", "loss")),
     // While growing: end growth and go back to the best state once that many
@@ -261,6 +281,9 @@ export function buildArgs(config, overrides = {}) {
   colorSpaceFor(args.colorSpace); // fail early on an unknown name
   if (!GROW_MODES[args.growMode]) {
     throw new Error(`growMode must be one of ${Object.keys(GROW_MODES).join(", ")} (got "${args.growMode}")`);
+  }
+  if (!GROW_CRITERIA[args.growCriterion]) {
+    throw new Error(`growCriterion must be one of ${Object.keys(GROW_CRITERIA).join(", ")} (got "${args.growCriterion}")`);
   }
   if (!KEEP_BEST[args.keepBest]) {
     throw new Error(`keepBest must be one of ${Object.keys(KEEP_BEST).join(", ")} (got "${args.keepBest}")`);
@@ -496,6 +519,7 @@ export class Trainer {
     this.growDoneIter = this.usesGrow ? null : 0;
     this.growGen = 0; // growth steps that added sites (see growLrDecay)
     this.growSteps = 0; // growth steps taken (growPatience)
+    this.growMdlBits = undefined; // cellMdlBits at the last growth step ("mdl" criterion)
     this.growStop = null;
     if (this.usesGrow) this._updateFitTarget();
 
@@ -1004,13 +1028,25 @@ export class Trainer {
     const queue = device.queue;
     const n0 = this.siteCount;
     const target = growthCounts(n0, args.growFactor, this.bufferCapacity)[0];
-    const threshold = args.growLambda * BITS_PER_SITE;
+    const mdl = args.growCriterion === "mdl";
+    if (mdl) {
+      const bits = cellMdlBits(stats, n0, this.activeEstimate, this.samples);
+      const prev = this.growMdlBits;
+      this.growMdlBits = bits;
+      if (prev !== undefined && !(bits < prev)) {
+        this._endGrowth(it, `MDL (stop): the last batch didn't pay for its bits ` +
+          `(${(prev / 8192).toFixed(2)} → ${(bits / 8192).toFixed(2)} KiB)`);
+        return;
+      }
+    }
+    const threshold = mdl ? 0 : args.growLambda * BITS_PER_SITE;
     const batch = args.growMode === "insert"
       ? await this._insertBatch(n0, target - n0, threshold)
       : await this._splitBatch(it, stats, n0, target - n0, threshold);
     if (!batch) {
-      this._endGrowth(it, `λ (stop): no ${args.growMode === "insert" ? "insertion" : "split"} would remove more ` +
-                          `than λ × ${BITS_PER_SITE} = ${fmtLambda(threshold)} ${this._gainUnit()}`);
+      const what = args.growMode === "insert" ? "insertion" : "split";
+      this._endGrowth(it, `λ (stop): no ${what} would remove more than λ × ${BITS_PER_SITE} = ` +
+                          `${fmtLambda(threshold)} ${this._gainUnit()}`);
       return;
     }
     const { data, k } = batch;
@@ -1060,7 +1096,8 @@ export class Trainer {
     queue.submit([seedEnc.finish()]);
 
     this._updateFitTarget();
-    this._log(`Grow @${it}: +${k} → ${n1} sites` + (k < target - n0 ? ` (${target - n0} wanted; the rest under λ)` : "") +
+    this._log(`Grow @${it}: +${k} → ${n1} sites` +
+              (k < target - n0 ? ` (${target - n0} wanted; the rest under λ)` : "") +
               ` | best ${args.growMode === "insert" ? "insertion" : "split"} ` +
               `${fmtLambda(batch.best / BITS_PER_SITE)} ${this._gainUnit()}/bit` +
               (this.fitSigma ? ` | blur σ ${this.fitSigma.toFixed(1)}px` : ""));
@@ -1425,6 +1462,23 @@ export function siteSplit(stats, i) {
 }
 
 const SITE_STAT_CH = 18; // channels per site in site_stats.wgsl's output
+
+// Description length in bits of sites [0, n)'s cells, each at its mean color
+// (site_stats.wgsl's owner moments): `sites` × BITS_PER_SITE plus `samples`
+// residuals coded as a Gaussian at 8-bit precision, floored at 0 bits each.
+function cellMdlBits(stats, n, sites, samples) {
+  let sse = 0;
+  for (let i = 0; i < n; i += 1) {
+    const b = i * SITE_STAT_CH;
+    const cnt = stats[b];
+    if (!(cnt > 0)) continue;
+    let ss = stats[b + 15];
+    for (let c = 0; c < 3; c += 1) ss -= stats[b + 6 + c] ** 2 / cnt;
+    sse += Math.max(0, ss);
+  }
+  const mse = (sse * 255 * 255) / Math.max(1, samples);
+  return sites * BITS_PER_SITE + samples * Math.max(0, 0.5 * Math.log2(2 * Math.PI * Math.E * Math.max(mse, 1e-30)));
+}
 
 // Gradient groups over the consolidated grads[idx*10+ch] channels. Multi-channel
 // groups use the vector magnitude (e.g. |(dx, dy)| for position).

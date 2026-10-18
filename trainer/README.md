@@ -18,6 +18,12 @@ both import it. Hyperparameter defaults come from `training_config.json`.
   existing sites are left alone; λ is then in the training loss's units.
 - `"fixed"`: exactly `sites` for the whole run.
 
+`growCriterion` picks what ends growth early: `"lambda"` (default, predicted gain against
+`growLambda`) or `"mdl"`: at each growth step the cells are scored by description length (sites ×
+`BITS_PER_SITE` plus the squared error of every cell at its mean color, coded as a Gaussian at
+8-bit precision), and growth ends once a batch hasn't lowered it. Judged on realized gains, so it can stop early
+where a new batch needs longer than `growEvery` to pay off (MNIST stops at ~2 sites).
+
 `keepBest` scores every log tick and ends the run on the best state seen, restored exactly
 (sites and Adam moments, candidate lists rebuilt): `"loss"` (default, lowest training loss),
 `"mdl"` (description length: sites × `BITS_PER_SITE` plus the residual coded at 8-bit precision
