@@ -17,6 +17,11 @@ import {
 } from "./analysis.js?v=site-clusters-20261018";
 
 const CONFIG_URL = "../training_config.json";
+// Saved settings (presets/<key>.json: { _note, args }, keys as in
+// node/sweep.mjs --set). "" = training_config.json and buildArgs defaults.
+const PRESET_DIR = "../presets/";
+const PRESETS = { "": "defaults", kodak: "Kodak", mnist: "MNIST" };
+const DEFAULTS_NOTE = "training_config.json and the trainer's built-in defaults.";
 const DEMO_MAX_IMAGE_SIDE = 2048;
 const MI_ROUND_ANISO = 0.05; // |log_aniso| below this, a site has no orientation (site MI view)
 const SNAP_MAP_K = 4; // snap-analysis fit drawn on the image (one of SNAP_KS)
@@ -100,6 +105,7 @@ const state = {
   layoutName: null,      // active key in LAYOUTS
   editing: false,        // layout edit mode (drag to move, add / remove, rows & cols)
   dragId: null,          // view being dragged in edit mode
+  baseConfig: null,      // training_config.json as loaded; state.config adds the preset's UPPER_CASE keys
   showCentroids: true,   // centroid dots over the preview (its card's checkbox)
 };
 
@@ -108,6 +114,8 @@ const ui = {
   imageInput: document.getElementById("imageInput"),
   imageLabel: document.getElementById("imageLabel"),
   datasetSelect: document.getElementById("datasetSelect"),
+  presetSelect: document.getElementById("presetSelect"),
+  presetNote: document.getElementById("presetNote"),
   itemSelect: document.getElementById("itemSelect"),
   itemPrev: document.getElementById("itemPrev"),
   itemNext: document.getElementById("itemNext"),
@@ -145,14 +153,14 @@ function appendLog(line) {
   ui.log.scrollTop = ui.log.scrollHeight;
 }
 
-function applyConfigToForm(config) {
+function applyConfigToForm(config, overrides = {}) {
   const spaceSelect = document.getElementById("p-colorSpace");
   spaceSelect.replaceChildren(...Object.entries(COLOR_SPACES).map(([key, space]) => new Option(space.label, key)));
   document.getElementById("p-lrSchedule")
     .replaceChildren(...Object.entries(LR_SCHEDULES).map(([key, label]) => new Option(label, key)));
   document.getElementById("p-loss")
     .replaceChildren(...Object.entries(LOSSES).map(([key, loss]) => new Option(loss.label, key)));
-  const defaults = buildArgs(config, {});
+  const defaults = buildArgs(config, overrides);
   for (const [key, elId, opts] of UI_FIELDS) {
     const el = document.getElementById(elId);
     if (!el) continue;
@@ -261,6 +269,37 @@ async function initDevice() {
     console.error(e.error);
   });
   return device;
+}
+
+// Fills the advanced panel from a preset: camelCase keys are trainer args,
+// UPPER_CASE keys patch training_config.json (they have no field).
+let presetToken = 0;
+async function applyPreset(key) {
+  if (!state.baseConfig) return;
+  ui.presetSelect.value = key;
+  const token = ++presetToken;
+  let preset = { _note: DEFAULTS_NOTE, args: {} };
+  if (key) {
+    try {
+      const res = await fetch(new URL(`${PRESET_DIR}${key}.json`, import.meta.url), { cache: "no-cache" });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      preset = await res.json();
+    } catch (err) {
+      setStatus(`Preset ${PRESETS[key]} failed: ${err.message}`);
+      console.error(err);
+      return;
+    }
+  }
+  if (token !== presetToken) return;
+  const configPatch = {}, overrides = {};
+  for (const [k, v] of Object.entries(preset.args || {})) {
+    if (/^[A-Z0-9_]+$/.test(k)) configPatch[k] = v;
+    else overrides[k] = v;
+  }
+  state.config = { ...state.baseConfig, ...configPatch };
+  applyConfigToForm(state.config, overrides);
+  ui.presetNote.textContent = `Fills every field below; picking a dataset switches to its preset. ${preset._note || ""}`;
+  updatePlanSummary();
 }
 
 async function loadConfig() {
@@ -2228,11 +2267,13 @@ function loadMnist() {
   return mnistData;
 }
 
-// Each dataset: item names for the picker (after prepare()), and load(i)
-// returning something createImageBitmap takes.
+// Each dataset: item names for the picker (after prepare()), load(i)
+// returning something createImageBitmap takes, and the preset (PRESETS key)
+// selecting it applies.
 const DATASETS = {
   kodak: {
     label: "Kodak",
+    preset: "kodak",
     count: KODAK_COUNT,
     async prepare() {},
     itemName: (i) => `kodim${String(i + 1).padStart(2, "0")}`,
@@ -2245,6 +2286,7 @@ const DATASETS = {
   },
   mnist: {
     label: "MNIST",
+    preset: "mnist",
     count: 0,
     labels: null,
     async prepare() {
@@ -2271,6 +2313,7 @@ function currentDataset() {
 async function selectDataset(key) {
   const dataset = DATASETS[key];
   ui.datasetSelect.value = key;
+  applyPreset(dataset.preset ?? "");
   ui.itemSelect.length = 0;
   ui.itemSelect.add(new Option(`${dataset.label}…`, ""));
   const prevStatus = ui.status.textContent;
@@ -2742,7 +2785,8 @@ async function main() {
   for (const [name, layout] of Object.entries(LAYOUTS)) ui.layoutSelect.add(new Option(layout.label, name));
   setLayout(savedLayout());
   try {
-    state.config = await loadConfig();
+    state.baseConfig = await loadConfig();
+    state.config = state.baseConfig;
     applyConfigToForm(state.config);
     state.device = await initDevice();
     state.shaders = await loadShaders({
@@ -2756,6 +2800,8 @@ async function main() {
   }
 
   ui.imageInput.addEventListener("change", handleImageInput);
+  for (const [key, label] of Object.entries(PRESETS)) ui.presetSelect.add(new Option(label, key));
+  ui.presetSelect.addEventListener("change", () => applyPreset(ui.presetSelect.value));
   for (const [key, dataset] of Object.entries(DATASETS)) ui.datasetSelect.add(new Option(dataset.label, key));
   selectDataset("kodak");
   ui.datasetSelect.addEventListener("change", () => selectDataset(ui.datasetSelect.value));
