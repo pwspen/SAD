@@ -1,8 +1,7 @@
 {
-  "_note": "Trainer settings (camelCase = buildArgs args, UPPER_CASE = training_config.json keys, as in node/sweep.mjs --set) tuned on Kodak 768x512: growing 1 -> 100 sites over 1000 iterations, by mean final PSNR over 8 Kodak images, checked on the other 16 (commit adfadf0). Tuned with squared-error loss, before the loss option existed; growLrDecay 1 = off. Everything not listed comes from training_config.json.",
+  "_note": "Trainer settings (camelCase = buildArgs args, UPPER_CASE = training_config.json keys, as in node/sweep.mjs --set) tuned on Kodak 768x512: growing 1 -> 100 sites over 1000 iterations, by mean final PSNR over 8 Kodak images, checked on the other 16 (commit adfadf0). Tuned with squared-error loss, before the loss option existed; growLrDecay 1 = off. Everything not listed comes from training_config.json. The LR warmup (200 of the 1000 iterations) was removed afterwards: within ±0.2 dB on MNIST and Kodak.",
   "args": {
-    "warmupIters": 200,
-    "decayIters": 800,
+    "iters": 1000,
     "lrMult": 8,
     "lrSchedule": "fixed",
     "loss": "l2",

@@ -609,18 +609,13 @@
         <h3 class="has-tip" tabindex="0">Schedule<span class="tip" role="tooltip">Everything that decides when things happen in a run: how long it is, how the learning rate moves, and (in grow mode) when sites are added and when growth stops. The summary below is worked out from these fields as you edit them; after a run it also says when and why growth actually ended.</span></h3>
         <div class="plan-summary" id="planSummary"></div>
         <div class="param">
-          <div class="row"><label>warmup iters</label><input id="p-warmupIters" type="number" /></div>
+          <div class="row"><label>iterations</label><input id="p-iters" type="number" min="1" /></div>
           <p class="help"><span class="unit">iterations</span></p>
-          <div class="tip" role="tooltip">Every learning rate ramps linearly from 0 to full over this many iterations. Run length = warmup + decay.</div>
-        </div>
-        <div class="param">
-          <div class="row"><label>decay iters</label><input id="p-decayIters" type="number" /></div>
-          <p class="help"><span class="unit">iterations</span></p>
-          <div class="tip" role="tooltip">Iterations after warmup. Run length = warmup + decay, whatever the schedule; with <b>warmup + cosine</b> the rates fall to 0 over exactly these iterations.</div>
+          <div class="tip" role="tooltip">Run length. There is no learning-rate warmup: every rate starts at full (in tests a 200-iteration warmup was within ±0.2 dB).</div>
         </div>
         <div class="param">
           <div class="row"><label>schedule</label><select id="p-lrSchedule" aria-label="LR schedule"></select></div>
-          <div class="tip" role="tooltip">How the learning rate changes over the run, after the warmup. <b>warmup + cosine</b>: falls to 0 on a cosine over <b>decay iters</b>. <b>fixed</b>: stays at full for the rest of the run. <b>decay after growth</b>: stays at full while sites are being added, then falls to 0 on a cosine by the end of the run, so late sites aren't starved and the finished set still gets a cool-down (with fixed site count it equals warmup + cosine).</div>
+          <div class="tip" role="tooltip">How the learning rate changes over the run. <b>cosine</b>: falls from full to 0 on a cosine over the run. <b>fixed</b>: stays at full. <b>decay after growth</b>: stays at full while sites are being added, then falls to 0 on a cosine by the end of the run, so late sites aren't starved and the finished set still gets a cool-down (with fixed site count it equals cosine). The cool-down matters: without it MNIST lost 1–1.5 dB.</div>
         </div>
         <div class="param" data-site-mode="grow">
           <div class="row"><label>start sites</label><input id="p-growInitSites" type="number" min="1" /></div>

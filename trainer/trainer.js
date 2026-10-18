@@ -149,24 +149,23 @@ export const GROW_MODES = {
   insert: "insert (exact loss)", // insert new sites where they cut the training loss most (insert.js)
 };
 
-// LR schedules (args.lrSchedule). All start with a linear warmup to 1 over
-// `warmupIters`; the run lasts warmupIters + decayIters.
+// LR schedules (args.lrSchedule), over a run of `iters` iterations. No warmup:
+// on MNIST and Kodak it was within ±0.2 dB of a 200-iteration warmup (sites
+// added by growth never had one; Adam's bias correction restarts per site).
 export const LR_SCHEDULES = {
-  "warmup-cosine": "warmup + cosine",          // cosine decay to 0 over decayIters
-  fixed: "fixed",                              // stays at 1 after warmup
+  cosine: "cosine",                            // cosine from 1 to 0 over the run
+  fixed: "fixed",                              // 1 throughout
   "decay-after-growth": "decay after growth",  // 1 until growth ends, then cosine to 0 by the end
 };
 
 // Multiplier applied to every base LR at step `it`. `growDoneIter` is the
 // iteration growth ended (Infinity while still growing); only
 // "decay-after-growth" uses it.
-export function lrSchedule(it, warmupIters, decayIters, kind = "warmup-cosine", growDoneIter = 0) {
-  if (it < warmupIters) return (it + 1) / warmupIters;
+export function lrSchedule(it, iters, kind = "cosine", growDoneIter = 0) {
   if (kind === "fixed") return 1;
-  const total = warmupIters + decayIters;
-  const start = kind === "decay-after-growth" ? Math.max(warmupIters, growDoneIter) : warmupIters;
+  const start = kind === "decay-after-growth" ? Math.max(0, growDoneIter) : 0;
   if (it < start) return 1;
-  const t = Math.min(1, (it - start) / Math.max(1, total - start));
+  const t = Math.min(1, (it - start) / Math.max(1, iters - start));
   return 0.5 * (1 + Math.cos(Math.PI * t));
 }
 
@@ -196,13 +195,11 @@ export function buildArgs(config, overrides = {}) {
   const args = {
     // WebGPU-specific defaults; training_config.json's DEFAULT_ITERS/SITES are
     // tuned for the other backends' densify/prune schedule, which JS doesn't run.
-    // Total iters = warmupIters + decayIters; an explicit "iters" override
-    // (e.g. from sweeps) sets the total and shortens the decay phase to fit.
-    // The schedule, LR and growth defaults (and LR_POS_BASE / LR_TAU_BASE in
+    // Run length. The schedule, LR and growth defaults (and LR_POS_BASE / LR_TAU_BASE in
     // training_config.json) were tuned for growing 1 -> 100 sites over 1000
     // iterations, by mean final PSNR over 8 Kodak images, then checked on the
     // other 16.
-    warmupIters: Math.max(0, Math.floor(Number(pick("warmupIters", "WARMUP_ITERS", 200)))),
+    iters: Math.max(1, Math.floor(Number(pick("iters", null, 1000)))),
     // Site count in "fixed" siteMode (ignored when growing; see below).
     sites: Number(pick("sites", null, 1000)),
     candFreq: Number(pick("candFreq", "CAND_UPDATE_FREQ", 1)),
@@ -260,10 +257,6 @@ export function buildArgs(config, overrides = {}) {
     // growth steps in a row haven't beaten it (keepBest score; 0 = never).
     growPatience: Math.max(0, Math.floor(Number(pick("growPatience", "GROW_PATIENCE", 0)))),
   };
-  args.decayIters = Math.max(0, Math.floor(Number(overrides.iters !== undefined && overrides.decayIters === undefined
-    ? overrides.iters - args.warmupIters
-    : pick("decayIters", "DECAY_ITERS", 800))));
-  args.iters = args.warmupIters + args.decayIters;
   // "fixed": exactly `sites` for the whole run. "grow": rate-distortion growth.
   const siteMode = pick("siteMode", "SITE_MODE", "grow");
   args.siteMode = String(siteMode);
@@ -688,8 +681,7 @@ export class Trainer {
         }
       }
 
-      const lrScale = args.lrMult * lrSchedule(it, args.warmupIters, args.decayIters, args.lrSchedule,
-        this.growDoneIter ?? Infinity);
+      const lrScale = args.lrMult * lrSchedule(it, args.iters, args.lrSchedule, this.growDoneIter ?? Infinity);
       const lrDir = it >= this.aniStartIter ? args.lrDirBase * lrScale : 0;
       const lrAniso = it >= this.aniStartIter ? args.lrAnisoBase * lrScale : 0;
       updateAdamParamsBuffer(queue, this.adamParams,

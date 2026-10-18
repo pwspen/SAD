@@ -32,7 +32,7 @@ growth also ends, and the run returns to the best state, after that many growth 
 better score. Mid-growth states are far from converged, so `"mdl"` and patience pick early
 half-fitted states with the current presets; see the comment on `KEEP_BEST` in `trainer.js`.
 
-`lrSchedule` is `"warmup-cosine"` (default), `"fixed"` (constant after warmup) or
+There is no LR warmup. `lrSchedule` is `"cosine"` (1 to 0 over `iters`), `"fixed"` (default, constant) or
 `"decay-after-growth"` (constant until growth ends, then cosine to 0 by the end of the run).
 
 ## Modules

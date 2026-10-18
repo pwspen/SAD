@@ -36,8 +36,7 @@ const MNIST_DIR = new URLSearchParams(location.search).get("mnist") || "../../co
 // Fields that live in the advanced panel. The target image is in the top bar;
 // init-sites / mask are pickers inside the panel (not listed here).
 const UI_FIELDS = [
-  ["warmupIters", "p-warmupIters"],
-  ["decayIters", "p-decayIters"],
+  ["iters", "p-iters"],
   ["sites", "p-sites"],
   ["logFreq", "p-logFreq"], // also sets viewerFreq (one "refresh every" field)
   ["candFreq", "p-candFreq"],
@@ -97,7 +96,7 @@ const state = {
   gradHistory: [],       // [{ it, stats }] per-param |grad| mean/max from log ticks
   lrHistory: [],         // [{ it, lr }] LR multiplier (schedule × LR mult) from log ticks
   growthGain: [],        // [{ step, addedAt, measuredAt, points: [{ site, predicted, realized }] }] per growth batch
-  lrPlan: null,          // { warmupIters, decayIters, lrMult, kind, growDoneIter } of the current run
+  lrPlan: null,          // { iters, lrMult, kind, growDoneIter } of the current run
   lastGrowth: null,      // { mode, doneIter, stop, sites, it, iters } at the latest log tick (Schedule summary)
   runSiteMode: null,     // siteMode of the current/last run
   bandHistory: [],       // [{ it, snr: [dB per band] }] from every render
@@ -212,7 +211,7 @@ function updatePlanSummary() {
   }
   const lines = [];
   const n = args.iters;
-  lines.push(`Run: <b>${n}</b> iterations (${args.warmupIters} warmup + ${args.decayIters} decay).`);
+  lines.push(`Run: <b>${n}</b> iterations.`);
   let growEnd = 0;
   if (args.siteMode === "grow") {
     const start = state.initSites ? state.initSites.count : args.growInitSites;
@@ -229,19 +228,18 @@ function updatePlanSummary() {
       const reached = seq[Math.min(seq.length - 1, Math.floor((n - 1) / args.growEvery))];
       lines.push(`Growth: ${seqText} would finish at iter ${growEnd}, ` +
                  `<span class="warn">after the run ends at ${n}: it stops at ${reached} sites. ` +
-                 `Raise decay iters, or lower grow every or max sites.</span>`);
+                 `Raise iterations, or lower grow every or max sites.</span>`);
       growEnd = n;
     }
   } else {
     lines.push(`Sites: fixed at <b>${state.initSites ? state.initSites.count : args.sites}</b>.`);
   }
-  const w = args.warmupIters;
   if (args.lrSchedule === "fixed") {
-    lines.push(`LR: full from iter ${w} to the end.`);
-  } else if (args.lrSchedule === "decay-after-growth" && growEnd > w) {
-    lines.push(`LR: full from iter ${w} until growth ends (iter ${growEnd}), then down to 0 by ${n}.`);
+    lines.push(`LR: full throughout.`);
+  } else if (args.lrSchedule === "decay-after-growth" && growEnd > 0) {
+    lines.push(`LR: full until growth ends (iter ${growEnd}), then down to 0 by ${n}.`);
   } else {
-    lines.push(`LR: full at iter ${w}, down to 0 by ${n}.`);
+    lines.push(`LR: full at iter 0, down to 0 by ${n}.`);
   }
   const g = state.lastGrowth;
   if (g && g.mode === "grow") {
@@ -394,7 +392,7 @@ const VIEWS = {
                 note: "Per-parameter-group |gradient| over sites, reported by the trainer at each log tick." },
   lr:         { label: "LR multiplier vs iteration", kind: "plot", source: "train", on: ["log", "run"],
                 draw: drawLrPlot, hit: hitLr,
-                note: "LR multiplier (warmup / cosine-decay schedule × LR mult) the trainer applied to every base " +
+                note: "LR multiplier (schedule × LR mult) the trainer applied to every base " +
                       "LR at each log tick. Dashed: the run's full planned schedule." },
   growGain:   { label: "Site gain: predicted vs real", kind: "plot", source: "train", on: ["growth", "run"],
                 draw: drawGrowGainPlot, hit: hitGrowGain,
@@ -1378,10 +1376,9 @@ function drawLrPlot(view) {
   const planned = [];
   if (plan) {
     const n = Math.max(2, Math.floor((p.w - PLOT_PAD.left - PLOT_PAD.right) / 2));
-    const total = plan.warmupIters + plan.decayIters;
     for (let i = 0; i <= n; i += 1) {
-      const it = Math.round((i / n) * Math.max(0, total - 1));
-      planned.push([it, plan.lrMult * lrSchedule(it, plan.warmupIters, plan.decayIters, plan.kind, plan.growDoneIter)]);
+      const it = Math.round((i / n) * Math.max(0, plan.iters - 1));
+      planned.push([it, plan.lrMult * lrSchedule(it, plan.iters, plan.kind, plan.growDoneIter)]);
     }
   }
   let hi = 0;
@@ -2526,7 +2523,7 @@ async function startTraining() {
     : Math.min(args.growEndIter, growthCounts(startCount, args.growFactor, args.growMaxSites).length * args.growEvery);
   state.runSiteMode = args.siteMode;
   state.lastGrowth = null;
-  state.lrPlan = { warmupIters: args.warmupIters, decayIters: args.decayIters, lrMult: args.lrMult,
+  state.lrPlan = { iters: args.iters, lrMult: args.lrMult,
                    kind: args.lrSchedule, growDoneIter: plannedGrowEnd };
   state.lastActiveSites = initSiteCount;
   state.bppRuns.push({
@@ -2539,7 +2536,7 @@ async function startTraining() {
     ? `grow ${startCount} → ${Math.max(args.growMaxSites, startCount)} by ${GROW_MODES[args.growMode]}, ×${args.growFactor} every ${args.growEvery} iters ` +
       `(λ stop ${args.growLambda})` + (args.growLrDecay !== 1 ? `, older sites' LR ×${args.growLrDecay} per step` : "")
     : `${initSiteCount} fixed`;
-  appendLog(`Target: ${width}×${height} | sites: ${sitesDesc} | iters: ${args.warmupIters} warmup + ${args.decayIters} decay | lr ×${args.lrMult} ${LR_SCHEDULES[args.lrSchedule]} | color: ${COLOR_SPACES[args.colorSpace].label} | loss: ${LOSSES[args.loss].label} | refresh: ${args.logFreq}`);
+  appendLog(`Target: ${width}×${height} | sites: ${sitesDesc} | iters: ${args.iters} | lr ×${args.lrMult} ${LR_SCHEDULES[args.lrSchedule]} | color: ${COLOR_SPACES[args.colorSpace].label} | loss: ${LOSSES[args.loss].label} | refresh: ${args.logFreq}`);
   updateProgress(0, args.iters, "Preparing…");
 
   const trainer = new Trainer(state.device, state.shaders, args, {
