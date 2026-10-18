@@ -315,6 +315,31 @@ export function updatePyrParamsBuffer(queue, buffer, { levels, level, siteCount,
 }
 
 // ---------------------------------------------------------------------------
+// GrowBlurParams (grow_blur.wgsl):
+//   u32 width, height, radius, _pad, f32 invTwoSigmaSq, _pad x3   (32 bytes)
+// GrowGainParams (grow_gain.wgsl):
+//   u32 width, height, cellSize, cellsX, cellsY, siteCount, _pad x2   (32 bytes)
+// ---------------------------------------------------------------------------
+
+export function createUniform32(device) {
+  return device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+}
+
+export function updateGrowBlurParamsBuffer(queue, buffer, { width, height, sigma }) {
+  const u = new Uint32Array(8);
+  const f = new Float32Array(u.buffer);
+  u[0] = width >>> 0;
+  u[1] = height >>> 0;
+  u[2] = Math.min(1024, Math.ceil(3 * sigma)) >>> 0;
+  f[4] = 1 / (2 * sigma * sigma);
+  queue.writeBuffer(buffer, 0, u);
+}
+
+export function updateGrowGainParamsBuffer(queue, buffer, { width, height, cellSize, cellsX, cellsY, siteCount }) {
+  queue.writeBuffer(buffer, 0, new Uint32Array([width, height, cellSize, cellsX, cellsY, siteCount, 0, 0]));
+}
+
+// ---------------------------------------------------------------------------
 // HilbertParams (hilbert.wgsl):
 //   u32 siteCount, u32 paddedCount, u32 width, u32 height, u32 bits,
 //   u32 _pad, u32 _pad, u32 _pad   (32 bytes)

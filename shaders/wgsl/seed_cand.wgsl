@@ -3,11 +3,14 @@
 @group(0) @binding(2) var inCand0 : texture_2d<u32>;
 @group(0) @binding(3) var outCand0 : texture_storage_2d<rgba32uint, write>;
 
+// Seeds sites [params.step, params.siteCount) into their home candidate
+// pixels; site growth uses a nonzero start to seed only the new sites.
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
-  if (gid.x >= params.siteCount) { return; }
+  let idx = gid.x + params.step;
+  if (idx >= params.siteCount) { return; }
 
-  let site = sites[gid.x];
+  let site = sites[idx];
   if (site.position.x < 0.0) { return; }
 
   let outW = max(params.width, 1u);
@@ -21,5 +24,5 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   let homePixel = vec2<i32>(i32(candX), i32(candY));
 
   let existing = textureLoad(inCand0, homePixel, 0);
-  textureStore(outCand0, homePixel, vec4<u32>(gid.x, existing.y, existing.z, existing.w));
+  textureStore(outCand0, homePixel, vec4<u32>(idx, existing.y, existing.z, existing.w));
 }

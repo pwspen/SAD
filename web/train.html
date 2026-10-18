@@ -548,6 +548,13 @@
         <div class="row"><label>pyramid cell px</label><input id="p-flowPyrCell" type="number" /></div>
         <div class="row"><label>pyramid levels</label><input id="p-flowPyrLevels" type="number" /></div>
         <div class="row"><label>pyramid gamma</label><input id="p-flowPyrGamma" type="number" step="0.1" /></div>
+
+        <h3>Site growth</h3>
+        <div class="row" title="Rate-distortion slope: squared error (8-bit levels², RGB) a site must remove per bit it costs. 0 = fixed site count; otherwise 'sites' is the cap."><label>λ (0 = off)</label><input id="p-growLambda" type="number" step="10" /></div>
+        <div class="row"><label>start sites</label><input id="p-growInitSites" type="number" /></div>
+        <div class="row"><label>every iters</label><input id="p-growEvery" type="number" /></div>
+        <div class="row"><label>end iter</label><input id="p-growEndIter" type="number" placeholder="60% of iters" /></div>
+        <div class="row" title="Blur the fit target to sigma = this × site spacing while growing (0 = off)."><label>blur × spacing</label><input id="p-growBlur" type="number" step="0.05" /></div>
       </aside>
 
       <section class="view">
@@ -574,6 +581,6 @@
       </section>
     </div>
 
-    <script type="module" src="train.js?v=spectrum-axes-20261017"></script>
+    <script type="module" src="train.js?v=grow-20261017"></script>
   </body>
 </html>

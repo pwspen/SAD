@@ -5,7 +5,7 @@
 
 import { loadShaders, tileSlotsForLimit } from "../trainer/shader_loader.js?v=shared-wgsl-20261017";
 import { requestTrainingDevice } from "../trainer/device.js?v=shared-wgsl-20261017";
-import { Trainer, buildArgs, GRAD_GROUPS, lrSchedule } from "../trainer/trainer.js?v=lr-default-20261017";
+import { Trainer, buildArgs, GRAD_GROUPS, lrSchedule } from "../trainer/trainer.js?v=grow-20261017";
 import { loadImageToFloat32, loadMaskRgba32Float, whiteMaskRgba32Float } from "../trainer/textures.js?v=shared-wgsl-20261017";
 import { loadSitesFromFile, serializeSitesTxt, triggerDownload, floatImageToRgba8, computeBpp, BITS_PER_SITE } from "../trainer/io.js?v=shared-wgsl-20261017";
 import { SITE_FLOATS } from "../trainer/params.js?v=shared-wgsl-20261017";
@@ -56,6 +56,11 @@ const UI_FIELDS = [
   ["flowPyrLevels", "p-flowPyrLevels"],
   ["flowPyrGamma", "p-flowPyrGamma"],
   ["colorSpace", "p-colorSpace"],
+  ["growLambda", "p-growLambda"],
+  ["growInitSites", "p-growInitSites"],
+  ["growEvery", "p-growEvery"],
+  ["growEndIter", "p-growEndIter", { blankDefault: true }], // blank = 60% of iters
+  ["growBlur", "p-growBlur"],
 ];
 
 const state = {
@@ -136,10 +141,10 @@ function applyConfigToForm(config) {
   const spaceSelect = document.getElementById("p-colorSpace");
   spaceSelect.replaceChildren(...Object.entries(COLOR_SPACES).map(([key, space]) => new Option(space.label, key)));
   const defaults = buildArgs(config, {});
-  for (const [key, elId] of UI_FIELDS) {
+  for (const [key, elId, opts] of UI_FIELDS) {
     const el = document.getElementById(elId);
     if (!el) continue;
-    const v = defaults[key];
+    const v = opts?.blankDefault ? undefined : defaults[key];
     if (el.type === "checkbox") el.checked = Boolean(v);
     else if (v === undefined) el.value = "";
     else el.value = v;
@@ -1849,7 +1854,10 @@ async function startTraining() {
   for (const view of Object.values(VIEWS)) view.hoverKey = null;
   await refreshViews("run");
 
-  appendLog(`Target: ${width}×${height} | sites: ${initSiteCount} | iters: ${args.warmupIters} warmup + ${args.decayIters} decay | lr ×${args.lrMult} | color: ${COLOR_SPACES[args.colorSpace].label} | log: ${args.logFreq} | view: ${args.viewerFreq}`);
+  const sitesDesc = args.growLambda > 0 && !init
+    ? `grow ${Math.min(args.growInitSites, args.sites)} → ≤${args.sites} (λ ${args.growLambda}, until iter ${args.growEndIter})`
+    : initSiteCount;
+  appendLog(`Target: ${width}×${height} | sites: ${sitesDesc} | iters: ${args.warmupIters} warmup + ${args.decayIters} decay | lr ×${args.lrMult} | color: ${COLOR_SPACES[args.colorSpace].label} | log: ${args.logFreq} | view: ${args.viewerFreq}`);
   updateProgress(0, args.iters, "Preparing…");
 
   const trainer = new Trainer(state.device, state.shaders, args, {

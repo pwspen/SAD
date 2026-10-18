@@ -57,7 +57,9 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   var m_log_aniso = adam[base + 18u];
   var v_log_aniso = adam[base + 19u];
 
-  let tt = f32(params.t);
+  // adam[base + 20] is the step a site was added at (0 for initial sites), so
+  // sites added by growth get their own bias correction.
+  let tt = max(1.0, f32(params.t) - adam[base + 20u]);
   let b1t_corr = 1.0 / (1.0 - pow(params.beta1, tt));
   let b2t_corr = 1.0 / (1.0 - pow(params.beta2, tt));
 

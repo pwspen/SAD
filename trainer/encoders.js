@@ -500,3 +500,45 @@ export class PyramidEncoder {
     }
   }
 }
+
+// Site growth: mask-normalized separable Gaussian blur of the target (into
+// `outTex`, via `tmpTex`), and per-cell gain statistics (grow_gain.wgsl).
+export class GrowEncoder {
+  constructor(device, shaders) {
+    this.device = device;
+    this.blurHPipeline = makePipeline(device, shaders.GROW_BLUR, "blur_h");
+    this.blurVPipeline = makePipeline(device, shaders.GROW_BLUR, "blur_v");
+    this.gainPipeline = makePipeline(device, shaders.GROW_GAIN);
+    this._views = new Map();
+  }
+  encodeBlur(encoder, blurParams, srcTex, maskTex, tmpTex, outTex, width, height) {
+    const dev = this.device;
+    const view = (t) => getTextureView(this._views, t);
+    let bg = dev.createBindGroup({ layout: this.blurHPipeline.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: { buffer: blurParams } },
+      { binding: 1, resource: view(srcTex) },
+      { binding: 2, resource: view(maskTex) },
+      { binding: 3, resource: view(tmpTex) },
+    ] });
+    dispatch2D(encoder, this.blurHPipeline, bg, Math.ceil(width / 16), Math.ceil(height / 16));
+    bg = dev.createBindGroup({ layout: this.blurVPipeline.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: { buffer: blurParams } },
+      { binding: 1, resource: view(tmpTex) },
+      { binding: 3, resource: view(outTex) },
+    ] });
+    dispatch2D(encoder, this.blurVPipeline, bg, Math.ceil(width / 16), Math.ceil(height / 16));
+  }
+  encodeGain(encoder, gainParams, sitesBuffer, predTex, fitTex, maskTex, cand0, cellsBuffer, cellCount) {
+    const view = (t) => getTextureView(this._views, t);
+    const bg = this.device.createBindGroup({ layout: this.gainPipeline.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: { buffer: gainParams } },
+      { binding: 1, resource: { buffer: sitesBuffer } },
+      { binding: 2, resource: view(predTex) },
+      { binding: 3, resource: view(fitTex) },
+      { binding: 4, resource: view(maskTex) },
+      { binding: 5, resource: view(cand0) },
+      { binding: 6, resource: { buffer: cellsBuffer } },
+    ] });
+    dispatch1D(encoder, this.gainPipeline, bg, Math.ceil(cellCount / 64));
+  }
+}

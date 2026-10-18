@@ -4,11 +4,15 @@ The WebGPU optimizer: the training loop, Adam schedule, GPU buffers and kernel d
 It has no DOM dependencies, so the browser pages in `web/` and the Node runner in `node/`
 both import it. Hyperparameter defaults come from `training_config.json`.
 
-The site count is fixed for the whole run: there is no densify/prune (and so no target-bpp).
+By default the site count is fixed for the whole run. With `growLambda > 0` the trainer adds
+sites by rate-distortion: every `growEvery` iterations, each site-spacing cell gets a site if
+the best error one site could remove there (scored over the cell's dyadic sub-blocks) beats
+`growLambda × BITS_PER_SITE`, so growth runs coarse to fine and stops when sites no longer pay
+for their bits. `sites` is then the cap. Sites are never removed (no prune).
 
 ## Modules
 
-- `trainer.js` - training loop (fixed site count; no densify/prune) and epilogue.
+- `trainer.js` - training loop (fixed site count, or rate-distortion growth; no prune) and epilogue.
 - `shader_loader.js` - fetches and assembles the WGSL in `shaders/`.
 - `device.js` - adapter/device setup.
 - `params.js` - parameter buffer writers, `pack_jump_step`, and `hilbert_bits_for_size`.

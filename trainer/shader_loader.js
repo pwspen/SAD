@@ -52,6 +52,8 @@ const SHADER_FILES = [
   "pyr_count",
   "pyr_base",
   "pyr_reduce",
+  "grow_blur",
+  "grow_gain",
 ];
 
 let _cache = null;
@@ -124,6 +126,8 @@ export async function loadShaders({ tileSlots = 128, readText = fetchText } = {}
     PYR_COUNT: out.pyr_count,
     PYR_BASE: out.pyr_base,
     PYR_REDUCE: out.pyr_reduce,
+    GROW_BLUR: out.grow_blur,
+    GROW_GAIN: out.grow_gain,
     tileSlots,
   };
   return _cache;

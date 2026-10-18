@@ -1,6 +1,7 @@
 // SAD training loop. Originally ported from the wgpu-py trainer (train_wgpu.py
-// at the `multi-backend` tag), minus densify/prune: it optimizes a fixed site
-// count for the whole run.
+// at the `multi-backend` tag), minus densify/prune. By default it optimizes a
+// fixed site count; with growLambda > 0 it adds sites by rate-distortion (see
+// "Site growth" below). Sites are never removed.
 
 import {
   SITE_FLOATS,
@@ -23,10 +24,16 @@ import {
   createFlowParamsBuffer,
   updateFlowParamsBuffer,
   createPyrParamsBuffer,
+  updatePyrParamsBuffer,
+  updateGradParamsBuffer,
+  updateClearParamsBuffer,
+  createUniform32,
+  updateGrowBlurParamsBuffer,
+  updateGrowGainParamsBuffer,
   pyramidLevels,
   packJumpStep,
   hilbertBitsForSize,
-} from "./params.js?v=shared-wgsl-20261017";
+} from "./params.js?v=grow-20261017";
 
 import {
   createSitesBuffer,
@@ -65,9 +72,11 @@ import {
   HilbertEncoder,
   FlowEncoder,
   PyramidEncoder,
-} from "./encoders.js?v=shared-wgsl-20261017";
+  GrowEncoder,
+} from "./encoders.js?v=grow-20261017";
 
 import { RadixSortUInt2 } from "./radix_sort.js?v=shared-wgsl-20261017";
+import { BITS_PER_SITE } from "./io.js";
 import {
   colorSpaceFor,
   specializeShaders,
@@ -159,11 +168,24 @@ export function buildArgs(config, overrides = {}) {
     flowPyrLevels: Math.max(0, Math.floor(Number(pick("flowPyrLevels", "FLOW_PYR_LEVELS", 0)))),
     // Target density exponent: the pyramid equalizes err^gamma per site.
     flowPyrGamma: Number(pick("flowPyrGamma", "FLOW_PYR_GAMMA", 1)),
+    // Site growth (rate-distortion). growLambda is the final slope -dD/dR: the
+    // squared error (8-bit levels², summed over RGB) a site must remove per bit
+    // it costs (BITS_PER_SITE bits). 0 = off: the site count stays fixed. With
+    // growth on, `sites` is the cap and runs start from growInitSites.
+    growLambda: Number(pick("growLambda", "GROW_LAMBDA", 0)),
+    growInitSites: Math.max(1, Math.floor(Number(pick("growInitSites", "GROW_INIT_SITES", 256)))),
+    growEvery: Math.max(1, Math.floor(Number(pick("growEvery", "GROW_EVERY", 10)))),
+    // While growing, the fit target is blurred with sigma = growBlur × site
+    // spacing √(mask area / sites); 0 = always fit the original.
+    growBlur: Math.max(0, Number(pick("growBlur", "GROW_BLUR", 0))),
   };
   args.decayIters = Math.max(0, Math.floor(Number(overrides.iters !== undefined && overrides.decayIters === undefined
     ? overrides.iters - args.warmupIters
     : pick("decayIters", "DECAY_ITERS", 500))));
   args.iters = args.warmupIters + args.decayIters;
+  // Growth (and the blurred target) stops here; the rest fits the original.
+  const growEnd = pick("growEndIter", "GROW_END_ITER", null);
+  args.growEndIter = Math.max(0, Math.floor(growEnd == null || growEnd === "" ? 0.6 * args.iters : Number(growEnd)));
   colorSpaceFor(args.colorSpace); // fail early on an unknown name
   if (!Number.isFinite(args.initLogTau) || !Number.isFinite(args.initRadius)) {
     throw new Error("training_config.json missing INIT_LOG_TAU / INIT_RADIUS (required).");
@@ -211,6 +233,8 @@ export class Trainer {
     this.usesPyr = this.usesFlow && args.flowPyrStrength > 0;
     this.flowEnc = this.usesFlow ? new FlowEncoder(device, shaders) : null;
     this.pyrEnc = this.usesPyr ? new PyramidEncoder(device, shaders) : null;
+    this.usesGrow = args.growLambda > 0;
+    this.growEnc = this.usesGrow ? new GrowEncoder(device, shaders) : null;
   }
 
   async prepare({ width, height, targetRgba32f, maskRgba32f, maskSum, initSites, initSiteCount }) {
@@ -238,9 +262,12 @@ export class Trainer {
     const maskData = maskRgba32f || whiteMaskRgba32Float(width, height).rgba;
     writeFloat32ToRgba32FloatTexture(device, this.maskTex, maskData, width, height);
 
-    // Site count is fixed for the whole run (no densify/prune).
+    // Without growth the site count is fixed. With growth, buffers hold up to
+    // `sites` and the run starts from growInitSites (or the loaded sites).
+    // Unused slots are inactive (position.x < 0), which every kernel skips.
+    this.bufferCapacity = this.usesGrow ? Math.max(initSiteCount, args.sites) : initSiteCount;
+    if (this.usesGrow && !initSites) initSiteCount = Math.min(args.growInitSites, this.bufferCapacity);
     this.siteCount = initSiteCount;
-    this.bufferCapacity = initSiteCount;
 
     // Buffers
     this.sitesBuf = createSitesBuffer(device, this.bufferCapacity);
@@ -277,7 +304,7 @@ export class Trainer {
       args.lrDirBase, args.lrAnisoBase, args.beta1, args.beta2, args.eps,
       1, width, height);
     this.countParams = createClearParamsBuffer(device, initSiteCount);
-    this.gradCountParams = createClearParamsBuffer(device, initSiteCount * 10);
+    this.gradCountParams = createClearParamsBuffer(device, this.bufferCapacity * 10);
     this.tauParams = createTauParamsBuffer(device, initSiteCount, TAU_DIFFUSE_LAMBDA, this.candDownscale);
 
     // Residual flow: per-pixel error EMA + per-site centroid moments (6 f32).
@@ -318,6 +345,27 @@ export class Trainer {
       this.hilbertSiteCount = 0;
       this.hilbertParams = null;
       this.hilbertSort = null;
+    }
+
+    if (this.bufferCapacity > initSiteCount) {
+      const inactive = new Float32Array((this.bufferCapacity - initSiteCount) * SITE_FLOATS);
+      for (let i = 0; i < inactive.length; i += SITE_FLOATS) { inactive[i] = -1; inactive[i + 1] = -1; }
+      device.queue.writeBuffer(this.sitesBuf, initSiteCount * SITE_FLOATS * 4, inactive);
+    }
+
+    // Site growth: the fit target (blurred while growing) and gain resources.
+    this.fitTex = this.targetTex;
+    if (this.usesGrow) {
+      this.maskArea = maskSum > 0 ? maskSum : width * height;
+      this.growBlurParams = createUniform32(device);
+      this.growGainParams = createUniform32(device);
+      this.growSeedParams = createParamsBuffer(device, this._paramsArgs(initSiteCount, 0, 0));
+      if (args.growBlur > 0 && args.growEndIter > 0) {
+        this.blurTex = createRgba32FloatTexture(device, width, height, { storage: true, copyDst: false });
+        this.blurTmpTex = createRgba32FloatTexture(device, width, height, { storage: true, copyDst: false });
+      }
+      this.growCellsBuf = null;
+      this.growCellsCap = 0;
     }
 
     // Initialize sites
@@ -377,6 +425,8 @@ export class Trainer {
       this.clearI32Enc.encode(encoder, this.grads, this.gradCountParams, initSiteCount * 10);
       device.queue.submit([encoder.finish()]);
     }
+
+    if (this.usesGrow) this._updateFitTarget();
 
     this.jumpPassIndex = 0;
     this.aniStartIter = ANI_START_ITER;
@@ -457,6 +507,7 @@ export class Trainer {
         break;
       }
 
+      if (this.usesGrow) await this._growStep(it);
       const siteCount = this.siteCount;
       const activeSites = this.activeEstimate;
       const updateCandidates = (it % candUpdateFreq === 0);
@@ -514,13 +565,13 @@ export class Trainer {
 
       // Gradients
       this.gradsEnc.encode(encoder, this.sitesBuf, this.gradParams,
-        this.cand0A, this.cand1A, this.targetTex, this.maskTex,
+        this.cand0A, this.cand1A, this.fitTex, this.maskTex,
         this.grads, this.width, this.height);
 
       // Residual flow moments, from the same pre-Adam sites as the gradients.
       if (flowScale > 0) {
         this.flowEnc.encodeAccum(encoder, this.sitesBuf, this.flowParams,
-          this.cand0A, this.cand1A, this.targetTex, this.maskTex,
+          this.cand0A, this.cand1A, this.fitTex, this.maskTex,
           this.errEmaBuf, this.flowBuf, this.width, this.height);
       }
 
@@ -605,6 +656,7 @@ export class Trainer {
             gradStats,
             activeSites,
             totalSites: siteCount,
+            fitSigma: this.fitSigma || 0,
             itsPerSec,
             elapsedSec: elapsed,
             renderRgba: rgba,
@@ -630,6 +682,142 @@ export class Trainer {
     this.renderEnc.encode(encoder, this.sitesBuf, this.renderParams,
       this.cand0A, this.cand1A, this.renderTex, this.width, this.height);
     device.queue.submit([encoder.finish()]);
+  }
+
+  // ---- Site growth ----
+  // Rate-distortion: minimize D + λ·R, with R = BITS_PER_SITE bits per site.
+  // Every growEvery iterations (before growEndIter), each cell of a grid at the
+  // current site spacing h = √(mask area / sites) is scored by the most error
+  // one new site could remove in it (pickGrowthBlocks); cells whose gain beats
+  // λ·BITS_PER_SITE get a site. One site per cell caps a step at roughly
+  // doubling the count, so growth runs coarse to fine and stops by itself once
+  // no cell pays for a site. Optionally (growBlur > 0) the fit target is the
+  // image blurred to the current spacing; in tests that cost 0.5-2 dB at a
+  // matched site count, since sites place edges far finer than their spacing.
+
+  _siteSpacing() { return Math.sqrt(this.maskArea / Math.max(1, this.siteCount)); }
+
+  // Point the gradients at the blurred (while growing) or original target.
+  _updateFitTarget() {
+    const sigma = this.blurTex && this._growing(this._iter ?? 0)
+      ? this.args.growBlur * this._siteSpacing() : 0;
+    this.fitSigma = sigma >= 0.25 ? sigma : 0;
+    if (!this.fitSigma) {
+      this.fitTex = this.targetTex;
+      return;
+    }
+    updateGrowBlurParamsBuffer(this.device.queue, this.growBlurParams,
+      { width: this.width, height: this.height, sigma: this.fitSigma });
+    const encoder = this.device.createCommandEncoder();
+    this.growEnc.encodeBlur(encoder, this.growBlurParams, this.targetTex, this.maskTex,
+      this.blurTmpTex, this.blurTex, this.width, this.height);
+    this.device.queue.submit([encoder.finish()]);
+    this.fitTex = this.blurTex;
+  }
+
+  _growing(it) { return it < this.args.growEndIter; }
+
+  async _growStep(it) {
+    this._iter = it;
+    const args = this.args;
+    if (!this._growing(it)) {
+      if (this.fitTex !== this.targetTex) {
+        this._updateFitTarget();
+        this._log(`Growth done at iter ${it}: ${this.siteCount} sites; fitting the original target.`);
+      }
+      return;
+    }
+    if (it === 0 || it % args.growEvery !== 0 || this.siteCount >= this.bufferCapacity) return;
+
+    const device = this.device;
+    const queue = device.queue;
+    const n0 = this.siteCount;
+    // Stats on a grid of h/4 cells; each spacing-sized parent of 4×4 of them
+    // can receive one site (so a step at most about doubles the count).
+    const cell = Math.max(1, Math.round(this._siteSpacing() / GROW_SUBDIV));
+    const cellsX = Math.ceil(this.width / cell);
+    const cellsY = Math.ceil(this.height / cell);
+    const cellCount = cellsX * cellsY;
+    const cellBytes = cellCount * 12 * 4;
+    if (cellBytes > this.growCellsCap) {
+      this.growCellsBuf?.destroy();
+      this.growCellsBuf = device.createBuffer({ size: cellBytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+      this.growCellsCap = cellBytes;
+    }
+    updateGrowGainParamsBuffer(queue, this.growGainParams,
+      { width: this.width, height: this.height, cellSize: cell, cellsX, cellsY, siteCount: n0 });
+    updateParamsBuffer(queue, this.renderParams, this._paramsArgs(n0, 0, 0));
+    const staging = device.createBuffer({ size: cellBytes, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    const encoder = device.createCommandEncoder();
+    this.renderEnc.encode(encoder, this.sitesBuf, this.renderParams,
+      this.cand0A, this.cand1A, this.renderTex, this.width, this.height);
+    this.growEnc.encodeGain(encoder, this.growGainParams, this.sitesBuf, this.renderTex, this.fitTex,
+      this.maskTex, this.cand0A, this.growCellsBuf, cellCount);
+    encoder.copyBufferToBuffer(this.growCellsBuf, 0, staging, 0, cellBytes);
+    queue.submit([encoder.finish()]);
+    await staging.mapAsync(GPUMapMode.READ);
+    const cells = new Float32Array(staging.getMappedRange()).slice();
+    staging.unmap();
+    staging.destroy();
+
+    const lambda = args.growLambda;
+    const picked = pickGrowthBlocks(cells, cellsX, cellsY, cell, lambda * BITS_PER_SITE);
+    picked.sort((a, b) => b.gain - a.gain);
+    picked.length = Math.min(picked.length, this.bufferCapacity - n0);
+    if (!picked.length) return;
+
+    // New sites: error centroid of the block, its mean fit color, its owners'
+    // tau and radius (so it competes as an equal), isotropic. A small jitter
+    // keeps them off existing positions.
+    const k = picked.length;
+    const data = new Float32Array(k * SITE_FLOATS);
+    picked.forEach((blk, i) => {
+      const o = i * SITE_FLOATS;
+      data[o] = Math.min(this.width - 1, Math.max(0, blk.x + (Math.random() - 0.5) * 0.5));
+      data[o + 1] = Math.min(this.height - 1, Math.max(0, blk.y + (Math.random() - 0.5) * 0.5));
+      data[o + 2] = blk.ownerW > 0 ? blk.tau / blk.ownerW : args.initLogTau;
+      data[o + 3] = blk.ownerW > 0 ? blk.radius / blk.ownerW : args.initRadius;
+      data[o + 4] = blk.color[0];
+      data[o + 5] = blk.color[1];
+      data[o + 6] = blk.color[2];
+      data[o + 7] = 1;
+      data[o + 8] = 0;
+      data[o + 9] = 0;
+    });
+    queue.writeBuffer(this.sitesBuf, n0 * SITE_FLOATS * 4, encodeSiteColors(data, k, this.colorSpace));
+    // Fresh Adam moments, with the birth step for per-site bias correction.
+    const adam = new Float32Array(k * ADAM_FLOATS);
+    for (let i = 0; i < k; i += 1) adam[i * ADAM_FLOATS + 20] = it;
+    queue.writeBuffer(this.adamBuf, n0 * ADAM_FLOATS * 4, adam);
+
+    const n1 = n0 + k;
+    this.siteCount = n1;
+    this.actualSites = n1;
+    this.activeEstimate += k;
+    updateClearParamsBuffer(queue, this.countParams, n1);
+    updateGradParamsBuffer(queue, this.gradParams, n1, this.invScaleSq);
+    if (this.usesPyr) {
+      for (let l = 0; l < this.pyrLevels.length; l += 1) {
+        updatePyrParamsBuffer(queue, this.pyrParams[l], {
+          levels: this.pyrLevels, level: l, siteCount: n1, width: this.width, height: this.height,
+          gamma: args.flowPyrGamma,
+        });
+      }
+    }
+
+    // Seed only the new sites into their home candidate pixels; the regular
+    // candidate updates spread them from there.
+    updateParamsBuffer(queue, this.growSeedParams, this._paramsArgs(n1, n0, 0));
+    const seedEnc = device.createCommandEncoder();
+    seedEnc.copyTextureToTexture({ texture: this.cand0A }, { texture: this.cand0B },
+      [this.candWidth, this.candHeight, 1]);
+    this.seedEnc.encode(seedEnc, this.sitesBuf, this.growSeedParams, this.cand0A, this.cand0B, k);
+    queue.submit([seedEnc.finish()]);
+    [this.cand0A, this.cand0B] = [this.cand0B, this.cand0A];
+
+    this._updateFitTarget();
+    this._log(`Grow @${it}: +${k} → ${n1} sites | best gain ${fmtLambda(picked[0].gain / BITS_PER_SITE)}/bit | ` +
+              `cell ${cell * GROW_SUBDIV}px` + (this.fitSigma ? ` | blur σ ${this.fitSigma.toFixed(1)}px` : ""));
   }
 
   // Encode preview readbacks into the same submission as the preview render.
@@ -865,6 +1053,8 @@ export class Trainer {
       this.dummyHilbertBuf, this.hilbertParams, this._tauHeatBuf,
       this.errEmaBuf, this.flowBuf, this.flowParams, this.pyrCnt0, this.pyrCells,
       ...(this.pyrParams || []),
+      this.blurTex, this.blurTmpTex, this.growBlurParams, this.growGainParams, this.growSeedParams,
+      this.growCellsBuf,
     ];
     if (this.hilbertRes) {
       owned.push(this.hilbertRes.pairs, this.hilbertRes.order, this.hilbertRes.pos);
@@ -878,6 +1068,74 @@ export class Trainer {
     this.maskCpu = null;
     this._lastSitesCpu = null;
   }
+}
+
+const fmtLambda = (v) => (v >= 100 ? v.toFixed(0) : v.toPrecision(2));
+
+// Growth candidates from grow_gain.wgsl's per-cell stats (`cells`, 12 floats
+// per cell of `cell` px). Each parent of GROW_SUBDIV × GROW_SUBDIV cells (about
+// one site spacing) is scored by its best dyadic block (the whole parent, its
+// quarters, ... down to single cells): the error a site taking that block over
+// with the block's mean color would remove, sum|fit - pred|² - sum|fit - mean|²,
+// in 8-bit levels² summed over RGB. Remaining error concentrates at edges finer
+// than the spacing, which a whole-parent score would miss. Returns the parents
+// whose best gain beats `threshold`, as { gain, x, y, color, tau, radius, ownerW }.
+const GROW_SUBDIV = 4;
+
+export function pickGrowthBlocks(cells, cellsX, cellsY, cell, threshold) {
+  const out = [];
+  const L2 = 255 * 255;
+  const block = (bx, by, size) => {
+    let n = 0, e = 0, ex = 0, ey = 0, tau = 0, rad = 0, ow = 0, var0 = 0;
+    const mean = [0, 0, 0];
+    const parts = [];
+    for (let y = by; y < Math.min(by + size, cellsY); y += 1) {
+      for (let x = bx; x < Math.min(bx + size, cellsX); x += 1) {
+        const b = (y * cellsX + x) * 12;
+        const ni = cells[b];
+        if (!(ni > 0)) continue;
+        n += ni;
+        for (let c = 0; c < 3; c += 1) mean[c] += ni * cells[b + 1 + c];
+        var0 += cells[b + 4];
+        const ei = cells[b + 5];
+        e += ei;
+        ex += cells[b + 6] + ei * x * cell;
+        ey += cells[b + 7] + ei * y * cell;
+        tau += cells[b + 8];
+        rad += cells[b + 9];
+        ow += cells[b + 10];
+        parts.push(b);
+      }
+    }
+    if (n < 1) return null;
+    for (let c = 0; c < 3; c += 1) mean[c] /= n;
+    // Pooled variance: within-cell spread plus spread of the cell means.
+    let v = var0;
+    for (const b of parts) {
+      let d2 = 0;
+      for (let c = 0; c < 3; c += 1) d2 += (cells[b + 1 + c] - mean[c]) ** 2;
+      v += cells[b] * d2;
+    }
+    const gain = (e - v) * L2;
+    if (!Number.isFinite(gain)) return null;
+    return { gain, x: e > 0 ? ex / e : (bx + size / 2) * cell, y: e > 0 ? ey / e : (by + size / 2) * cell,
+             color: mean, tau, radius: rad, ownerW: ow };
+  };
+  for (let py = 0; py < cellsY; py += GROW_SUBDIV) {
+    for (let px = 0; px < cellsX; px += GROW_SUBDIV) {
+      let best = null;
+      for (let size = GROW_SUBDIV; size >= 1; size >>= 1) {
+        for (let by = py; by < py + GROW_SUBDIV; by += size) {
+          for (let bx = px; bx < px + GROW_SUBDIV; bx += size) {
+            const blk = block(bx, by, size);
+            if (blk && (!best || blk.gain > best.gain)) best = blk;
+          }
+        }
+      }
+      if (best && best.gain > threshold) out.push(best);
+    }
+  }
+  return out;
 }
 
 // Gradient groups over the consolidated grads[idx*10+ch] channels. Multi-channel
