@@ -5,7 +5,7 @@
 
 import { loadShaders, tileSlotsForLimit } from "../trainer/shader_loader.js?v=shared-wgsl-20261017";
 import { requestTrainingDevice } from "../trainer/device.js?v=shared-wgsl-20261017";
-import { Trainer, buildArgs, GRAD_GROUPS, lrSchedule } from "../trainer/trainer.js?v=grow-20261017";
+import { Trainer, buildArgs, GRAD_GROUPS, lrSchedule } from "../trainer/trainer.js?v=noflow-20261017";
 import { loadImageToFloat32, loadMaskRgba32Float, whiteMaskRgba32Float } from "../trainer/textures.js?v=shared-wgsl-20261017";
 import { loadSitesFromFile, serializeSitesTxt, triggerDownload, floatImageToRgba8, computeBpp, BITS_PER_SITE } from "../trainer/io.js?v=shared-wgsl-20261017";
 import { SITE_FLOATS } from "../trainer/params.js?v=shared-wgsl-20261017";
@@ -45,16 +45,6 @@ const UI_FIELDS = [
   ["lrColorBase", "p-lrColorBase"],
   ["lrDirBase", "p-lrDirBase"],
   ["lrAnisoBase", "p-lrAnisoBase"],
-  ["flowStrength", "p-flowStrength"],
-  ["flowStartIter", "p-flowStartIter"],
-  ["flowEndIter", "p-flowEndIter"],
-  ["flowMaxStep", "p-flowMaxStep"],
-  ["flowEmaAlpha", "p-flowEmaAlpha"],
-  ["flowGeoMix", "p-flowGeoMix"],
-  ["flowPyrStrength", "p-flowPyrStrength"],
-  ["flowPyrCell", "p-flowPyrCell"],
-  ["flowPyrLevels", "p-flowPyrLevels"],
-  ["flowPyrGamma", "p-flowPyrGamma"],
   ["colorSpace", "p-colorSpace"],
   ["growLambda", "p-growLambda"],
   ["growInitSites", "p-growInitSites"],
@@ -234,8 +224,7 @@ const VIEWS = {
                 note: "The trainer's latest render, with site centroids blinking on top." },
   residual:   { label: "Residual |recon − target|", kind: "image", source: "derived", blank: "#000004",
                 on: ["render"], draw: drawResidual,
-                note: "Mean |recon − target| over RGB on a fixed 0–0.25 scale. The residual-driven site flow " +
-                      "uses its own per-pixel error EMA on the GPU, not this image." },
+                note: "Mean |recon − target| over RGB on a fixed 0–0.25 scale." },
   importance: { label: "Importance (Laplacian bands)", kind: "image", source: "derived", on: ["target"], draw: drawImportance,
                 note: `Luma Laplacian band energy, mask · (ε + √Σ β_k L_k²)^γ with β = [${IMPORTANCE.bandWeights.join(", ")}]. ` +
                       "Not used by the optimizer." },

@@ -178,38 +178,6 @@ struct TauDiffuseParams {
   _pad4 : f32,
 }
 
-// Residual-driven site flow (lloyd_accum.wgsl, flow_step.wgsl).
-struct FlowParams {
-  siteCount : u32,
-  width : u32,
-  height : u32,
-  geoMix : f32,
-  invScaleSq : f32,
-  emaAlpha : f32,
-  strength : f32,
-  maxStep : f32,
-  pyrStrength : f32,
-  pyrLevels : f32,
-  _pad2 : f32,
-  _pad3 : f32,
-}
-
-// Residual-flow pyramid. levels[l] = (cellsX, cellsY, offset into the
-// concatenated cell buffer, cell size in px); level 0 is finest, the last is 1x1.
-// \`level\` is only read by pyr_reduce (one uniform buffer per level). \`gamma\`
-// softens the target density: cells sum err^gamma instead of err.
-struct PyrParams {
-  numLevels : u32,
-  level : u32,
-  siteCount : u32,
-  width : u32,
-  height : u32,
-  gamma : f32,
-  _pad1 : u32,
-  _pad2 : u32,
-  levels : array<vec4<u32>, 16>,
-}
-
 fn viewToImage(viewPx : vec2<f32>, view : ViewParams) -> vec2<f32> {
   let centered = (viewPx - view.canvasSize * 0.5) / max(view.zoom, 1e-6);
   return centered + view.imageSize * 0.5 + view.pan;
