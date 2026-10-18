@@ -4,11 +4,18 @@ The WebGPU optimizer: the training loop, Adam schedule, GPU buffers and kernel d
 It has no DOM dependencies, so the browser pages in `web/` and the Node runner in `node/`
 both import it. Hyperparameter defaults come from `training_config.json`.
 
-By default (`growLambda` 400) the trainer adds sites by rate-distortion; `growLambda = 0` keeps
-the site count fixed for the whole run. With growth on: every `growEvery` iterations, each site-spacing cell gets a site if
-the best error one site could remove there (scored over the cell's dyadic sub-blocks) beats
-`growLambda × BITS_PER_SITE`, so growth runs coarse to fine and stops when sites no longer pay
-for their bits. `sites` is then the cap. Sites are never removed (no prune).
+`siteMode` picks how many sites a run uses:
+
+- `"grow"` (default): start from `growInitSites` and add sites by rate-distortion. Every
+  `growEvery` iterations, each site-spacing cell gets a site if the best error one site could
+  remove there (scored over the cell's dyadic sub-blocks) beats `growLambda × BITS_PER_SITE`, so
+  growth runs coarse to fine and stops when sites no longer pay for their bits. `growMaxSites`
+  is a hard cap (and sizes the buffers); if growth hits it, the trainer logs it and reports
+  `growCapped`, since the cap rather than λ then sets the count. Sites are never removed.
+- `"fixed"`: exactly `sites` for the whole run.
+
+Without an explicit `siteMode`, `growLambda <= 0` means fixed, so older `growLambda=0` configs
+still work.
 
 ## Modules
 

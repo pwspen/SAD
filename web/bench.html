@@ -32,7 +32,7 @@
 
     <script type="module">
       import { loadShaders, tileSlotsForLimit } from "../trainer/shader_loader.js?v=shared-wgsl-20261017";
-      import { Trainer, buildArgs } from "../trainer/trainer.js?v=grow-default-20261017";
+      import { Trainer, buildArgs } from "../trainer/trainer.js?v=site-mode-20261017";
       import { loadImageToFloat32 } from "../trainer/textures.js?v=shared-wgsl-20261017";
       import { requestTrainingDevice, adapterLabel } from "../trainer/device.js?v=shared-wgsl-20261017";
 
@@ -82,6 +82,8 @@
         const overrides = {
           iters: numberParam("iters"),
           sites: numberParam("sites"),
+          // A speed benchmark needs a known count: fixed unless ?siteMode=grow.
+          siteMode: params.get("siteMode") || "fixed",
           logFreq: numberParam("logFreq"),
           viewerFreq: numberParam("viewerFreq"),
           candUpdatePasses: numberParam("candPasses"),

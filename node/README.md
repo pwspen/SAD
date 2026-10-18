@@ -6,12 +6,13 @@ so parameter sweeps don't need a browser:
 ```bash
 cd node
 npm install
-node sweep.mjs --image /path/to/image.png --set growLambda=0 --set sites=500,1000,2000 --set lrPosBase=0.025,0.05
+node sweep.mjs --image /path/to/image.png --set siteMode=fixed --set sites=500,1000,2000 --set lrPosBase=0.025,0.05
 node sweep.mjs --image /path/to/image.png --grid grid.json --repeat 3 --save-dir results/sweep
 ```
 
-- Site growth is on by default (`growLambda` 400, `sites` = cap). Pass `--set growLambda=0` to sweep
-  fixed site counts, or sweep `growLambda` to trace a bpp/PSNR curve.
+- Site growth is on by default (`siteMode=grow`, `growLambda` 400, capped at `growMaxSites`);
+  `sites` only applies with `--set siteMode=fixed` (or `growLambda=0`). Sweep `growLambda` to
+  trace a bpp/PSNR curve; runs that hit the cap say so (`growCapped` in the JSON).
 - `--set key=v1,v2` sweeps a trainer arg (camelCase, as in `buildArgs` in `trainer/trainer.js`) or a
   `training_config.json` key (UPPER_CASE). Axes combine as a cartesian grid.
   `--grid` takes the same as JSON, or an explicit list of runs.

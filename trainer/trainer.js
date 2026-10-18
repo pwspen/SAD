@@ -109,8 +109,8 @@ export function buildArgs(config, overrides = {}) {
     // Total iters = warmupIters + decayIters; an explicit "iters" override
     // (e.g. from sweeps) sets the total and shortens the decay phase to fit.
     warmupIters: Math.max(0, Math.floor(Number(pick("warmupIters", "WARMUP_ITERS", 100)))),
-    // Fixed site count, or with growth on (the default) the cap.
-    sites: Number(pick("sites", null, 20000)),
+    // Site count in "fixed" siteMode (ignored when growing; see below).
+    sites: Number(pick("sites", null, 1000)),
     candFreq: Number(pick("candFreq", "CAND_UPDATE_FREQ", 1)),
     candHilbertWindow: Number(pick("candHilbertWindow", "CAND_HILBERT_WINDOW", 0)),
     candHilbertProbes: Number(pick("candHilbertProbes", "CAND_HILBERT_PROBES", 0)),
@@ -137,13 +137,14 @@ export function buildArgs(config, overrides = {}) {
     beta2: Number(pick("beta2", "BETA2", 0.999)),
     eps: Number(pick("eps", "EPS", 1e-8)),
     maxDim: Number(pick("maxDim", "MAX_DIM", 2048)),
-    // Site growth (rate-distortion). growLambda is the final slope -dD/dR: the
-    // squared error (8-bit levels², summed over RGB) a site must remove per bit
-    // it costs (BITS_PER_SITE bits). 0 = off: the site count stays fixed. With
-    // growth on, `sites` is the cap and runs start from growInitSites. 400
-    // lands around 4-9k sites on Kodak; there is no single best λ, it picks
-    // the bpp/PSNR operating point.
+    // Site growth (rate-distortion), used when siteMode is "grow". growLambda
+    // is the slope -dD/dR: the squared error (8-bit levels², summed over RGB) a
+    // site must remove per bit it costs (BITS_PER_SITE bits). 400 lands around
+    // 4-9k sites on Kodak; there is no single best λ, it picks the bpp/PSNR
+    // operating point. Runs start from growInitSites and never exceed
+    // growMaxSites (which also sizes the GPU buffers).
     growLambda: Number(pick("growLambda", "GROW_LAMBDA", 400)),
+    growMaxSites: Math.max(1, Math.floor(Number(pick("growMaxSites", "GROW_MAX_SITES", 20000)))),
     growInitSites: Math.max(1, Math.floor(Number(pick("growInitSites", "GROW_INIT_SITES", 256)))),
     growEvery: Math.max(1, Math.floor(Number(pick("growEvery", "GROW_EVERY", 10)))),
     // While growing, the fit target is blurred with sigma = growBlur × site
@@ -154,6 +155,17 @@ export function buildArgs(config, overrides = {}) {
     ? overrides.iters - args.warmupIters
     : pick("decayIters", "DECAY_ITERS", 500))));
   args.iters = args.warmupIters + args.decayIters;
+  // "fixed": exactly `sites` for the whole run. "grow": rate-distortion growth.
+  // Without an explicit siteMode, growLambda <= 0 means fixed, so older
+  // configs and sweeps that switched growth off with growLambda=0 still work.
+  const siteMode = pick("siteMode", "SITE_MODE", null);
+  args.siteMode = siteMode == null || siteMode === "" ? (args.growLambda > 0 ? "grow" : "fixed") : String(siteMode);
+  if (args.siteMode !== "fixed" && args.siteMode !== "grow") {
+    throw new Error(`siteMode must be "fixed" or "grow" (got "${args.siteMode}")`);
+  }
+  if (args.siteMode === "grow" && !(args.growLambda > 0)) {
+    throw new Error("siteMode \"grow\" needs growLambda > 0");
+  }
   // Growth (and the blurred target) stops here; the rest fits the original.
   const growEnd = pick("growEndIter", "GROW_END_ITER", null);
   args.growEndIter = Math.max(0, Math.floor(growEnd == null || growEnd === "" ? 0.6 * args.iters : Number(growEnd)));
@@ -199,7 +211,7 @@ export class Trainer {
     this.tauEnc = new TauEncoder(device, shaders);
     this.clearI32Enc = new ClearBufferEncoder(device, shaders, { useI32: true });
     this.hilbertEnc = this.usesHilbert ? new HilbertEncoder(device, shaders) : null;
-    this.usesGrow = args.growLambda > 0;
+    this.usesGrow = args.siteMode === "grow";
     this.growEnc = this.usesGrow ? new GrowEncoder(device, shaders) : null;
   }
 
@@ -228,11 +240,16 @@ export class Trainer {
     const maskData = maskRgba32f || whiteMaskRgba32Float(width, height).rgba;
     writeFloat32ToRgba32FloatTexture(device, this.maskTex, maskData, width, height);
 
-    // Without growth the site count is fixed. With growth, buffers hold up to
-    // `sites` and the run starts from growInitSites (or the loaded sites).
-    // Unused slots are inactive (position.x < 0), which every kernel skips.
-    this.bufferCapacity = this.usesGrow ? Math.max(initSiteCount, args.sites) : initSiteCount;
-    if (this.usesGrow && !initSites) initSiteCount = Math.min(args.growInitSites, this.bufferCapacity);
+    // Fixed mode: exactly initSiteCount sites. Grow mode: buffers hold up to
+    // growMaxSites (or the loaded sites, if more) and the run starts from
+    // growInitSites (or the loaded sites). Unused slots are inactive
+    // (position.x < 0), which every kernel skips.
+    if (this.usesGrow) {
+      this.bufferCapacity = Math.max(initSites ? initSiteCount : 0, args.growMaxSites);
+      if (!initSites) initSiteCount = Math.min(args.growInitSites, this.bufferCapacity);
+    } else {
+      this.bufferCapacity = initSiteCount;
+    }
     this.siteCount = initSiteCount;
 
     // Buffers
@@ -310,6 +327,7 @@ export class Trainer {
       }
       this.growCellsBuf = null;
       this.growCellsCap = 0;
+      this.growCapped = false; // set once growth wanted more sites than growMaxSites allows
     }
 
     // Initialize sites
@@ -562,6 +580,7 @@ export class Trainer {
             activeSites,
             totalSites: siteCount,
             fitSigma: this.fitSigma || 0,
+            growCapped: Boolean(this.growCapped),
             itsPerSec,
             elapsedSec: elapsed,
             renderRgba: rgba,
@@ -632,7 +651,7 @@ export class Trainer {
       }
       return;
     }
-    if (it === 0 || it % args.growEvery !== 0 || this.siteCount >= this.bufferCapacity) return;
+    if (it === 0 || it % args.growEvery !== 0 || this.growCapped) return;
 
     const device = this.device;
     const queue = device.queue;
@@ -668,7 +687,13 @@ export class Trainer {
     const lambda = args.growLambda;
     const picked = pickGrowthBlocks(cells, cellsX, cellsY, cell, lambda * BITS_PER_SITE);
     picked.sort((a, b) => b.gain - a.gain);
-    picked.length = Math.min(picked.length, this.bufferCapacity - n0);
+    const room = this.bufferCapacity - n0;
+    if (picked.length > room && !this.growCapped) {
+      this.growCapped = true;
+      this._log(`Hit max sites (${this.bufferCapacity}) at iter ${it}: ${picked.length - room} more sites ` +
+                `would pay for their bits, so the cap now sets the count, not λ. Raise max sites or λ.`);
+    }
+    picked.length = Math.min(picked.length, room);
     if (!picked.length) return;
 
     // New sites: error centroid of the block, its mean fit color, its owners'
@@ -929,6 +954,7 @@ export class Trainer {
       width: this.width,
       height: this.height,
       bestPsnr: this.bestPsnr,
+      growCapped: Boolean(this.growCapped),
       trainSeconds: (performance.now() - this.trainStartMs) / 1000,
     };
   }

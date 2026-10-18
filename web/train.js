@@ -5,7 +5,7 @@
 
 import { loadShaders, tileSlotsForLimit } from "../trainer/shader_loader.js?v=shared-wgsl-20261017";
 import { requestTrainingDevice } from "../trainer/device.js?v=shared-wgsl-20261017";
-import { Trainer, buildArgs, GRAD_GROUPS, lrSchedule } from "../trainer/trainer.js?v=grow-default-20261017";
+import { Trainer, buildArgs, GRAD_GROUPS, lrSchedule } from "../trainer/trainer.js?v=site-mode-20261017";
 import { loadImageToFloat32, loadMaskRgba32Float, whiteMaskRgba32Float } from "../trainer/textures.js?v=shared-wgsl-20261017";
 import { loadSitesFromFile, serializeSitesTxt, triggerDownload, floatImageToRgba8, computeBpp, BITS_PER_SITE } from "../trainer/io.js?v=shared-wgsl-20261017";
 import { SITE_FLOATS } from "../trainer/params.js?v=shared-wgsl-20261017";
@@ -45,8 +45,10 @@ const UI_FIELDS = [
   ["lrDirBase", "p-lrDirBase"],
   ["lrAnisoBase", "p-lrAnisoBase"],
   ["colorSpace", "p-colorSpace"],
+  ["siteMode", "p-siteMode"],
   ["growLambda", "p-growLambda"],
   ["growInitSites", "p-growInitSites"],
+  ["growMaxSites", "p-growMaxSites"],
   ["growEvery", "p-growEvery"],
   ["growEndIter", "p-growEndIter", { blankDefault: true }], // blank = 60% of iters
   ["growBlur", "p-growBlur"],
@@ -70,6 +72,7 @@ const state = {
   lastSiteCount: 0,
   lastPsnr: null,        // persists between log ticks so preview updates don't blank the PSNR
   lastLrScale: null,     // schedule × LR mult at the last log tick
+  growCapped: false,     // the current run's growth hit max sites (marked in the status bar)
   lastActiveSites: 0,    // active sites at the last log tick (site-spacing reference lines)
   psnrHistory: [],       // [{ it, psnr }] from log ticks, plotted in the PSNR card
   psnrIters: 0,
@@ -97,6 +100,7 @@ const ui = {
   maskLabel: document.getElementById("maskLabel"),
   initSitesInput: document.getElementById("initSitesInput"),
   initLabel: document.getElementById("initLabel"),
+  initSitesClear: document.getElementById("initSitesClear"),
   startBtn: document.getElementById("startBtn"),
   stopBtn: document.getElementById("stopBtn"),
   loopToggle: document.getElementById("loopToggle"),
@@ -138,6 +142,7 @@ function applyConfigToForm(config) {
     else if (v === undefined) el.value = "";
     else el.value = v;
   }
+  syncSiteFields();
 }
 
 function readFormArgs() {
@@ -145,6 +150,7 @@ function readFormArgs() {
   for (const [key, elId] of UI_FIELDS) {
     const el = document.getElementById(elId);
     if (!el) continue;
+    if (el.disabled) continue; // locked to a loaded sites file's count (syncSiteFields)
     if (el.type === "checkbox") overrides[key] = el.checked;
     else if (el.tagName === "SELECT") overrides[key] = el.value;
     else if (el.value === "") continue;
@@ -152,6 +158,24 @@ function readFormArgs() {
   }
   if (overrides.logFreq !== undefined) overrides.viewerFreq = overrides.logFreq;
   return buildArgs(state.config, overrides);
+}
+
+// Show only the chosen site mode's fields, and lock its starting-count field
+// (sites when fixed, start sites when growing) to a loaded sites file's count,
+// restoring the typed value once the file is cleared.
+function syncSiteFields() {
+  const mode = document.getElementById("p-siteMode").value;
+  ui.paramsPanel.dataset.siteMode = mode;
+  const locked = mode === "grow" ? "p-growInitSites" : "p-sites";
+  for (const id of ["p-sites", "p-growInitSites"]) {
+    const el = document.getElementById(id);
+    const lock = id === locked && state.initSites != null;
+    if (lock && !el.disabled) el.dataset.typed = el.value;
+    if (!lock && el.disabled) el.value = el.dataset.typed ?? el.value;
+    el.disabled = lock;
+    if (lock) el.value = state.initSites.count;
+    el.title = lock ? "Set by the loaded sites file (Clear it to edit)" : "";
+  }
 }
 
 async function initDevice() {
@@ -1761,11 +1785,21 @@ async function handleInitSitesInput(ev) {
   try {
     state.initSites = await loadSitesFromFile(file);
     ui.initLabel.textContent = `${file.name} (${state.initSites.count})`;
+    ui.initSitesClear.hidden = false;
     appendLog(`Init sites: ${state.initSites.count}` +
       (state.initSites.width ? ` (${state.initSites.width}×${state.initSites.height})` : ""));
   } catch (err) {
     appendLog(`Init sites load failed: ${err.message}`);
   }
+  syncSiteFields();
+}
+
+function clearInitSites() {
+  state.initSites = null;
+  ui.initSitesInput.value = "";
+  ui.initLabel.textContent = "gradient init";
+  ui.initSitesClear.hidden = true;
+  syncSiteFields();
 }
 
 function maybeEnableStart() {
@@ -1797,6 +1831,13 @@ function overrideInitLogTau(init, initLogTau) {
 async function startTraining() {
   if (state.running) return;
   if (!state.device || !state.targetImage) return;
+  let args;
+  try {
+    args = readFormArgs();
+  } catch (err) {
+    appendLog(`Settings error: ${err.message}`);
+    return;
+  }
 
   ui.saveBtn.disabled = true;
   ui.savePopover.classList.add("hidden");
@@ -1813,7 +1854,6 @@ async function startTraining() {
   state.trainer?.destroy();
   state.trainer = null;
 
-  const args = readFormArgs();
   const { width, height } = state.targetImage;
 
   let maskRgba = null;
@@ -1837,15 +1877,17 @@ async function startTraining() {
   state.lrHistory = [];
   state.lrPlan = { warmupIters: args.warmupIters, decayIters: args.decayIters, lrMult: args.lrMult };
   state.lastActiveSites = initSiteCount;
+  state.growCapped = false;
   state.bppRuns.push({
     sites: initSiteCount, bpp: computeBpp(initSiteCount, width, height), colorSpace: args.colorSpace, points: [],
   });
   for (const view of Object.values(VIEWS)) view.hoverKey = null;
   await refreshViews("run");
 
-  const sitesDesc = args.growLambda > 0 && !init
-    ? `grow ${Math.min(args.growInitSites, args.sites)} → ≤${args.sites} (λ ${args.growLambda}, until iter ${args.growEndIter})`
-    : initSiteCount;
+  const sitesDesc = args.siteMode === "grow"
+    ? `grow ${init ? init.count : Math.min(args.growInitSites, args.growMaxSites)} → ≤${Math.max(args.growMaxSites, init ? init.count : 0)} ` +
+      `(λ ${args.growLambda}, until iter ${args.growEndIter})`
+    : `${initSiteCount} fixed`;
   appendLog(`Target: ${width}×${height} | sites: ${sitesDesc} | iters: ${args.warmupIters} warmup + ${args.decayIters} decay | lr ×${args.lrMult} | color: ${COLOR_SPACES[args.colorSpace].label} | refresh: ${args.logFreq}`);
   updateProgress(0, args.iters, "Preparing…");
 
@@ -1864,6 +1906,7 @@ async function startTraining() {
         state.lastPsnr = info.psnr;
         state.lastLrScale = info.lrScale;
         state.lastActiveSites = info.activeSites;
+        state.growCapped = Boolean(info.growCapped);
         if (Number.isFinite(info.psnr)) {
           state.psnrHistory.push({ it: info.it, psnr: info.psnr });
           const run = state.bppRuns[state.bppRuns.length - 1];
@@ -1959,7 +2002,9 @@ function renderMetrics(info) {
     `<span>iter <strong>${info.it + 1}/${info.iters}</strong></span>` +
     `<span>PSNR <strong>${psnrText}</strong></span>` +
     (state.lastLrScale != null ? `<span>lr <strong>×${state.lastLrScale.toPrecision(3)}</strong></span>` : "") +
-    `<span>active <strong>${info.activeSites}</strong>/${info.totalSites}</span>` +
+    `<span>active <strong>${info.activeSites}</strong>/${info.totalSites}` +
+      (state.growCapped ? ` <strong title="Growth hit max sites: the cap, not λ, set the count" style="color:var(--accent)">cap</strong>` : "") +
+      `</span>` +
     `<span><strong>${info.itsPerSec.toFixed(1)}</strong> it/s</span>`;
 }
 
@@ -2122,6 +2167,8 @@ async function main() {
   });
   ui.maskInput.addEventListener("change", handleMaskInput);
   ui.initSitesInput.addEventListener("change", handleInitSitesInput);
+  ui.initSitesClear.addEventListener("click", clearInitSites);
+  document.getElementById("p-siteMode").addEventListener("change", syncSiteFields);
   ui.startBtn.addEventListener("click", startTraining);
   ui.stopBtn.addEventListener("click", stopTraining);
   ui.toggleParamsBtn.addEventListener("click", toggleParams);
