@@ -14,8 +14,9 @@ All pages read hyperparameters from `training_config.json`.
 - HTTP(S) hosting. ES modules + `fetch` won't run from `file://`; GitHub Pages
   works because it serves the repository over HTTPS. Locally, run `./serve.sh`
   from the repo root and open the trainer link it prints. It serves the parent
-  folder so the Kodak picker can find `../comp/data/kodak` (override the folder
-  with `?kodak=<dir>`).
+  folder so the dataset picker can find `../comp/data/kodak` and
+  `../comp/data/mnist` (the MNIST test split's `t10k-*-ubyte.gz` files);
+  override the folders with `?kodak=<dir>` / `?mnist=<dir>`.
 
 ## Viewer (`index.html`)
 

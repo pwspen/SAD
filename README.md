@@ -21,7 +21,8 @@ Serve the pages over HTTP (ES modules and `fetch` don't work from `file://`):
 ```
 
 It serves the folder above the repo on port 8766 (`PORT=…` to change it), so the
-trainer's Kodak picker can reach `../comp/data/kodak`, and prints the links:
+trainer's dataset picker can reach `../comp/data/kodak` and `../comp/data/mnist`,
+and prints the links:
 
 - http://127.0.0.1:8766/SAD/web/train.html: interactive trainer
 - http://127.0.0.1:8766/SAD/web/index.html: viewer for saved `*_sites.txt` files

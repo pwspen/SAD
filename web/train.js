@@ -24,6 +24,9 @@ const SNAP_MAP_K = 4; // snap-analysis fit drawn on the image (one of SNAP_KS)
 // kodak-bench server (which serves the parent dir). Override with ?kodak=<dir>.
 const KODAK_DIR = new URLSearchParams(location.search).get("kodak") || "../../comp/data/kodak/";
 const KODAK_COUNT = 24;
+// MNIST test split (t10k-*-ubyte.gz, the original IDX files) sits next to
+// Kodak. Override with ?mnist=<dir>.
+const MNIST_DIR = new URLSearchParams(location.search).get("mnist") || "../../comp/data/mnist/";
 
 // Fields that live in the advanced panel. The target image is in the top bar;
 // init-sites / mask are pickers inside the panel (not listed here).
@@ -101,9 +104,10 @@ const ui = {
   status: document.getElementById("status"),
   imageInput: document.getElementById("imageInput"),
   imageLabel: document.getElementById("imageLabel"),
-  kodakSelect: document.getElementById("kodakSelect"),
-  kodakPrev: document.getElementById("kodakPrev"),
-  kodakNext: document.getElementById("kodakNext"),
+  datasetSelect: document.getElementById("datasetSelect"),
+  itemSelect: document.getElementById("itemSelect"),
+  itemPrev: document.getElementById("itemPrev"),
+  itemNext: document.getElementById("itemNext"),
   maskInput: document.getElementById("maskInput"),
   maskLabel: document.getElementById("maskLabel"),
   initSitesInput: document.getElementById("initSitesInput"),
@@ -2177,46 +2181,128 @@ function drawImportance() {
 async function handleImageInput(ev) {
   const file = ev.target.files[0];
   if (!file) return;
-  ui.kodakSelect.value = "";
+  ui.itemSelect.value = "";
   await setTarget(file, file.name);
 }
 
-function kodakName(i) {
-  return `kodim${String(i).padStart(2, "0")}.png`;
+let mnistData = null; // promise of { count, side, pixels, labels }
+
+async function fetchIdx(name) {
+  const res = await fetch(new URL(name, new URL(MNIST_DIR, location.href)));
+  if (!res.ok) throw new Error(`${name}: HTTP ${res.status}`);
+  const bytes = await new Response(res.body.pipeThrough(new DecompressionStream("gzip"))).arrayBuffer();
+  // IDX: big-endian magic (0x08 = ubyte, low byte = rank), dims, then data.
+  const view = new DataView(bytes);
+  const rank = view.getUint8(3);
+  const dims = Array.from({ length: rank }, (_, d) => view.getUint32(4 + 4 * d));
+  return { dims, data: new Uint8Array(bytes, 4 + 4 * rank) };
 }
 
-async function loadKodak(i) {
+function loadMnist() {
+  mnistData ??= Promise.all([
+    fetchIdx("t10k-images-idx3-ubyte.gz"),
+    fetchIdx("t10k-labels-idx1-ubyte.gz"),
+  ]).then(([images, labels]) => ({
+    count: images.dims[0], side: images.dims[1], pixels: images.data, labels: labels.data,
+  }));
+  mnistData.catch(() => { mnistData = null; }); // let a failed load retry
+  return mnistData;
+}
+
+// Each dataset: item names for the picker (after prepare()), and load(i)
+// returning something createImageBitmap takes.
+const DATASETS = {
+  kodak: {
+    label: "Kodak",
+    count: KODAK_COUNT,
+    async prepare() {},
+    itemName: (i) => `kodim${String(i + 1).padStart(2, "0")}`,
+    async load(i) {
+      const name = `${this.itemName(i)}.png`;
+      const res = await fetch(new URL(name, new URL(KODAK_DIR, location.href)));
+      if (!res.ok) throw new Error(`${name}: HTTP ${res.status}`);
+      return res.blob();
+    },
+  },
+  mnist: {
+    label: "MNIST",
+    count: 0,
+    labels: null,
+    async prepare() {
+      ({ count: this.count, labels: this.labels } = await loadMnist());
+    },
+    itemName(i) { return `mnist${String(i).padStart(4, "0")}_${this.labels[i]}`; },
+    async load(i) {
+      const { side, pixels } = await loadMnist();
+      const n = side * side;
+      const img = new ImageData(side, side);
+      for (let p = 0; p < n; p += 1) {
+        const v = pixels[i * n + p];
+        img.data.set([v, v, v, 255], p * 4);
+      }
+      return img;
+    },
+  },
+};
+
+function currentDataset() {
+  return DATASETS[ui.datasetSelect.value];
+}
+
+async function selectDataset(key) {
+  const dataset = DATASETS[key];
+  ui.datasetSelect.value = key;
+  ui.itemSelect.length = 0;
+  ui.itemSelect.add(new Option(`${dataset.label}…`, ""));
+  const prevStatus = ui.status.textContent;
+  try {
+    setStatus(`Loading ${dataset.label}…`);
+    await dataset.prepare();
+  } catch (err) {
+    setStatus(`Failed: ${err.message}`);
+    console.error(err);
+    return;
+  }
+  if (ui.datasetSelect.value !== key) return;
+  for (let i = 0; i < dataset.count; i += 1) {
+    ui.itemSelect.add(new Option(dataset.itemName(i), String(i)));
+  }
+  setStatus(prevStatus);
+}
+
+async function loadItem(i) {
   if (state.running) return;
-  const name = kodakName(i);
+  const dataset = currentDataset();
+  const name = dataset.itemName(i);
   // Fast flicks overlap loads; only the latest one may land.
   const token = ++state.targetToken;
-  ui.kodakSelect.value = String(i);
-  // Clear so re-picking the same local file after a Kodak image still fires change.
+  ui.itemSelect.value = String(i);
+  // Clear so re-picking the same local file after a dataset image still fires change.
   ui.imageInput.value = "";
   setStatus(`Loading ${name}…`);
   ui.imageLabel.textContent = name;
   try {
-    const res = await fetch(new URL(name, new URL(KODAK_DIR, location.href)));
-    if (!res.ok) throw new Error(`${name}: HTTP ${res.status}`);
-    const blob = await res.blob();
+    const source = await dataset.load(i);
     if (token !== state.targetToken) return;
-    await setTarget(blob, name, token);
+    await setTarget(source, name, token);
   } catch (err) {
     setStatus(`Failed: ${err.message}`);
     console.error(err);
   }
 }
 
-function stepKodak(delta) {
-  const cur = Number(ui.kodakSelect.value) || (delta > 0 ? 0 : 1);
-  const next = ((cur - 1 + delta + KODAK_COUNT) % KODAK_COUNT) + 1;
-  loadKodak(next);
+function stepItem(delta) {
+  const count = currentDataset().count;
+  if (ui.itemSelect.length <= 1) return; // still preparing
+  const cur = ui.itemSelect.value === "" ? (delta > 0 ? -1 : 0) : Number(ui.itemSelect.value);
+  loadItem((cur + delta + count) % count);
 }
 
-function setKodakEnabled(enabled) {
-  ui.kodakSelect.disabled = !enabled;
-  ui.kodakPrev.disabled = !enabled;
-  ui.kodakNext.disabled = !enabled;
+function setDatasetEnabled(enabled) {
+  ui.datasetSelect.disabled = !enabled;
+  ui.itemSelect.disabled = !enabled;
+  ui.itemPrev.disabled = !enabled;
+  ui.itemNext.disabled = !enabled;
 }
 
 async function setTarget(file, name, token = ++state.targetToken) {
@@ -2328,7 +2414,7 @@ async function startTraining() {
   ui.savePopover.classList.add("hidden");
   ui.startBtn.disabled = true;
   ui.stopBtn.disabled = false;
-  setKodakEnabled(false);
+  setDatasetEnabled(false);
   state.running = true;
   state.abortCtrl = new AbortController();
   const signal = state.abortCtrl.signal;
@@ -2485,7 +2571,7 @@ async function startTraining() {
     state.running = false;
     ui.startBtn.disabled = false;
     ui.stopBtn.disabled = true;
-    setKodakEnabled(true);
+    setDatasetEnabled(true);
   }
   // The snap analysis waits for training to stop; looping runs skip it.
   if (!(completed && ui.loopToggle.checked)) drawSnapViews();
@@ -2651,21 +2737,21 @@ async function main() {
   }
 
   ui.imageInput.addEventListener("change", handleImageInput);
-  for (let i = 1; i <= KODAK_COUNT; i += 1) {
-    ui.kodakSelect.add(new Option(kodakName(i).replace(".png", ""), String(i)));
-  }
-  ui.kodakSelect.addEventListener("change", () => {
-    if (ui.kodakSelect.value) loadKodak(Number(ui.kodakSelect.value));
+  for (const [key, dataset] of Object.entries(DATASETS)) ui.datasetSelect.add(new Option(dataset.label, key));
+  selectDataset("kodak");
+  ui.datasetSelect.addEventListener("change", () => selectDataset(ui.datasetSelect.value));
+  ui.itemSelect.addEventListener("change", () => {
+    if (ui.itemSelect.value) loadItem(Number(ui.itemSelect.value));
   });
-  ui.kodakPrev.addEventListener("click", () => stepKodak(-1));
-  ui.kodakNext.addEventListener("click", () => stepKodak(1));
+  ui.itemPrev.addEventListener("click", () => stepItem(-1));
+  ui.itemNext.addEventListener("click", () => stepItem(1));
   document.addEventListener("keydown", (ev) => {
     if (ev.key !== "ArrowLeft" && ev.key !== "ArrowRight") return;
     if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
     const tag = ev.target.tagName;
     if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA") return;
     ev.preventDefault();
-    stepKodak(ev.key === "ArrowRight" ? 1 : -1);
+    stepItem(ev.key === "ArrowRight" ? 1 : -1);
   });
   ui.maskInput.addEventListener("change", handleMaskInput);
   ui.initSitesInput.addEventListener("change", handleInitSitesInput);

@@ -94,9 +94,9 @@
       .loop-toggle input { margin: 0; accent-color: var(--accent); cursor: pointer; }
       .file-btn input { display: none; }
 
-      .kodak-nav { display: flex; gap: 4px; }
-      .kodak-nav .btn { padding: 6px 10px; }
-      .kodak-nav select { cursor: pointer; }
+      .dataset-nav { display: flex; gap: 4px; }
+      .dataset-nav .btn { padding: 6px 10px; }
+      .dataset-nav select { cursor: pointer; }
 
       .save-menu {
         position: relative;
@@ -517,12 +517,11 @@
         <span id="imageLabel">Choose target image</span>
       </label>
 
-      <div class="kodak-nav" title="Kodak targets (← / → to flick)">
-        <button class="btn" id="kodakPrev" aria-label="Previous Kodak image">‹</button>
-        <select class="field" id="kodakSelect" aria-label="Kodak image">
-          <option value="">Kodak…</option>
-        </select>
-        <button class="btn" id="kodakNext" aria-label="Next Kodak image">›</button>
+      <div class="dataset-nav" title="Dataset targets (← / → to flick)">
+        <select class="field" id="datasetSelect" aria-label="Dataset"></select>
+        <button class="btn" id="itemPrev" aria-label="Previous dataset image">‹</button>
+        <select class="field" id="itemSelect" aria-label="Dataset image"></select>
+        <button class="btn" id="itemNext" aria-label="Next dataset image">›</button>
       </div>
 
       <button class="btn btn-primary" id="startBtn" disabled>Train</button>
