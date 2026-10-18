@@ -151,8 +151,13 @@ const ui = {
 };
 
 function setStatus(msg) { ui.status.textContent = msg; }
+// One text node per line, oldest dropped past LOG_MAX_LINES: `textContent +=`
+// re-copied and re-laid-out the whole log on every tick, so a long session
+// (or loop mode) slowed training from ~2700 to ~300 it/s on MNIST.
+const LOG_MAX_LINES = 1000;
 function appendLog(line) {
-  ui.log.textContent += line + "\n";
+  ui.log.append(line + "\n");
+  while (ui.log.childNodes.length > LOG_MAX_LINES) ui.log.firstChild.remove();
   ui.log.scrollTop = ui.log.scrollHeight;
 }
 
