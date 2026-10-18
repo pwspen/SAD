@@ -15,6 +15,16 @@
 // analysis (barriers must be reachable from uniform control flow), NO thread
 // takes an early `return` before either barrier: every skip is expressed as an
 // `if (guard) { work }` with no return inside.
+//
+// GN_MODE (a pipeline-overridable constant) turns the same pass into the
+// Gauss–Newton diagonal of the squared-error loss: per site and parameter,
+// Σ_pixels Σ_rgb (∂pred/∂θ)², with color taken in decoded RGB. That is the
+// predicted rise in summed squared error per unit² change of θ, used by the
+// viewer's site-clustering analysis; training never runs it. GN sums skip the
+// fixed-point tile path (squared terms can exceed its per-pixel range) and
+// add straight to `grads` as f32.
+
+override GN_MODE : bool = false;
 
 @group(0) @binding(0) var<storage, read> sites : array<Site>;
 @group(0) @binding(1) var<uniform> params : GradParams;
@@ -168,6 +178,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>,
 
                 let tau = exp(site.log_tau);
                 if (!is_bad(tau)) {
+                  let gn_k = dot(w * (site_col - pred), w * (site_col - pred));
                   let diff = uv - site.position;
                   let diff2 = dot(diff, diff);
                   let dir = site_aniso_dir(site);
@@ -183,18 +194,36 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>,
                   let r_norm = site.radius_sq * inv_scale;
                   let dmix2 = (sqrt(d2_safe) - r_norm);
                   if (!is_bad(dmix2)) {
+                    // ∂logit/∂θ for the geometric parameters.
                     let g_diff = l2 * diff + (l1 - l2) * dir * proj;
-                    let dL_dpos = dL_dlogit * (tau * params.invScaleSq * inv_sqrt_d2) * g_diff;
-                    let dL_dlog_tau = dL_dlogit * (-dmix2) * tau;
-                    let dL_dradius_sq = dL_dlogit * tau * inv_scale;
+                    let dz_dpos = (tau * params.invScaleSq * inv_sqrt_d2) * g_diff;
+                    let dz_dlog_tau = (-dmix2) * tau;
+                    let dz_dradius_sq = tau * inv_scale;
                     let d2_dlog_aniso = (l1 * proj2 - l2 * perp2) * params.invScaleSq;
-                    let dL_dlog_aniso = dL_dlogit * (-tau) * (0.5 * inv_sqrt_d2) * d2_dlog_aniso;
+                    let dz_dlog_aniso = (-tau) * (0.5 * inv_sqrt_d2) * d2_dlog_aniso;
                     let d2_ddir = (2.0 * (l1 - l2) * proj * params.invScaleSq) * diff;
-                    let dL_ddir = dL_dlogit * (-tau) * (0.5 * inv_sqrt_d2) * d2_ddir;
+                    let dz_ddir = (-tau) * (0.5 * inv_sqrt_d2) * d2_ddir;
+
+                    // Gradient: dL/dlogit · ∂logit/∂θ. GN: |∂pred/∂logit|² · (∂logit/∂θ)²,
+                    // with ∂pred/∂logit = w (c − pred); per color channel, (∂pred/∂c)² = w².
+                    var dL_dpos = dL_dlogit * dz_dpos;
+                    var dL_dlog_tau = dL_dlogit * dz_dlog_tau;
+                    var dL_dradius_sq = dL_dlogit * dz_dradius_sq;
+                    var dL_dlog_aniso = dL_dlogit * dz_dlog_aniso;
+                    var dL_ddir = dL_dlogit * dz_ddir;
+                    var dL_dcolor_out = dL_dcolor;
+                    if (GN_MODE) {
+                      dL_dpos = gn_k * dz_dpos * dz_dpos;
+                      dL_dlog_tau = gn_k * dz_dlog_tau * dz_dlog_tau;
+                      dL_dradius_sq = gn_k * dz_dradius_sq * dz_dradius_sq;
+                      dL_dlog_aniso = gn_k * dz_dlog_aniso * dz_dlog_aniso;
+                      dL_ddir = gn_k * dz_ddir * dz_ddir;
+                      dL_dcolor_out = vec3<f32>(w * w);
+                    }
 
                     var inserted = false;
                     let base = tile_hash(idx) & K_TILE_HASH_MASK;
-                    for (var probe = 0u; probe < K_TILE_MAX_PROBES; probe = probe + 1u) {
+                    for (var probe = 0u; probe < K_TILE_MAX_PROBES && !GN_MODE; probe = probe + 1u) {
                       let slot = (base + probe) & K_TILE_HASH_MASK;
                       var expected = K_TILE_EMPTY_KEY;
                       let res = atomicCompareExchangeWeak(&tg_keys[slot], expected, idx);
@@ -203,9 +232,9 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>,
                         wgAddGrad(slot, 1u, dL_dpos.y);
                         wgAddGrad(slot, 2u, dL_dlog_tau);
                         wgAddGrad(slot, 3u, dL_dradius_sq);
-                        wgAddGrad(slot, 4u, dL_dcolor.x);
-                        wgAddGrad(slot, 5u, dL_dcolor.y);
-                        wgAddGrad(slot, 6u, dL_dcolor.z);
+                        wgAddGrad(slot, 4u, dL_dcolor_out.x);
+                        wgAddGrad(slot, 5u, dL_dcolor_out.y);
+                        wgAddGrad(slot, 6u, dL_dcolor_out.z);
                         wgAddGrad(slot, 7u, dL_ddir.x);
                         wgAddGrad(slot, 8u, dL_ddir.y);
                         wgAddGrad(slot, 9u, dL_dlog_aniso);
@@ -217,9 +246,9 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>,
                       atomicAddGrad(idx * 10u + 1u, dL_dpos.y);
                       atomicAddGrad(idx * 10u + 2u, dL_dlog_tau);
                       atomicAddGrad(idx * 10u + 3u, dL_dradius_sq);
-                      atomicAddGrad(idx * 10u + 4u, dL_dcolor.x);
-                      atomicAddGrad(idx * 10u + 5u, dL_dcolor.y);
-                      atomicAddGrad(idx * 10u + 6u, dL_dcolor.z);
+                      atomicAddGrad(idx * 10u + 4u, dL_dcolor_out.x);
+                      atomicAddGrad(idx * 10u + 5u, dL_dcolor_out.y);
+                      atomicAddGrad(idx * 10u + 6u, dL_dcolor_out.z);
                       atomicAddGrad(idx * 10u + 7u, dL_ddir.x);
                       atomicAddGrad(idx * 10u + 8u, dL_ddir.y);
                       atomicAddGrad(idx * 10u + 9u, dL_dlog_aniso);

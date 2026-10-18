@@ -5,7 +5,7 @@
 
 import { loadShaders, tileSlotsForLimit } from "../trainer/shader_loader.js?v=shared-wgsl-20261017";
 import { requestTrainingDevice } from "../trainer/device.js?v=shared-wgsl-20261017";
-import { Trainer, buildArgs, GRAD_GROUPS, lrSchedule, LR_SCHEDULES, growthCounts } from "../trainer/trainer.js?v=split-20261018";
+import { Trainer, buildArgs, GRAD_GROUPS, lrSchedule, LR_SCHEDULES, growthCounts } from "../trainer/trainer.js?v=gn-20261018";
 import { loadImageToFloat32, loadMaskRgba32Float, whiteMaskRgba32Float } from "../trainer/textures.js?v=shared-wgsl-20261017";
 import { loadSitesFromFile, serializeSitesTxt, triggerDownload, floatImageToRgba8, computeBpp, BITS_PER_SITE } from "../trainer/io.js?v=shared-wgsl-20261017";
 import { SITE_FLOATS } from "../trainer/params.js?v=shared-wgsl-20261017";
@@ -19,6 +19,7 @@ import {
 const CONFIG_URL = "../training_config.json";
 const DEMO_MAX_IMAGE_SIDE = 2048;
 const MI_ROUND_ANISO = 0.05; // |log_aniso| below this, a site has no orientation (site MI view)
+const SNAP_MAP_K = 4; // snap-analysis fit drawn on the image (one of SNAP_KS)
 // Kodak set lives outside this repo; the default resolves under the
 // kodak-bench server (which serves the parent dir). Override with ?kodak=<dir>.
 const KODAK_DIR = new URLSearchParams(location.search).get("kodak") || "../../comp/data/kodak/";
@@ -89,7 +90,7 @@ const state = {
   targetAnalysis: null,  // viewer-side target luma / pyramid / spectrum (see targetAnalysis())
   spectra: null,         // spectra of the latest render (see currentSpectra())
   siteMI: null,          // { sites, mi } parameter mutual information for the latest readback
-  siteClusters: null,    // { sites, result, centers } shape k-means for the latest readback (see currentSiteClusters())
+  snapAnalysis: null,    // { sites, status, result, error, promise } for the latest sites (see snapAnalysis())
   importanceImage: null, // RGBA8 importance map for the current target + mask
   layoutName: null,      // active key in LAYOUTS
   editing: false,        // layout edit mode (drag to move, add / remove, rows & cols)
@@ -370,16 +371,20 @@ const VIEWS = {
                       `${NEIGHBOR_K} nearest sites: log distance to the farthest of them, and the main direction φ ` +
                       `and eccentricity (λ1 − λ2) / (λ1 + λ2) of the structure tensor of the unit offsets to them. ` +
                       `Hover a cell for bits.` },
-  siteClusters: { label: "Site shape clusters", kind: "plot", source: "derived", on: ["render", "run"],
-                draw: drawSiteClusters,
-                note: "k-means (k = 5) on log_tau, radius and |log_aniso|, each z-scored over the active sites; " +
-                      "orientation and color are left out. Per cluster: share of sites, then centroid ± standard " +
-                      "deviation in original units. R²: share of the z-scored variance the clusters explain. Each " +
-                      "fit starts from the previous centroids, so clusters keep their colors during a run." },
-  clusterMap: { label: "Shape clusters on the image", kind: "image", source: "derived", blank: "#f1f1ec",
-                on: ["render"], draw: drawClusterMap,
-                note: "The latest render, washed out, with each site's centroid in its shape cluster's color " +
-                      "(same colors as the Site shape clusters card)." },
+  siteClusters: { label: "Site snap analysis", kind: "plot", source: "derived", on: ["render", "run"],
+                draw: drawSnapAnalysis,
+                note: "After a run: every site parameter except position (aniso_dir sign-canonicalized) is " +
+                      "clustered with k-means, measuring distance by each site's Gauss–Newton diagonal (the " +
+                      "trainer's extra GPU pass), so the k-means cost is the predicted rise in squared error from " +
+                      "snapping every site to its centroid. Left: PSNR loss predicted that way, and the actual loss " +
+                      "from re-rendering with snapped sites (same candidate lists). bits = log₂ k per site. Right: " +
+                      "the same if every site shared one value of that parameter (its weighted mean), others " +
+                      "unchanged; near 0 means the parameter is slack. Predictions are second order, so they " +
+                      "overshoot for large snaps." },
+  clusterMap: { label: `Snap clusters on the image (k = ${SNAP_MAP_K})`, kind: "image", source: "derived",
+                blank: "#f1f1ec", on: ["render"], draw: drawClusterMap,
+                note: "The latest render, washed out, with each site's centroid in its cluster's color from the " +
+                      `k = ${SNAP_MAP_K} fit of the Site snap analysis.` },
 };
 
 // Layouts are CSS grid-template-areas: one quoted string per row, one view id
@@ -1903,139 +1908,168 @@ function hitSiteMI(g, mx, my) {
   return i >= 0 && j >= 0 && i < g.k && j < g.k ? `${i},${j}` : null;
 }
 
-// ---- Site shape clusters ----
-// k-means on the canonical shape (log_tau, radius, elongation), each z-scored
-// over the active sites; orientation and color stay out. Each fit warm-starts
-// from the previous one's centroids so a cluster keeps its color while the
-// run goes on; the first fit of a run numbers clusters by size.
+// ---- Site snap analysis ----
+// How many distinct values do the sites need? Every parameter except position
+// is clustered with k-means under each site's own Gauss–Newton metric
+// (Trainer.siteSensitivity), so the k-means cost is the predicted rise in
+// squared error from snapping every site to its cluster's centroid. Nothing
+// here depends on a parameter's units or meaning, with two exceptions:
+// position stays out (it's the site's identity and gets coded separately) and
+// aniso_dir is sign-canonicalized, since ±dir render the same. Each k is also
+// checked by re-rendering with snapped sites. Runs between training runs.
 
-const CLUSTER_K = 5;
-const CLUSTER_PARAMS = MI_COLUMNS.slice(0, 3); // τ, rad, elong
+const SNAP_KS = [4, 8, 16, 32, 64];
+const SNAP_PARAMS = [ // [site-float index, label]
+  [2, "log_tau"], [3, "radius"], [4, "red"], [5, "green"], [6, "blue"],
+  [7, "dir_x"], [8, "dir_y"], [9, "log_aniso"],
+];
+const SNAP_COLORS = SERIES_COLORS.slice(0, SNAP_MAP_K);
 
-function currentSiteClusters() {
+// The analysis of the latest sites: started here on first use once training
+// has stopped, then redrawn when it finishes. null while there's nothing to do.
+function snapAnalysis() {
   const sites = state.lastSites;
-  if (!sites) return null;
-  if (state.siteClusters?.sites === sites) return state.siteClusters.result;
-  const d = CLUSTER_PARAMS.length;
-  const bases = [];
-  const raw = [];
-  for (let i = 0; i < state.lastSiteCount; i += 1) {
-    const b = i * SITE_FLOATS;
-    if (sites[b] < 0) continue;
-    const v = CLUSTER_PARAMS.map((c) => c.get(sites, b));
-    if (v.every(Number.isFinite)) { bases.push(b); raw.push(...v); }
-  }
-  const n = bases.length;
-  if (n < CLUSTER_K * 2) {
-    state.siteClusters = { sites, result: null, centers: state.siteClusters?.centers };
-    return null;
-  }
-  const mean = new Float64Array(d), sd = new Float64Array(d);
-  for (let i = 0; i < n; i += 1) for (let t = 0; t < d; t += 1) mean[t] += raw[i * d + t] / n;
-  for (let i = 0; i < n; i += 1) for (let t = 0; t < d; t += 1) sd[t] += (raw[i * d + t] - mean[t]) ** 2 / n;
-  for (let t = 0; t < d; t += 1) sd[t] = Math.sqrt(sd[t]) || 1;
-  const z = Float64Array.from(raw, (v, j) => (v - mean[j % d]) / sd[j % d]);
-  const prev = state.siteClusters?.centers;
-  const init = prev && Float64Array.from(prev, (v, j) => (v - mean[j % d]) / sd[j % d]);
-  let { centroids, labels } = kMeans(z, n, d, CLUSTER_K, { init });
-
-  const count = new Float64Array(CLUSTER_K);
-  for (const l of labels) count[l] += 1;
-  if (!init) {
-    // First fit of the run: renumber clusters largest first.
-    const order = [...count.keys()].sort((a, b) => count[b] - count[a]);
-    const rank = new Int32Array(CLUSTER_K);
-    order.forEach((c, r) => { rank[c] = r; });
-    labels = labels.map((l) => rank[l]);
-    centroids = Float64Array.from({ length: CLUSTER_K * d }, (_, j) => centroids[order[Math.floor(j / d)] * d + j % d]);
-    count.set(order.map((c) => count[c]));
-  }
-  // Centroid ± spread in original units; R² = share of the z-scored variance
-  // the clusters account for.
-  const center = [], spread = [];
-  let within = 0;
-  for (let c = 0; c < CLUSTER_K; c += 1) {
-    center.push(Array.from({ length: d }, (_, t) => centroids[c * d + t] * sd[t] + mean[t]));
-    spread.push(new Array(d).fill(0));
-  }
-  for (let i = 0; i < n; i += 1) {
-    const c = labels[i];
-    for (let t = 0; t < d; t += 1) {
-      spread[c][t] += (raw[i * d + t] - center[c][t]) ** 2;
-      within += (z[i * d + t] - centroids[c * d + t]) ** 2;
-    }
-  }
-  for (let c = 0; c < CLUSTER_K; c += 1) for (let t = 0; t < d; t += 1) spread[c][t] = Math.sqrt(spread[c][t] / (count[c] || 1));
-  const result = { n, bases, labels, share: Array.from(count, (v) => v / n), center, spread, r2: 1 - within / (n * d) };
-  state.siteClusters = { sites, result, centers: center.flat() };
-  return result;
+  if (state.snapAnalysis?.sites === sites) return state.snapAnalysis;
+  if (!sites || !state.trainer || state.running) return null;
+  const job = { sites, status: "running", result: null, error: null };
+  job.promise = runSnapAnalysis(job, state.trainer)
+    .then((result) => { job.result = result; job.status = "done"; })
+    .catch((err) => { job.error = err.message; job.status = "error"; console.error(err); })
+    .finally(() => { if (state.snapAnalysis === job) drawSnapViews(); });
+  state.snapAnalysis = job;
+  return job;
 }
 
-const CLUSTER_COLORS = SERIES_COLORS.slice(0, CLUSTER_K);
+function drawSnapViews() {
+  if (VIEWS.siteClusters.canvas) drawSnapAnalysis(VIEWS.siteClusters);
+  drawClusterMap();
+}
 
-function drawSiteClusters(view) {
+async function runSnapAnalysis(job, trainer) {
+  const sites = job.sites;
+  const { F, samples } = await trainer.siteSensitivity();
+  const d = SNAP_PARAMS.length;
+  const bases = [];
+  for (let i = 0; i < state.lastSiteCount; i += 1) if (sites[i * SITE_FLOATS] >= 0) bases.push(i * SITE_FLOATS);
+  const n = bases.length;
+  const X = new Float64Array(n * d), W = new Float64Array(n * d);
+  bases.forEach((b, a) => {
+    const flip = sites[b + 7] < 0 || (sites[b + 7] === 0 && sites[b + 8] < 0) ? -1 : 1;
+    const f = (b / SITE_FLOATS) * 10;
+    SNAP_PARAMS.forEach(([idx], t) => {
+      X[a * d + t] = (idx === 7 || idx === 8 ? flip : 1) * sites[b + idx];
+      const w = F[f + idx];
+      W[a * d + t] = Number.isFinite(w) && w > 0 ? w : 0;
+    });
+  });
+  const yieldUi = () => new Promise((r) => setTimeout(r, 0));
+
+  // One shared value per parameter (its weighted mean): what each costs alone.
+  const tDir = [7, 8].map((idx) => SNAP_PARAMS.findIndex(([j]) => j === idx));
+  const single = [];
+  for (const [t, [idx, label]] of SNAP_PARAMS.entries()) {
+    let sw = 0, swx = 0;
+    for (let a = 0; a < n; a += 1) { sw += W[a * d + t]; swx += W[a * d + t] * X[a * d + t]; }
+    const mean = sw > 0 ? swx / sw : 0;
+    let cost = 0;
+    const snapped = Float32Array.from(sites);
+    bases.forEach((b, a) => {
+      cost += W[a * d + t] * (X[a * d + t] - mean) ** 2;
+      // Sign-canonicalized dir: write the whole canonical pair, then the mean.
+      if (idx === 7 || idx === 8) { snapped[b + 7] = X[a * d + tDir[0]]; snapped[b + 8] = X[a * d + tDir[1]]; }
+      snapped[b + idx] = mean;
+    });
+    const { psnr } = await trainer.snapPsnr(snapped);
+    single.push({ label, cost, psnr });
+  }
+
+  const fits = [];
+  for (const k of SNAP_KS) {
+    await yieldUi();
+    const fit = kMeans(X, n, d, k, { weights: W });
+    const snapped = Float32Array.from(sites);
+    bases.forEach((b, a) => {
+      const c = fit.labels[a];
+      SNAP_PARAMS.forEach(([idx], t) => { snapped[b + idx] = fit.centroids[c * d + t]; });
+    });
+    const { psnr, basePsnr } = await trainer.snapPsnr(snapped);
+    fits.push({ k, cost: fit.cost, labels: fit.labels, psnr, basePsnr });
+  }
+  // Predicted ΔPSNR from a predicted rise in summed squared error.
+  const basePsnr = fits[0].basePsnr;
+  const sse0 = samples * 10 ** (-basePsnr / 10);
+  const predDb = (cost) => 10 * Math.log10(1 + cost / sse0);
+  return {
+    n, basePsnr,
+    rows: fits.map((f) => ({ k: f.k, bits: Math.log2(f.k), pred: predDb(f.cost), real: basePsnr - f.psnr })),
+    single: single.map((p) => ({ label: p.label, pred: predDb(p.cost), real: basePsnr - p.psnr })),
+    map: { bases, labels: fits.find((f) => f.k === SNAP_MAP_K).labels },
+  };
+}
+
+// Two tables side by side: per k, predicted vs re-rendered PSNR loss of the
+// joint snap; per parameter, the predicted loss if every site shared one value.
+function drawSnapAnalysis(view) {
   const p = beginPlot(view);
   if (!p) return;
   const { ctx, col, w, h } = p;
   const box = { left: 12, right: w - 12, top: PLOT_PAD.top, bottom: h - 28 };
-  const cl = currentSiteClusters();
-  if (!cl) {
-    drawEmpty(p, box, "Sites appear after the first render");
+  const job = snapAnalysis();
+  const msg = state.running ? "Runs when training stops"
+    : !job ? "Sites appear after the first render"
+    : job.status === "running" ? "Analyzing…"
+    : job.status === "error" ? `Analysis failed: ${job.error}` : null;
+  if (msg) {
+    drawEmpty(p, box, msg);
     return;
   }
-  const fmt = (v) => (Math.abs(v) >= 100 ? v.toFixed(0) : Math.abs(v) >= 10 ? v.toFixed(1) : v.toFixed(2));
-  const headers = ["cluster", "sites", ...CLUSTER_PARAMS.map((c) => c.short)];
-  const rows = cl.center.map((ctr, c) => [
-    String(c + 1), `${(cl.share[c] * 100).toFixed(0)}%`,
-    ...ctr.map((v, t) => `${fmt(v)} ± ${fmt(cl.spread[c][t])}`),
-  ]);
-  const rowH = Math.min(26, (box.bottom - box.top) / (rows.length + 1));
-  const colX = [box.left + 18, box.left + 90];
-  const valueW = (box.right - colX[1] - 24) / CLUSTER_PARAMS.length;
-  CLUSTER_PARAMS.forEach((_, t) => colX.push(colX[1] + 24 + valueW * (t + 1)));
-  ctx.font = PLOT_FONT;
-  ctx.textBaseline = "middle";
-  const drawRow = (cells, y, color) => {
-    ctx.fillStyle = color;
-    cells.forEach((s, j) => {
-      ctx.textAlign = j === 0 ? "left" : "right";
-      ctx.fillText(s, colX[j], y);
-    });
+  const r = job.result;
+  const fmtDb = (v) => (v < 0.005 ? "<0.01" : v.toFixed(2));
+  const table = (x0, x1, header, rows) => {
+    const rowH = Math.min(18, (box.bottom - box.top) / (rows.length + 1));
+    const n = header.length;
+    const xs = header.map((_, j) => (j === 0 ? x0 : x0 + ((x1 - x0) * (j + 1)) / (n + 0.5)));
+    ctx.font = PLOT_FONT;
+    ctx.textBaseline = "middle";
+    const drawRow = (cells, y, color) => {
+      ctx.fillStyle = color;
+      cells.forEach((c, j) => { ctx.textAlign = j === 0 ? "left" : "right"; ctx.fillText(c, xs[j], y); });
+    };
+    let y = box.top + rowH / 2;
+    drawRow(header, y, col.dim);
+    ctx.strokeStyle = col.line;
+    ctx.beginPath(); ctx.moveTo(x0, y + rowH / 2); ctx.lineTo(x1, y + rowH / 2); ctx.stroke();
+    for (const cells of rows) { y += rowH; drawRow(cells, y, col.text); }
   };
-  let y = box.top + rowH / 2;
-  drawRow(headers, y, col.dim);
-  ctx.strokeStyle = col.line;
-  ctx.beginPath(); ctx.moveTo(box.left, y + rowH / 2); ctx.lineTo(box.right, y + rowH / 2); ctx.stroke();
-  rows.forEach((cells, c) => {
-    y += rowH;
-    ctx.fillStyle = CLUSTER_COLORS[c];
-    ctx.beginPath();
-    ctx.arc(box.left + 5, y, 5, 0, Math.PI * 2);
-    ctx.fill();
-    drawRow(cells, y, col.text);
-  });
+  const mid = Math.round(w * 0.52);
+  table(box.left, mid - 12, ["k clusters", "bits", "pred.", "actual"],
+        r.rows.map((row) => [String(row.k), row.bits.toFixed(0), fmtDb(row.pred), fmtDb(row.real)]));
+  table(mid + 4, box.right, ["one value for all", "pred.", "actual"],
+        r.single.map((row) => [row.label, fmtDb(row.pred), fmtDb(row.real)]));
   ctx.fillStyle = col.soft;
   ctx.textAlign = "center";
   ctx.textBaseline = "bottom";
-  ctx.fillText(`k-means, k = ${CLUSTER_K}, z-scored · R² = ${cl.r2.toFixed(2)} · ${cl.n} sites · centroid ± sd`,
+  ctx.fillText(`PSNR loss (dB) from snapping: predicted, re-rendered · ${r.n} sites · base ${r.basePsnr.toFixed(2)} dB`,
                w / 2, h - 8);
 }
 
-// The reconstruction, washed out, with each site's centroid in its cluster color.
+// The reconstruction, washed out, with each site's centroid in the color of
+// its cluster from the k = SNAP_MAP_K snap fit.
 function drawClusterMap() {
   const canvas = VIEWS.clusterMap.canvas;
   const render = state.lastRender;
-  const cl = currentSiteClusters();
   if (!canvas || !render) return;
   const { rgba, width, height } = render;
   drawToCanvas(canvas, rgba, width, height);
   const ctx = canvas.getContext("2d");
   ctx.fillStyle = "rgba(255, 255, 255, 0.6)";
   ctx.fillRect(0, 0, width, height);
-  if (!cl) return;
+  const job = snapAnalysis();
+  if (job?.status !== "done" || job.sites !== state.lastSites) return;
+  const { bases, labels } = job.result.map;
   const r = Math.max(1.5, Math.max(width, height) / 350);
-  cl.bases.forEach((b, i) => {
-    ctx.fillStyle = CLUSTER_COLORS[cl.labels[i]];
+  bases.forEach((b, i) => {
+    ctx.fillStyle = SNAP_COLORS[labels[i]];
     ctx.beginPath();
     ctx.arc(state.lastSites[b], state.lastSites[b + 1], r, 0, Math.PI * 2);
     ctx.fill();
@@ -2302,6 +2336,7 @@ async function startTraining() {
   state.lastHeatmap = null;
   // The previous run's trainer only served site-ID / tau renders of its last
   // state; free its GPU buffers so repeated (or looped) runs don't pile up.
+  await state.snapAnalysis?.promise; // it renders with the old trainer
   state.trainer?.destroy();
   state.trainer = null;
 
@@ -2327,7 +2362,7 @@ async function startTraining() {
   state.bandHistory = [];
   state.growthGain = [];
   state.lrHistory = [];
-  state.siteClusters = null; // a new run renumbers its clusters by size
+  state.snapAnalysis = null;
   // Growth multiplies the count by growFactor every growEvery iterations, so
   // its end (where "decay after growth" starts decaying) is predictable unless
   // λ stops it early; the plan is corrected once the trainer reports the real end.
@@ -2452,6 +2487,8 @@ async function startTraining() {
     ui.stopBtn.disabled = true;
     setKodakEnabled(true);
   }
+  // The snap analysis waits for training to stop; looping runs skip it.
+  if (!(completed && ui.loopToggle.checked)) drawSnapViews();
   // Loop mode: a run that finished on its own starts over from iteration 0
   // (with the form's current settings). Stop or an error ends the loop.
   if (completed && ui.loopToggle.checked) {

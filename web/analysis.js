@@ -514,15 +514,21 @@ export function neighborFeatures(xs, ys, k = NEIGHBOR_K) {
 
 // ---- k-means ----
 // Lloyd's algorithm on n points of dimension d (row-major Float64Array).
-// `init` (k·d) warm-starts the centroids so labels stay put between calls;
-// without it, k-means++ seeding from a fixed-seed generator. Clusters that
-// empty out keep their previous centroid. Returns { centroids, labels, iters }.
+// `weights` (n·d, optional) makes the distance Σ_t w[i,t]·(x[i,t] − c[t])²,
+// a per-point diagonal metric; centroids are then per-coordinate weighted
+// means. `init` (k·d) warm-starts the centroids so labels stay put between
+// calls; without it, k-means++ seeding from a fixed-seed generator. Clusters
+// (or coordinates) that lose all their weight keep their previous centroid.
+// Returns { centroids, labels, iters, cost } with cost = Σ_i distance(i, own).
 
-export function kMeans(points, n, d, k, { init = null, maxIters = 50 } = {}) {
+export function kMeans(points, n, d, k, { init = null, maxIters = 50, weights = null } = {}) {
   const centroids = new Float64Array(k * d);
   const dist2 = (i, c) => {
     let s = 0;
-    for (let t = 0; t < d; t += 1) { const v = points[i * d + t] - centroids[c * d + t]; s += v * v; }
+    for (let t = 0; t < d; t += 1) {
+      const v = points[i * d + t] - centroids[c * d + t];
+      s += (weights ? weights[i * d + t] : 1) * v * v;
+    }
     return s;
   };
   if (init) {
@@ -546,24 +552,27 @@ export function kMeans(points, n, d, k, { init = null, maxIters = 50 } = {}) {
     }
   }
   const labels = new Int32Array(n).fill(-1);
-  const sum = new Float64Array(k * d), count = new Float64Array(k);
-  let iters = 0;
+  const sum = new Float64Array(k * d), wsum = new Float64Array(k * d);
+  let iters = 0, cost = 0;
   for (; iters < maxIters; iters += 1) {
     let changed = 0;
+    cost = 0;
     for (let i = 0; i < n; i += 1) {
       let bc = 0, bd = Infinity;
       for (let c = 0; c < k; c += 1) { const v = dist2(i, c); if (v < bd) { bd = v; bc = c; } }
+      cost += bd;
       if (labels[i] !== bc) { labels[i] = bc; changed += 1; }
     }
     if (!changed) break;
-    sum.fill(0); count.fill(0);
+    sum.fill(0); wsum.fill(0);
     for (let i = 0; i < n; i += 1) {
-      count[labels[i]] += 1;
-      for (let t = 0; t < d; t += 1) sum[labels[i] * d + t] += points[i * d + t];
+      for (let t = 0; t < d; t += 1) {
+        const w = weights ? weights[i * d + t] : 1;
+        sum[labels[i] * d + t] += w * points[i * d + t];
+        wsum[labels[i] * d + t] += w;
+      }
     }
-    for (let c = 0; c < k; c += 1) {
-      if (count[c]) for (let t = 0; t < d; t += 1) centroids[c * d + t] = sum[c * d + t] / count[c];
-    }
+    for (let j = 0; j < k * d; j += 1) if (wsum[j] > 0) centroids[j] = sum[j] / wsum[j];
   }
-  return { centroids, labels, iters };
+  return { centroids, labels, iters, cost };
 }

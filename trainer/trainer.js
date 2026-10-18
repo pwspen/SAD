@@ -66,7 +66,7 @@ import {
   HilbertEncoder,
   GrowEncoder,
   SiteStatsEncoder,
-} from "./encoders.js?v=split-20261018";
+} from "./encoders.js?v=gn-20261018";
 
 import { RadixSortUInt2 } from "./radix_sort.js?v=shared-wgsl-20261017";
 import { BITS_PER_SITE } from "./io.js";
@@ -1032,6 +1032,50 @@ export class Trainer {
 
   setLastSites(data) { this._lastSitesCpu = data; }
 
+  // ---- Snap analysis (viewer only; call between runs, never during run()) ----
+
+  // Per-site Gauss–Newton diagonal of the summed squared error over the masked
+  // pixels: F = Float32Array(actualSites · 10) in site-parameter order, colors
+  // per decoded RGB channel. Δ(Σ squared error) ≈ Σ_t F[t] · Δθ_t² for small
+  // changes Δθ of one site's parameters, cross terms ignored. `samples` is the
+  // number of squared errors PSNR averages (masked pixels × 3).
+  async siteSensitivity() {
+    const device = this.device;
+    this.gnEnc ||= new GradientsEncoder(device, this.shaders, { gaussNewton: true });
+    this._gnBuf ||= createGradsBuffer(device, this.bufferCapacity);
+    const bytes = Math.max(1, this.actualSites) * 10 * 4;
+    const staging = device.createBuffer({ size: bytes, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    const encoder = device.createCommandEncoder();
+    encoder.clearBuffer(this._gnBuf);
+    this.gnEnc.encode(encoder, this.sitesBuf, this.gradParams,
+      this.cand0A, this.cand1A, this.fitTex, this.maskTex,
+      this._gnBuf, this.width, this.height);
+    encoder.copyBufferToBuffer(this._gnBuf, 0, staging, 0, bytes);
+    device.queue.submit([encoder.finish()]);
+    await staging.mapAsync(GPUMapMode.READ);
+    const F = new Float32Array(staging.getMappedRange()).slice();
+    staging.unmap();
+    staging.destroy();
+    let pixels = this.width * this.height;
+    if (this.maskCpu) { pixels = 0; for (const m of this.maskCpu) if (m > 0) pixels += 1; }
+    return { F, samples: 3 * pixels };
+  }
+
+  // Renders with `rgbSites` (actualSites · SITE_FLOATS, decoded colors) in
+  // place of the current sites, then puts the originals back. Candidate lists
+  // stay those of the current sites. Returns { psnr, basePsnr }.
+  async snapPsnr(rgbSites) {
+    const queue = this.device.queue;
+    const n = this.actualSites;
+    const original = await readSites(this.device, this.sitesBuf, n);
+    queue.writeBuffer(this.sitesBuf, 0, encodeSiteColors(rgbSites.slice(0, n * SITE_FLOATS), n, this.colorSpace));
+    const snapped = await this.renderView("render");
+    queue.writeBuffer(this.sitesBuf, 0, original);
+    const base = await this.renderView("render");
+    const psnr = (rgba) => computePsnrSafe(rgba, this.target, this.width, this.height, this.maskCpu, this.maskSum);
+    return { psnr: psnr(snapped), basePsnr: psnr(base) };
+  }
+
   // Site readback with colors decoded to RGB, so nothing outside the trainer
   // sees color-space params.
   async _readSitesRgb(count) {
@@ -1070,7 +1114,7 @@ export class Trainer {
       ...(this.candParams || []),
       this.renderParams, this.gradParams, this.adamParams,
       this.countParams, this.gradCountParams, this.tauParams,
-      this.dummyHilbertBuf, this.hilbertParams, this._tauHeatBuf,
+      this.dummyHilbertBuf, this.hilbertParams, this._tauHeatBuf, this._gnBuf,
       this.blurTex, this.blurTmpTex, this.growBlurParams, this.growSeedParams,
       ...(this.growJfaParams || []), this.siteStatsParams, this.siteStatsBuf,
     ];

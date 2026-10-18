@@ -2,7 +2,7 @@
 // One class per WGSL kernel entry point; bindings match the WGSL @group(0)
 // declarations one-for-one.
 
-function makePipeline(device, code, entryPoint = "main") {
+function makePipeline(device, code, entryPoint = "main", constants = undefined) {
   const module = device.createShaderModule({ code });
   if (module.getCompilationInfo) {
     module.getCompilationInfo().then((info) => {
@@ -15,7 +15,7 @@ function makePipeline(device, code, entryPoint = "main") {
   }
   return device.createComputePipeline({
     layout: "auto",
-    compute: { module, entryPoint },
+    compute: { module, entryPoint, ...(constants ? { constants } : {}) },
   });
 }
 
@@ -227,9 +227,12 @@ export class RenderEncoder {
 }
 
 export class GradientsEncoder {
-  constructor(device, shaders) {
+  // gaussNewton: build the GN_MODE variant (per-site Gauss–Newton diagonal,
+  // see gradients_tiled.wgsl) instead of the loss gradient.
+  constructor(device, shaders, { gaussNewton = false } = {}) {
     this.device = device;
-    this.pipeline = makePipeline(device, shaders.GRADIENTS_TILED);
+    this.pipeline = makePipeline(device, shaders.GRADIENTS_TILED, "main",
+      gaussNewton ? { GN_MODE: 1 } : undefined);
     this._views = new Map();
     this._bgs = new Map();
   }
