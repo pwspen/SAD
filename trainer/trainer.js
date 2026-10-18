@@ -1311,6 +1311,52 @@ export class Trainer {
 
   setLastSites(data) { this._lastSitesCpu = data; }
 
+  // ---- Site editing (viewer only; call between runs, never during run()) ----
+
+  // Overwrites site `i` with `rgbSite` (SITE_FLOATS values, decoded colors)
+  // and updates the candidate lists for it in place: the site is seeded at its
+  // home pixel, then one jump-flood sequence (long jumps down to 1 px) spreads
+  // it over the lists as they are, so the rest of the image keeps its lists.
+  editSite(i, rgbSite) {
+    const device = this.device;
+    const queue = device.queue;
+    const n = this.actualSites;
+    if (!(i >= 0 && i < n)) throw new Error(`site ${i} out of range (0–${n - 1})`);
+    queue.writeBuffer(this.sitesBuf, i * SITE_FLOATS * 4, encodeSiteColors(Float32Array.from(rgbSite), 1, this.colorSpace));
+    this.editSeedParams ??= createParamsBuffer(device, this._paramsArgs(n, 0, 0));
+    updateParamsBuffer(queue, this.editSeedParams, this._paramsArgs(i + 1, i, 0));
+    const stages = Math.max(1, Math.ceil(Math.log2(Math.max(this.candWidth, this.candHeight, 2))));
+    this.growJfaParams ??= [];
+    for (let st = 0; st < stages; st += 1) {
+      this.growJfaParams[st] ??= createParamsBuffer(device, this._paramsArgs(n, 0, 0));
+      updateParamsBuffer(queue, this.growJfaParams[st],
+        this._paramsArgs(n, packJumpStep(st, this.candWidth, this.candHeight), 0));
+    }
+    const encoder = device.createCommandEncoder();
+    encoder.copyTextureToTexture({ texture: this.cand0A }, { texture: this.cand0B },
+      [this.candWidth, this.candHeight, 1]);
+    this.seedEnc.encode(encoder, this.sitesBuf, this.editSeedParams, this.cand0A, this.cand0B, 1);
+    [this.cand0A, this.cand0B] = [this.cand0B, this.cand0A];
+    this.hilbertReady = false; // the moved site's place in the Hilbert order
+    this._maybeRefreshHilbert(encoder, n);
+    this.packEnc.encode(encoder, this.sitesBuf, this.packedSitesBuf, this.countParams, n);
+    for (let st = 0; st < stages; st += 1) {
+      this.candsEnc.encodeUpdate(encoder, this.packedSitesBuf, this.growJfaParams[st],
+        this.cand0A, this.cand1A, this.cand0B, this.cand1B,
+        this._hilbertOrderBuf(), this._hilbertPosBuf(), this.candWidth, this.candHeight);
+      [this.cand0A, this.cand0B] = [this.cand0B, this.cand0A];
+      [this.cand1A, this.cand1B] = [this.cand1B, this.cand1A];
+    }
+    queue.submit([encoder.finish()]);
+  }
+
+  // Renders the current (edited) sites. Returns { rgba, psnr }, PSNR masked as
+  // in training.
+  async renderEdited() {
+    const rgba = await this.renderView("render");
+    return { rgba, psnr: computePsnrSafe(rgba, this.target, this.width, this.height, this.maskCpu, this.maskSum) };
+  }
+
   // ---- Snap analysis (viewer only; call between runs, never during run()) ----
 
   // Per-site Gauss–Newton diagonal of the summed squared error over the masked
@@ -1398,7 +1444,7 @@ export class Trainer {
       this.dummyHilbertBuf, this.hilbertParams, this._tauHeatBuf, this._gnBuf,
       this.blurTex, this.blurTmpTex, this.growBlurParams, this.growSeedParams,
       ...(this.growJfaParams || []), this.siteStatsParams, this.siteStatsBuf,
-      this.bestSitesBuf, this.bestAdamBuf, this.rebuildParams,
+      this.bestSitesBuf, this.bestAdamBuf, this.rebuildParams, this.editSeedParams,
     ];
     if (this.hilbertRes) {
       owned.push(this.hilbertRes.pairs, this.hilbertRes.order, this.hilbertRes.pos);

@@ -373,6 +373,11 @@ const VIEWS = {
   preview:    { label: "Reconstruction + centroids", kind: "image", source: "model", overlay: true, blank: "#0a0a0f",
                 on: ["render"], draw: drawPreview,
                 note: "The trainer's latest render, with site centroids on top (the dots checkbox hides them)." },
+  editor:     { label: "Site editor", kind: "image", source: "model", overlay: true, editor: true, blank: "#0a0a0f",
+                on: ["render", "run"], draw: drawEditor,
+                note: "The latest render with site centroids; once a run has stopped, drag a site to move it or " +
+                      "select one and edit its parameters below. Every change re-renders on the GPU with the " +
+                      "candidate lists updated for the edited site; the other views follow when you let go." },
   residual:   { label: "Residual |recon − target|", kind: "image", source: "derived", blank: "#000004",
                 on: ["render"], draw: drawResidual,
                 note: "Mean |recon − target| over RGB on a fixed 0–0.25 scale." },
@@ -479,6 +484,11 @@ const LAYOUTS = {
     areas: `"preview    siteMI"
             "clusterMap siteClusters"`,
   },
+  editor: {
+    label: "Site editor",
+    areas: `"editor target   residual"
+            "editor siteIds  tau"`,
+  },
   spectral: {
     label: "Spectral",
     areas: `"spectrum  spectrum  spectrum2d spectrum2d"
@@ -533,7 +543,7 @@ function buildCards(name) {
     const view = VIEWS[id];
     const source = SOURCES[view.source];
     const card = document.createElement("div");
-    card.className = `canvas-card ${view.kind}`;
+    card.className = `canvas-card ${view.kind}${view.editor ? " editor-card" : ""}`;
     card.dataset.source = view.source;
     card.style.setProperty("--view", id);
     const label = document.createElement("span");
@@ -544,8 +554,24 @@ function buildCards(name) {
     badge.textContent = source.badge;
     label.append(badge, document.createTextNode(view.label));
     const canvas = document.createElement("canvas");
-    card.append(label, canvas);
-    if (view.overlay) {
+    if (view.editor) {
+      // The image fits a stage above the parameter fields; the overlay takes
+      // the pointer for picking and dragging sites.
+      const stage = document.createElement("div");
+      stage.className = "editor-stage";
+      const overlay = document.createElement("canvas");
+      overlay.className = "overlay-canvas";
+      stage.append(canvas, overlay);
+      const fields = document.createElement("div");
+      fields.className = "editor-fields";
+      card.append(label, stage, fields);
+      view.overlayCanvas = overlay;
+      buildEditorFields(fields);
+      attachEditorPointer(view, overlay);
+    } else {
+      card.append(label, canvas);
+    }
+    if (view.overlay && !view.editor) {
       const overlay = document.createElement("canvas");
       overlay.className = "overlay-canvas";
       overlay.hidden = !state.showCentroids;
@@ -809,6 +835,7 @@ function blankRenderViews(width, height) {
     ctx.fillRect(0, 0, width, height);
   }
   clearOverlay();
+  clearOverlay(VIEWS.editor);
 }
 
 function updateCanvasLayout(width = state.targetImage?.width, height = state.targetImage?.height) {
@@ -817,7 +844,6 @@ function updateCanvasLayout(width = state.targetImage?.width, height = state.tar
     if (view.kind === "image") fitCanvasToCard(view.canvas, width || view.canvas.width, height || view.canvas.height);
     else view.draw(view);
   }
-  positionOverlay();
   drawCentroidOverlay();
 }
 
@@ -2704,6 +2730,7 @@ async function startTraining() {
     ui.startBtn.disabled = false;
     ui.stopBtn.disabled = true;
     setDatasetEnabled(true);
+    drawEditor(); // editing opens once the run has stopped
   }
   // The snap analysis waits for training to stop; looping runs skip it.
   if (!(completed && ui.loopToggle.checked)) drawSnapViews();
@@ -2734,26 +2761,27 @@ function updateProgress(cur, total, text) {
   ui.progressText.textContent = text;
 }
 
-function clearOverlay() {
-  const overlay = VIEWS.preview.overlayCanvas;
+function clearOverlay(view = VIEWS.preview) {
+  const overlay = view.overlayCanvas;
   if (!overlay) return;
   const ctx = overlay.getContext("2d");
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.clearRect(0, 0, overlay.width, overlay.height);
 }
 
-// The overlay canvas sits inside the same card as the preview but is absolutely
+// The overlay canvas sits next to its view's image but is absolutely
 // positioned, so we need to match its drawing buffer and CSS box to the
-// preview's actual displayed rect (which is aspect-fit inside the card).
-function positionOverlay() {
-  const { canvas, card, overlayCanvas: overlay } = VIEWS.preview;
+// image's actual displayed rect (which is aspect-fit inside its parent).
+function positionOverlay(view = VIEWS.preview) {
+  const { canvas, overlayCanvas: overlay } = view;
   if (!canvas || !overlay) return;
+  const host = canvas.parentElement;
   const prect = canvas.getBoundingClientRect();
-  const crect = card.getBoundingClientRect();
+  const hrect = host.getBoundingClientRect();
   // Absolute offsets are relative to the parent's padding box, while
-  // getBoundingClientRect is its border box, so subtract the card border.
-  overlay.style.left = `${prect.left - crect.left - card.clientLeft}px`;
-  overlay.style.top = `${prect.top - crect.top - card.clientTop}px`;
+  // getBoundingClientRect is its border box, so subtract the parent's border.
+  overlay.style.left = `${prect.left - hrect.left - host.clientLeft}px`;
+  overlay.style.top = `${prect.top - hrect.top - host.clientTop}px`;
   overlay.style.width = `${prect.width}px`;
   overlay.style.height = `${prect.height}px`;
 }
@@ -2762,10 +2790,10 @@ function positionOverlay() {
 // the image's), so marks stay sharp and a few screen pixels wide however far a
 // small image is scaled up. Returns a context in image pixel units and the
 // size of one screen (CSS) pixel in those units.
-function prepareOverlay(width, height) {
-  const overlay = VIEWS.preview.overlayCanvas;
-  positionOverlay();
-  const rect = VIEWS.preview.canvas.getBoundingClientRect();
+function prepareOverlay(width, height, view = VIEWS.preview) {
+  const overlay = view.overlayCanvas;
+  positionOverlay(view);
+  const rect = view.canvas.getBoundingClientRect();
   const dpr = window.devicePixelRatio || 1;
   const bw = Math.max(1, Math.round(rect.width * dpr));
   const bh = Math.max(1, Math.round(rect.height * dpr));
@@ -2773,17 +2801,397 @@ function prepareOverlay(width, height) {
     overlay.width = bw;
     overlay.height = bh;
   }
-  clearOverlay();
+  clearOverlay(view);
   const ctx = overlay.getContext("2d");
   ctx.setTransform(bw / width, 0, 0, bh / height, 0, 0);
   return { ctx, cssPx: width / Math.max(1, rect.width) };
 }
 
 function drawCentroidOverlay() {
+  drawEditorOverlay();
   if (!VIEWS.preview.overlayCanvas) return;
   if (!state.lastRender || !state.lastSites) return;
   const { ctx, cssPx } = prepareOverlay(state.lastRender.width, state.lastRender.height);
   drawCentroids(ctx, cssPx);
+}
+
+// ---- Site editor ----
+// A copy of the preview whose sites can be dragged and edited once a run has
+// stopped (never during one). Edits go to `editor.sites`, a working copy of
+// the run's final sites (decoded colors), and to the stopped run's trainer,
+// which updates the candidate lists for each edited site and re-renders.
+// While dragging only this card redraws; when the edits settle they become
+// state.lastSites / lastRender (a new array, so analyses keyed on the sites
+// rerun) and the other views and exports follow.
+
+const editor = {
+  trainer: null,       // the trainer the working copy belongs to
+  sites: null,         // working copy of the sites (Float32Array, decoded colors)
+  original: null,      // the run's final sites, for Reset
+  selected: -1,        // selected site index, -1 for none
+  drag: null,          // { i, dx, dy } while dragging a site
+  pending: new Set(),  // edited sites not yet written to the trainer
+  busy: false,         // a write + render is in flight
+  commit: null,        // promise of the in-flight commit to the other views
+  commitTimer: 0,
+  basePsnr: null,      // PSNR of the unedited sites
+  psnr: null,          // PSNR of the latest edited render
+  fields: null,        // { root, header, message, inputs: { key: input }, color, index, ... }
+};
+const EDIT_COMMIT_MS = 250;
+const EDIT_PICK_PX = 8;  // pick radius around a centroid, CSS pixels
+
+// The editable parameters: `idx` into a site's SITE_FLOATS, or get / set for
+// derived ones (θ is the angle of the unit aniso_dir).
+const EDIT_FIELDS = [
+  { key: "x", label: "x", unit: "px", idx: 0, step: 0.1, digits: 2 },
+  { key: "y", label: "y", unit: "px", idx: 1, step: 0.1, digits: 2 },
+  { key: "logTau", label: "log τ", unit: "", idx: 2, step: 0.05, digits: 3 },
+  { key: "radius", label: "radius", unit: "", idx: 3, step: 0.1, digits: 3 },
+  { key: "r", label: "R", unit: "", idx: 4, step: 0.01, digits: 3 },
+  { key: "g", label: "G", unit: "", idx: 5, step: 0.01, digits: 3 },
+  { key: "b", label: "B", unit: "", idx: 6, step: 0.01, digits: 3 },
+  { key: "theta", label: "θ (aniso dir)", unit: "°", step: 1, digits: 1,
+    get: (s, b) => (Math.atan2(s[b + 8], s[b + 7]) * 180) / Math.PI,
+    set: (s, b, v) => { const t = (v * Math.PI) / 180; s[b + 7] = Math.cos(t); s[b + 8] = Math.sin(t); } },
+  { key: "logAniso", label: "log aniso", unit: "", idx: 9, step: 0.05, digits: 3 },
+];
+
+function editorAvailable() {
+  return !state.running && !!state.trainer && !!state.lastSites && !!state.lastRender;
+}
+
+// Starts a fresh working copy when the run (or its sites) changed under it,
+// and drops it while editing isn't available.
+function syncEditorSites() {
+  if (!editorAvailable()) {
+    if (editor.sites) Object.assign(editor, { trainer: null, sites: null, original: null, selected: -1, drag: null,
+                                              basePsnr: null, psnr: null });
+    editor.pending.clear();
+    return;
+  }
+  if (editor.trainer === state.trainer && editor.sites) return;
+  editor.trainer = state.trainer;
+  editor.sites = Float32Array.from(state.lastSites);
+  editor.original = Float32Array.from(state.lastSites);
+  editor.selected = -1;
+  editor.drag = null;
+  editor.basePsnr = null;
+  editor.psnr = null;
+}
+
+function editorSites() { return editor.sites || state.lastSites; }
+
+function drawEditor() {
+  syncEditorSites();
+  const view = VIEWS.editor;
+  if (view.canvas && state.lastRender) {
+    const { rgba, width, height } = state.lastRender;
+    drawToCanvas(view.canvas, rgba, width, height);
+  }
+  drawEditorOverlay();
+  updateEditorFields();
+}
+
+function drawEditorOverlay() {
+  const view = VIEWS.editor;
+  if (!view.overlayCanvas) return;
+  view.overlayCanvas.classList.toggle("editable", editorAvailable());
+  if (!state.lastRender || !editorSites()) { clearOverlay(view); return; }
+  const { width, height } = state.lastRender;
+  const { ctx, cssPx } = prepareOverlay(width, height, view);
+  drawCentroids(ctx, cssPx, editorSites());
+  const i = editor.selected;
+  if (i < 0 || !editor.sites) return;
+  const s = editor.sites;
+  const b = i * SITE_FLOATS;
+  const x = s[b] + 0.5, y = s[b + 1] + 0.5;
+  ctx.save();
+  ctx.lineWidth = 2 * cssPx;
+  ctx.strokeStyle = "#ff7d33";
+  ctx.beginPath();
+  ctx.arc(x, y, 6 * cssPx, 0, Math.PI * 2);
+  ctx.stroke();
+  // The anisotropy axis, when the site has one.
+  if (Math.abs(s[b + 9]) > 0.05) {
+    const len = 14 * cssPx;
+    const n = Math.hypot(s[b + 7], s[b + 8]) || 1;
+    const ux = s[b + 7] / n, uy = s[b + 8] / n;
+    ctx.beginPath();
+    ctx.moveTo(x - ux * len, y - uy * len);
+    ctx.lineTo(x + ux * len, y + uy * len);
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+// Image-pixel coordinates (site units) of a pointer event over the overlay.
+function editorPointer(ev, overlay) {
+  const rect = overlay.getBoundingClientRect();
+  const { width, height } = state.lastRender;
+  return {
+    x: ((ev.clientX - rect.left) / Math.max(1, rect.width)) * width - 0.5,
+    y: ((ev.clientY - rect.top) / Math.max(1, rect.height)) * height - 0.5,
+    px: width / Math.max(1, rect.width), // image pixels per CSS pixel
+  };
+}
+
+// The active site nearest to `p` within EDIT_PICK_PX screen pixels, or -1.
+function pickSite(p) {
+  const s = editor.sites;
+  let best = -1;
+  let bestD = (EDIT_PICK_PX * p.px) ** 2;
+  for (let i = 0; i < state.lastSiteCount; i += 1) {
+    const b = i * SITE_FLOATS;
+    if (s[b] < 0) continue;
+    const d = (s[b] - p.x) ** 2 + (s[b + 1] - p.y) ** 2;
+    if (d < bestD) { bestD = d; best = i; }
+  }
+  return best;
+}
+
+function attachEditorPointer(view, overlay) {
+  overlay.addEventListener("pointerdown", (ev) => {
+    if (!editorAvailable() || ev.button !== 0) return;
+    syncEditorSites();
+    const p = editorPointer(ev, overlay);
+    const i = pickSite(p);
+    editor.selected = i;
+    if (i >= 0) {
+      const b = i * SITE_FLOATS;
+      editor.drag = { i, dx: editor.sites[b] - p.x, dy: editor.sites[b + 1] - p.y };
+      overlay.setPointerCapture(ev.pointerId);
+      overlay.style.cursor = "grabbing";
+    }
+    ev.preventDefault();
+    drawEditorOverlay();
+    updateEditorFields();
+  });
+  overlay.addEventListener("pointermove", (ev) => {
+    if (!editorAvailable() || !editor.sites) return;
+    const p = editorPointer(ev, overlay);
+    if (!editor.drag) {
+      overlay.style.cursor = pickSite(p) >= 0 ? "grab" : "default";
+      return;
+    }
+    const { i, dx, dy } = editor.drag;
+    const { width, height } = state.lastRender;
+    const b = i * SITE_FLOATS;
+    editor.sites[b] = Math.min(width - 1, Math.max(0, p.x + dx));
+    editor.sites[b + 1] = Math.min(height - 1, Math.max(0, p.y + dy));
+    markEdited(i);
+  });
+  const endDrag = (ev) => {
+    if (!editor.drag) return;
+    editor.drag = null;
+    if (overlay.hasPointerCapture(ev.pointerId)) overlay.releasePointerCapture(ev.pointerId);
+    overlay.style.cursor = "grab";
+    scheduleCommit();
+  };
+  overlay.addEventListener("pointerup", endDrag);
+  overlay.addEventListener("pointercancel", endDrag);
+}
+
+function buildEditorFields(root) {
+  const header = document.createElement("div");
+  header.className = "editor-header";
+  const indexLabel = document.createElement("label");
+  indexLabel.textContent = "Site ";
+  const index = document.createElement("input");
+  index.type = "number";
+  index.min = "0";
+  index.step = "1";
+  index.placeholder = "—";
+  index.setAttribute("aria-label", "Selected site index");
+  index.addEventListener("change", () => {
+    const i = Math.round(Number(index.value));
+    editor.selected = Number.isFinite(i) && i >= 0 && i < state.lastSiteCount ? i : -1;
+    drawEditorOverlay();
+    updateEditorFields();
+  });
+  const count = document.createElement("span");
+  count.className = "editor-count";
+  indexLabel.append(index, count);
+  const spacer = document.createElement("span");
+  spacer.className = "editor-spacer";
+  const resetSite = document.createElement("button");
+  resetSite.className = "btn";
+  resetSite.textContent = "Reset site";
+  resetSite.addEventListener("click", () => {
+    if (editor.selected >= 0) resetSites([editor.selected]);
+  });
+  const resetAll = document.createElement("button");
+  resetAll.className = "btn";
+  resetAll.textContent = "Reset all";
+  resetAll.addEventListener("click", () => resetSites(editedSites()));
+  header.append(indexLabel, spacer, resetSite, resetAll);
+
+  // One line under the header: what to do, or the edited render's PSNR.
+  const status = document.createElement("p");
+  status.className = "editor-status";
+
+  const grid = document.createElement("div");
+  grid.className = "editor-grid";
+  const inputs = {};
+  for (const f of EDIT_FIELDS) {
+    const label = document.createElement("label");
+    label.className = "editor-field";
+    const name = document.createElement("span");
+    name.textContent = f.unit ? `${f.label} (${f.unit})` : f.label;
+    const input = document.createElement("input");
+    input.type = "number";
+    input.step = String(f.step);
+    input.addEventListener("input", () => {
+      const v = Number(input.value);
+      const i = editor.selected;
+      if (input.value === "" || !Number.isFinite(v) || i < 0 || !editor.sites) return;
+      const b = i * SITE_FLOATS;
+      if (f.set) f.set(editor.sites, b, v);
+      else editor.sites[b + f.idx] = v;
+      markEdited(i);
+      scheduleCommit();
+    });
+    label.append(name, input);
+    grid.append(label);
+    inputs[f.key] = input;
+  }
+  const colorLabel = document.createElement("label");
+  colorLabel.className = "editor-field";
+  const colorName = document.createElement("span");
+  colorName.textContent = "color";
+  const color = document.createElement("input");
+  color.type = "color";
+  color.addEventListener("input", () => {
+    const i = editor.selected;
+    if (i < 0 || !editor.sites) return;
+    const b = i * SITE_FLOATS;
+    for (let c = 0; c < 3; c += 1) editor.sites[b + 4 + c] = parseInt(color.value.slice(1 + 2 * c, 3 + 2 * c), 16) / 255;
+    markEdited(i);
+    scheduleCommit();
+  });
+  colorLabel.append(colorName, color);
+  grid.append(colorLabel);
+
+  root.append(header, status, grid);
+  editor.fields = { root, index, count, status, resetSite, resetAll, inputs, color };
+}
+
+function editedSites() {
+  if (!editor.sites) return [];
+  const out = [];
+  for (let i = 0; i < state.lastSiteCount; i += 1) {
+    const b = i * SITE_FLOATS;
+    for (let t = 0; t < SITE_FLOATS; t += 1) {
+      if (editor.sites[b + t] !== editor.original[b + t]) { out.push(i); break; }
+    }
+  }
+  return out;
+}
+
+function resetSites(ids) {
+  if (!editor.sites || !ids.length) return;
+  for (const i of ids) {
+    const b = i * SITE_FLOATS;
+    editor.sites.set(editor.original.subarray(b, b + SITE_FLOATS), b);
+    markEdited(i);
+  }
+  scheduleCommit();
+}
+
+function updateEditorFields() {
+  const f = editor.fields;
+  if (!f || !VIEWS.editor.card) return;
+  const available = editorAvailable() && !!editor.sites;
+  const i = available ? editor.selected : -1;
+  f.index.disabled = !available;
+  f.index.max = String(Math.max(0, state.lastSiteCount - 1));
+  if (document.activeElement !== f.index) f.index.value = i >= 0 ? String(i) : "";
+  f.count.textContent = available ? ` of ${state.lastSiteCount}` : "";
+  const edited = available ? editedSites().length : 0;
+  f.resetSite.disabled = !(i >= 0 && edited);
+  f.resetAll.disabled = !edited;
+  const delta = editor.psnr - editor.basePsnr;
+  f.status.textContent = state.running ? "Editing is available once the run has stopped."
+    : !available ? "Run training to get sites to edit."
+    : editor.psnr != null ? `PSNR ${editor.psnr.toFixed(2)} dB (${delta >= 0 ? "+" : ""}${delta.toFixed(2)} from the run's ` +
+                            `${editor.basePsnr.toFixed(2)}) · ${edited} site${edited === 1 ? "" : "s"} edited`
+    : i < 0 ? "Click a site to select it, or drag it to move it."
+    : "Drag the site or edit its parameters.";
+  const s = editor.sites;
+  const b = i * SITE_FLOATS;
+  for (const field of EDIT_FIELDS) {
+    const input = f.inputs[field.key];
+    input.disabled = i < 0;
+    if (document.activeElement === input) continue;
+    input.value = i < 0 ? "" : (field.get ? field.get(s, b) : s[b + field.idx]).toFixed(field.digits);
+  }
+  f.color.disabled = i < 0;
+  if (i >= 0 && document.activeElement !== f.color) {
+    const hex = (v) => Math.round(Math.min(1, Math.max(0, v)) * 255).toString(16).padStart(2, "0");
+    f.color.value = `#${hex(s[b + 4])}${hex(s[b + 5])}${hex(s[b + 6])}`;
+  }
+}
+
+function markEdited(i) {
+  editor.pending.add(i);
+  drawEditorOverlay();
+  updateEditorFields();
+  pumpEdits();
+}
+
+// Writes the pending edits to the trainer and re-renders, as long as edits
+// keep coming; one write + render is in flight at a time, so a fast drag
+// skips frames instead of queueing them. The snap analysis swaps the
+// trainer's sites while it runs, so edits wait for it.
+async function pumpEdits() {
+  if (editor.busy) return;
+  editor.busy = true;
+  try {
+    while (editor.pending.size) {
+      await editor.commit;
+      await state.snapAnalysis?.promise;
+      const trainer = editor.trainer;
+      if (!editorAvailable() || trainer !== state.trainer) { editor.pending.clear(); break; }
+      if (editor.basePsnr == null) editor.basePsnr = (await trainer.renderEdited()).psnr;
+      for (const i of editor.pending) trainer.editSite(i, editor.sites.subarray(i * SITE_FLOATS, (i + 1) * SITE_FLOATS));
+      editor.pending.clear();
+      const { rgba, psnr } = await trainer.renderEdited();
+      if (trainer !== state.trainer || state.running) break;
+      state.lastRender = { rgba, width: state.lastRender.width, height: state.lastRender.height };
+      editor.psnr = psnr;
+      const view = VIEWS.editor;
+      if (view.canvas) drawToCanvas(view.canvas, rgba, state.lastRender.width, state.lastRender.height);
+      drawEditorOverlay();
+      updateEditorFields();
+    }
+  } catch (err) {
+    appendLog(`Edit failed: ${err.message}`);
+    console.error(err);
+  } finally {
+    editor.busy = false;
+  }
+}
+
+function scheduleCommit() {
+  clearTimeout(editor.commitTimer);
+  editor.commitTimer = setTimeout(commitEdits, EDIT_COMMIT_MS);
+}
+
+// Hands the settled edits to the rest of the page: the other views, the
+// exports and the site analyses.
+async function commitEdits() {
+  if (!editor.sites || !editorAvailable()) return;
+  if (editor.drag || editor.busy || editor.pending.size) { scheduleCommit(); return; }
+  editor.commit = (async () => {
+    state.lastSites = Float32Array.from(editor.sites);
+    state.trainer.setLastSites(state.lastSites);
+    state.lastHashed = null;
+    state.lastHeatmap = null;
+    if (editor.psnr != null) state.lastPsnr = editor.psnr;
+    await refreshViews("render");
+    drawCentroidOverlay();
+  })();
+  try { await editor.commit; } finally { editor.commit = null; }
 }
 
 async function ensureRender(mode) {
@@ -2806,14 +3214,14 @@ async function ensureRender(mode) {
 // Each site as a dot a few screen pixels wide with a dark rim. Site positions
 // are in the renderer's pixel coordinates, where pixel (i, j) is sampled at
 // (i, j); on a canvas that pixel's centre is (i + 0.5, j + 0.5).
-function drawCentroids(ctx, cssPx = 1) {
-  if (!state.lastSites || !state.lastRender) return;
+function drawCentroids(ctx, cssPx = 1, sites = state.lastSites) {
+  if (!sites || !state.lastRender) return;
   const { rgba, width, height } = state.lastRender;
   ctx.save();
   for (let i = 0; i < state.lastSiteCount; i += 1) {
     const base = i * SITE_FLOATS;
-    const x = state.lastSites[base + 0];
-    const y = state.lastSites[base + 1];
+    const x = sites[base + 0];
+    const y = sites[base + 1];
     if (x < 0) continue;
     // Fill with the inverse of the rendered pixel under the dot so it stands out.
     const px = Math.min(width - 1, Math.max(0, Math.floor(x + 0.5)));

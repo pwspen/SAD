@@ -343,6 +343,90 @@
         pointer-events: none;
       }
       .canvas-card .overlay-canvas[hidden] { display: none; }
+      /* Site editor (train.js "editor" view): the image on a stage above its
+         parameter fields; the overlay takes the pointer once a run stops. */
+      .canvas-card.editor-card {
+        flex-direction: column;
+        align-items: stretch;
+      }
+      .editor-stage {
+        flex: 1;
+        min-height: 0;
+        position: relative;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+      .editor-stage .overlay-canvas.editable { pointer-events: auto; touch-action: none; }
+      .editor-fields {
+        flex: none;
+        background: var(--panel);
+        border-top: 1px solid var(--line);
+        padding: 10px 12px 12px;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        font-size: 12px;
+      }
+      .editor-header {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+      .editor-header label { color: var(--text-dim); display: flex; align-items: center; gap: 4px; }
+      .editor-count { font-variant-numeric: tabular-nums; }
+      .editor-spacer { flex: 1; }
+      .editor-header .btn { padding: 4px 9px; font-size: 11.5px; }
+      .editor-status {
+        margin: 0;
+        color: var(--text-dim);
+        font-variant-numeric: tabular-nums;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .editor-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+        gap: 6px 12px;
+      }
+      .editor-field {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 6px;
+        color: var(--text-dim);
+        min-width: 0;
+      }
+      .editor-fields input[type="number"] {
+        width: 76px;
+        font: inherit;
+        font-size: 12px;
+        padding: 4px 6px;
+        border: 1px solid var(--line);
+        background: #ffffff;
+        color: var(--text);
+        border-radius: 6px;
+        text-align: right;
+        font-variant-numeric: tabular-nums;
+      }
+      .editor-header input[type="number"] { width: 64px; }
+      .editor-fields input[type="number"]:focus {
+        outline: none;
+        border-color: var(--accent);
+        box-shadow: 0 0 0 3px var(--focus);
+      }
+      .editor-fields input:disabled { background: var(--panel-soft); color: var(--text-soft); }
+      .editor-fields input[type="color"] {
+        width: 76px;
+        height: 26px;
+        padding: 1px 2px;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        background: #ffffff;
+        cursor: pointer;
+      }
       .overlay-toggle {
         position: absolute;
         bottom: 10px;
@@ -647,6 +731,10 @@
           <div class="tip" role="tooltip">Growth stops when the count reaches this; the rest of the run refines the sites it has. Leave the run long enough after the last step for that.</div>
         </div>
         <div class="param" data-site-mode="grow">
+          <div class="row"><label>stop by</label><select id="p-growCriterion" aria-label="Growth stop criterion"></select></div>
+          <div class="tip" role="tooltip">What can end growth before <b>max sites</b>. <b>λ</b>: a new site's predicted gain must beat λ × 128 bits (below). <b>description length</b>: at every growth step the cells are scored as the bits to send them, 128 per site plus the error of each cell at its mean color coded at 8-bit precision, and growth ends once a batch hasn't lowered that score; λ is ignored. It's judged on what each batch actually achieved after <b>grow every</b> iterations, so it can stop too early where new sites need longer to pay off: on Kodak at 256 px it ended at 315–473 sites, about the best fixed budget for each image, but on MNIST digits at ~2 sites.</div>
+        </div>
+        <div class="param" data-site-mode="grow">
           <div class="row"><label>λ (stop)</label><input id="p-growLambda" type="number" step="10" min="0" /></div>
           <p class="help"><span class="unit">error per bit: 8-bit levels² (summed over R, G, B and pixels); with insert and L1 loss, levels</span></p>
           <div class="tip" role="tooltip">With <b>insert</b>, gains are measured in the training loss: levels (absolute error) under L1, levels² under L2. Only cells whose split would remove more than λ × 128 levels² of error (a site costs 128 bits) are split; a step adds fewer sites if fewer qualify, and growth ends early once none do. Example: λ = 400 → 51,200 levels², e.g. 100 pixels each off by about 13 levels in all three channels. Higher λ stops sooner. 0 = never stop early (any site that helps at all qualifies). The log says which limit ended growth.</div>
@@ -655,10 +743,6 @@
         <div class="param">
           <div class="row"><label>keep best</label><select id="p-keepBest" aria-label="Keep best state by"></select></div>
           <div class="tip" role="tooltip">At every refresh the state is scored, and the run ends on the best one seen (restored exactly), not the last. <b>lowest training loss</b>: only ever swaps the final state for one with lower loss at the same or fewer sites; in tests about 1 run in 10 ended a few % worse than an earlier refresh. <b>description length</b>: the bits to send the sites (128 per site) plus the residual coded at 8-bit precision under the training loss's own likelihood (Laplace for L1, Gaussian for L2); fewer sites at the same loss score better, and a site is worth keeping only if it saves more than its 128 bits (on 28×28 about 4% less error per site, on 768×512 under 0.01%). Caveat: states in the middle of growth are far from converged, so within a growing run this tends to pick an early, half-fitted state. <b>off</b>: the last state.</div>
-        </div>
-        <div class="param" data-site-mode="grow">
-          <div class="row"><label>stop by</label><select id="p-growCriterion" aria-label="Growth stop criterion"></select></div>
-          <div class="tip" role="tooltip">What can end growth before <b>max sites</b>. <b>λ</b>: a new site's predicted gain must beat λ × 128 bits (below). <b>description length</b>: at every growth step the cells are scored as the bits to send them, 128 per site plus the error of each cell at its mean color coded at 8-bit precision, and growth ends once a batch hasn't lowered that score; λ is ignored. It's judged on what each batch actually achieved after <b>grow every</b> iterations, so it can stop too early where new sites need longer to pay off: on Kodak at 256 px it ended at 315–473 sites, about the best fixed budget for each image, but on MNIST digits at ~2 sites.</div>
         </div>
         <div class="param" data-site-mode="grow">
           <div class="row"><label>patience</label><input id="p-growPatience" type="number" min="0" /></div>
