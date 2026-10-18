@@ -802,11 +802,7 @@ function blankRenderViews(width, height) {
     ctx.fillStyle = view.blank;
     ctx.fillRect(0, 0, width, height);
   }
-  const overlay = VIEWS.preview.overlayCanvas;
-  if (overlay) {
-    overlay.width = width;
-    overlay.height = height;
-  }
+  clearOverlay();
 }
 
 function updateCanvasLayout(width = state.targetImage?.width, height = state.targetImage?.height) {
@@ -816,6 +812,7 @@ function updateCanvasLayout(width = state.targetImage?.width, height = state.tar
     else view.draw(view);
   }
   positionOverlay();
+  drawCentroidOverlay();
 }
 
 // Builds a 256-entry RGB lookup from [t, [r, g, b]] stops.
@@ -2140,7 +2137,7 @@ function drawClusterMap() {
   bases.forEach((b, i) => {
     ctx.fillStyle = SNAP_COLORS[labels[i]];
     ctx.beginPath();
-    ctx.arc(state.lastSites[b], state.lastSites[b + 1], r, 0, Math.PI * 2);
+    ctx.arc(state.lastSites[b] + 0.5, state.lastSites[b + 1] + 0.5, r, 0, Math.PI * 2);
     ctx.fill();
   });
 }
@@ -2674,7 +2671,9 @@ function updateProgress(cur, total, text) {
 function clearOverlay() {
   const overlay = VIEWS.preview.overlayCanvas;
   if (!overlay) return;
-  overlay.getContext("2d").clearRect(0, 0, overlay.width, overlay.height);
+  const ctx = overlay.getContext("2d");
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, overlay.width, overlay.height);
 }
 
 // The overlay canvas sits inside the same card as the preview but is absolutely
@@ -2693,22 +2692,32 @@ function positionOverlay() {
   overlay.style.height = `${prect.height}px`;
 }
 
+// The overlay's drawing buffer matches its displayed size in device pixels (not
+// the image's), so marks stay sharp and a few screen pixels wide however far a
+// small image is scaled up. Returns a context in image pixel units and the
+// size of one screen (CSS) pixel in those units.
 function prepareOverlay(width, height) {
   const overlay = VIEWS.preview.overlayCanvas;
-  if (overlay.width !== width || overlay.height !== height) {
-    overlay.width = width;
-    overlay.height = height;
-  }
   positionOverlay();
+  const rect = VIEWS.preview.canvas.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  const bw = Math.max(1, Math.round(rect.width * dpr));
+  const bh = Math.max(1, Math.round(rect.height * dpr));
+  if (overlay.width !== bw || overlay.height !== bh) {
+    overlay.width = bw;
+    overlay.height = bh;
+  }
   clearOverlay();
-  return overlay.getContext("2d");
+  const ctx = overlay.getContext("2d");
+  ctx.setTransform(bw / width, 0, 0, bh / height, 0, 0);
+  return { ctx, cssPx: width / Math.max(1, rect.width) };
 }
 
 function drawCentroidOverlay() {
   if (!VIEWS.preview.overlayCanvas) return;
   if (!state.lastRender || !state.lastSites) return;
-  const ctx = prepareOverlay(state.lastRender.width, state.lastRender.height);
-  drawCentroids(ctx);
+  const { ctx, cssPx } = prepareOverlay(state.lastRender.width, state.lastRender.height);
+  drawCentroids(ctx, cssPx);
 }
 
 async function ensureRender(mode) {
@@ -2728,7 +2737,10 @@ async function ensureRender(mode) {
   }
 }
 
-function drawCentroids(ctx) {
+// Each site as a dot a few screen pixels wide with a dark rim. Site positions
+// are in the renderer's pixel coordinates, where pixel (i, j) is sampled at
+// (i, j); on a canvas that pixel's centre is (i + 0.5, j + 0.5).
+function drawCentroids(ctx, cssPx = 1) {
   if (!state.lastSites || !state.lastRender) return;
   const { rgba, width, height } = state.lastRender;
   ctx.save();
@@ -2738,14 +2750,17 @@ function drawCentroids(ctx) {
     const y = state.lastSites[base + 1];
     if (x < 0) continue;
     // Fill with the inverse of the rendered pixel under the dot so it stands out.
-    const px = Math.min(width - 1, Math.max(0, Math.floor(x)));
-    const py = Math.min(height - 1, Math.max(0, Math.floor(y)));
+    const px = Math.min(width - 1, Math.max(0, Math.floor(x + 0.5)));
+    const py = Math.min(height - 1, Math.max(0, Math.floor(y + 0.5)));
     const p = (py * width + px) * 4;
     const inv = (v) => 255 - Math.round(Math.max(0, Math.min(1, Number.isFinite(v) ? v : 0)) * 255);
     ctx.fillStyle = `rgb(${inv(rgba[p])}, ${inv(rgba[p + 1])}, ${inv(rgba[p + 2])})`;
     ctx.beginPath();
-    ctx.arc(x, y, 1.4, 0, Math.PI * 2);
+    ctx.arc(x + 0.5, y + 0.5, Math.min(1.4, 2.5 * cssPx), 0, Math.PI * 2);
     ctx.fill();
+    ctx.lineWidth = 0.75 * cssPx;
+    ctx.strokeStyle = "rgba(0, 0, 0, 0.6)";
+    ctx.stroke();
   }
   ctx.restore();
 }
