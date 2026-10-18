@@ -70,6 +70,7 @@ import {
 
 import { RadixSortUInt2 } from "./radix_sort.js?v=shared-wgsl-20261017";
 import { BITS_PER_SITE } from "./io.js";
+import { insertionField, pickInsertions } from "./insert.js?v=insert-20261018";
 import {
   colorSpaceFor,
   specializeShaders,
@@ -88,6 +89,12 @@ const MAX_PREVIEW_SITE_READBACKS = 8;
 export const LOSSES = {
   l1: { label: "L1 (absolute error)", id: 1 },
   l2: { label: "L2 (squared error)", id: 0 },
+};
+
+// How growth adds sites (args.growMode).
+export const GROW_MODES = {
+  split: "split cells",       // split the cells a linear color ramp explains best (siteSplit)
+  insert: "insert (exact loss)", // insert new sites where they cut the training loss most (insert.js)
 };
 
 // LR schedules (args.lrSchedule). All start with a linear warmup to 1 over
@@ -191,6 +198,7 @@ export function buildArgs(config, overrides = {}) {
     // Each growth step multiplies the learning rates of every site that
     // existed before it (split parents count as new) by this; 1 = off.
     growLrDecay: Math.max(0, Number(pick("growLrDecay", "GROW_LR_DECAY", 1))),
+    growMode: String(pick("growMode", "GROW_MODE", "split")),
   };
   args.decayIters = Math.max(0, Math.floor(Number(overrides.iters !== undefined && overrides.decayIters === undefined
     ? overrides.iters - args.warmupIters
@@ -211,6 +219,9 @@ export function buildArgs(config, overrides = {}) {
   const growEnd = pick("growEndIter", "GROW_END_ITER", null);
   args.growEndIter = growEnd == null || growEnd === "" ? args.iters : Math.max(0, Math.floor(Number(growEnd)));
   colorSpaceFor(args.colorSpace); // fail early on an unknown name
+  if (!GROW_MODES[args.growMode]) {
+    throw new Error(`growMode must be one of ${Object.keys(GROW_MODES).join(", ")} (got "${args.growMode}")`);
+  }
   if (!LOSSES[args.loss]) {
     throw new Error(`loss must be one of ${Object.keys(LOSSES).join(", ")} (got "${args.loss}")`);
   }
@@ -666,14 +677,17 @@ export class Trainer {
   }
 
   // ---- Site growth ----
-  // Rate-distortion growth in batches, by splitting cells. Every growEvery
-  // iterations the count is multiplied by growFactor (growthCounts); each
-  // existing site is scored by the error a two-way split of its cell would
-  // remove (siteSplit, from site_stats.wgsl's moments) and the best cells are
-  // split, one new site each. Only splits whose gain beats λ·BITS_PER_SITE (the
-  // cost of a site's bits; λ = 0 only requires a positive gain) qualify; growth
-  // ends at growMaxSites, when no split qualifies, or at the hidden growEndIter
-  // safety stop. Optionally (growBlur > 0) the fit target is the
+  // Rate-distortion growth in batches. Every growEvery iterations the count is
+  // multiplied by growFactor (growthCounts). growMode "split": each existing
+  // site is scored by the error a two-way split of its cell would remove
+  // (siteSplit, from site_stats.wgsl's moments) and the best cells are split,
+  // one new site each. growMode "insert": new sites are picked one at a time
+  // by their exact gain in the training loss (insert.js), leaving existing
+  // sites alone. Only batches whose gain beats λ·BITS_PER_SITE (the cost of a
+  // site's bits, in squared error for splits and in the training loss for
+  // insertions; λ = 0 only requires a positive gain) qualify; growth ends at
+  // growMaxSites, when nothing qualifies, or at the hidden growEndIter safety
+  // stop. Optionally (growBlur > 0) the fit target is the
   // image blurred to the current spacing until growth ends; in tests that cost
   // 0.5-2 dB at a matched site count, since sites place edges far finer than
   // their spacing.
@@ -742,26 +756,12 @@ export class Trainer {
     this._log(`Growth done at iter ${it}: ${this.siteCount} sites (${reason}).`);
   }
 
-  async _growStep(it) {
-    const args = this.args;
-    if (this.growDoneIter !== null) {
-      // One more measurement for the final batch, a growth step after it.
-      if (this.growPending && it >= this.growPending.it + args.growEvery) {
-        this._reportGrowthGain(it, await this._siteStats());
-      }
-      return;
-    }
-    if (this.siteCount >= this.bufferCapacity) { this._endGrowth(it, "reached max sites"); return; }
-    if (it >= args.growEndIter) { this._endGrowth(it, "growEndIter safety stop"); return; }
-    if (it === 0 || it % args.growEvery !== 0) return;
-    const stats = await this._siteStats();
-    this._reportGrowthGain(it, stats);
-
+  // Split growth: the `count` cells whose two-way split (siteSplit) gains most,
+  // above `threshold`. Rewrites the split parents in place and returns the new
+  // sites (RGB) as { data, k, predicted, best }, or null.
+  async _splitBatch(it, stats, n0, count, threshold) {
     const device = this.device;
     const queue = device.queue;
-    const n0 = this.siteCount;
-    const target = growthCounts(n0, args.growFactor, this.bufferCapacity)[0];
-    const threshold = args.growLambda * BITS_PER_SITE;
     const sitesRaw = await readSites(device, this.sitesBuf, n0);
     const splits = [];
     for (let i = 0; i < n0; i += 1) {
@@ -770,12 +770,8 @@ export class Trainer {
       if (sp && sp.gain > threshold) splits.push(sp);
     }
     splits.sort((x, y) => y.gain - x.gain);
-    splits.length = Math.min(splits.length, target - n0);
-    if (!splits.length) {
-      this._endGrowth(it, `λ (stop): no split would remove more than λ × ${BITS_PER_SITE} = ` +
-                          `${fmtLambda(threshold)} levels²`);
-      return;
-    }
+    splits.length = Math.min(splits.length, count);
+    if (!splits.length) return null;
 
     // Each split: the existing site moves to one half's centroid with that
     // half's ramp color, the new site takes the other half with an exact copy
@@ -806,6 +802,79 @@ export class Trainer {
       queue.writeBuffer(this.sitesBuf, sp.site * SITE_FLOATS * 4, enc);
       queue.writeBuffer(this.adamBuf, sp.site * ADAM_FLOATS * 4, adam);
     });
+    return { data, k, predicted: splits.map((sp) => sp.gain), best: splits[0].gain };
+  }
+
+  // Insertion growth (insert.js): up to `count` new sites picked greedily by
+  // their exact gain in the training loss; existing sites are untouched.
+  async _insertBatch(n0, count, threshold) {
+    const device = this.device;
+    const sitesRgb = await this._readSitesRgb(n0);
+    // Candidate textures are rgba32uint; the float readback copies their bytes
+    // unchanged (same-type typed-array copies are bitwise).
+    const [c0, c1] = await Promise.all([
+      readRgba32FloatTexture(device, this.cand0A, this.candWidth, this.candHeight),
+      readRgba32FloatTexture(device, this.cand1A, this.candWidth, this.candHeight),
+    ]);
+    const u0 = new Uint32Array(c0.buffer), u1 = new Uint32Array(c1.buffer);
+    const cand = new Uint32Array(this.candWidth * this.candHeight * 8);
+    for (let i = 0; i < this.candWidth * this.candHeight; i += 1) {
+      cand.set(u0.subarray(i * 4, i * 4 + 4), i * 8);
+      cand.set(u1.subarray(i * 4, i * 4 + 4), i * 8 + 4);
+    }
+    const field = insertionField({
+      width: this.width, height: this.height, sites: sitesRgb, siteCount: n0,
+      cand, candWidth: this.candWidth, candHeight: this.candHeight,
+    });
+    const picks = pickInsertions({
+      width: this.width, height: this.height, target: this.target, mask: this.maskCpu,
+      sites: sitesRgb, field, count, threshold, loss: this.args.loss,
+      spacing: Math.sqrt(this.maskArea / (n0 + count)),
+    });
+    if (!picks.length) return null;
+    this.growGen += 1;
+    const k = picks.length;
+    const data = new Float32Array(k * SITE_FLOATS);
+    picks.forEach((pk, j) => data.set(pk.site, j * SITE_FLOATS));
+    // predicted: squared-error gains, to match the realized-gain diagnostic.
+    return { data, k, predicted: picks.map((pk) => pk.gainL2), best: picks[0].gain };
+  }
+
+  // Units of growth gains and λ: split gains are squared error; insertion
+  // gains are in the training loss.
+  _gainUnit() {
+    return this.args.growMode === "insert" && this.args.loss === "l1" ? "levels" : "levels²";
+  }
+
+  async _growStep(it) {
+    const args = this.args;
+    if (this.growDoneIter !== null) {
+      // One more measurement for the final batch, a growth step after it.
+      if (this.growPending && it >= this.growPending.it + args.growEvery) {
+        this._reportGrowthGain(it, await this._siteStats());
+      }
+      return;
+    }
+    if (this.siteCount >= this.bufferCapacity) { this._endGrowth(it, "reached max sites"); return; }
+    if (it >= args.growEndIter) { this._endGrowth(it, "growEndIter safety stop"); return; }
+    if (it === 0 || it % args.growEvery !== 0) return;
+    const stats = await this._siteStats();
+    this._reportGrowthGain(it, stats);
+
+    const device = this.device;
+    const queue = device.queue;
+    const n0 = this.siteCount;
+    const target = growthCounts(n0, args.growFactor, this.bufferCapacity)[0];
+    const threshold = args.growLambda * BITS_PER_SITE;
+    const batch = args.growMode === "insert"
+      ? await this._insertBatch(n0, target - n0, threshold)
+      : await this._splitBatch(it, stats, n0, target - n0, threshold);
+    if (!batch) {
+      this._endGrowth(it, `λ (stop): no ${args.growMode === "insert" ? "insertion" : "split"} would remove more ` +
+                          `than λ × ${BITS_PER_SITE} = ${fmtLambda(threshold)} ${this._gainUnit()}`);
+      return;
+    }
+    const { data, k } = batch;
     queue.writeBuffer(this.sitesBuf, n0 * SITE_FLOATS * 4, encodeSiteColors(data, k, this.colorSpace));
     const adamNew = new Float32Array(k * ADAM_FLOATS);
     for (let j = 0; j < k; j += 1) {
@@ -813,7 +882,7 @@ export class Trainer {
       adamNew[j * ADAM_FLOATS + 21] = this.growGen;
     }
     queue.writeBuffer(this.adamBuf, n0 * ADAM_FLOATS * 4, adamNew);
-    this.growPending = { it, sites: splits.map((sp, j) => ({ id: n0 + j, predicted: sp.gain })) };
+    this.growPending = { it, sites: batch.predicted.map((predicted, j) => ({ id: n0 + j, predicted })) };
 
     const n1 = n0 + k;
     this.siteCount = n1;
@@ -853,7 +922,8 @@ export class Trainer {
 
     this._updateFitTarget();
     this._log(`Grow @${it}: +${k} → ${n1} sites` + (k < target - n0 ? ` (${target - n0} wanted; the rest under λ)` : "") +
-              ` | best split ${fmtLambda(splits[0].gain / BITS_PER_SITE)} levels²/bit` +
+              ` | best ${args.growMode === "insert" ? "insertion" : "split"} ` +
+              `${fmtLambda(batch.best / BITS_PER_SITE)} ${this._gainUnit()}/bit` +
               (this.fitSigma ? ` | blur σ ${this.fitSigma.toFixed(1)}px` : ""));
     if (n1 >= this.bufferCapacity) this._endGrowth(it, "reached max sites");
   }

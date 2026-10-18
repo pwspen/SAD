@@ -628,6 +628,10 @@
           <div class="tip" role="tooltip">Count at iteration 0, placed by the default edge-based init. 1 works. Growth only adds, so this is also the minimum.</div>
         </div>
         <div class="param" data-site-mode="grow">
+          <div class="row"><label>grow by</label><select id="p-growMode" aria-label="Growth mode"></select></div>
+          <div class="tip" role="tooltip">How each step adds sites. <b>split cells</b>: the cells whose colors a linear ramp explains best are each split in two; the site moves to one half and a new site takes the other. <b>insert (exact loss)</b>: new sites are placed one at a time where they cut the training loss most, computed exactly from the current fit; candidates are every pixel (or the worst-fit pixels on large images), with the shape of the site that owns it, colored with the median of the pixels it would win. Existing sites are left alone. Insertion is slower per step on large images.</div>
+        </div>
+        <div class="param" data-site-mode="grow">
           <div class="row"><label>factor</label><input id="p-growFactor" type="number" step="0.1" min="1.0001" /></div>
           <p class="help"><span class="unit">× sites per step (above 1)</span></p>
           <div class="tip" role="tooltip">Each step multiplies the count by this (rounded up, at least +1), capped at <b>max sites</b>. 2 doubles: 1, 2, 4, 8, …; 1.5 gives 1, 2, 3, 5, 8, 12, …. Within a step, the cells whose color structure a split would explain best are each split in two: the site moves to one half and a new site takes the other. A factor just above 1 adds one site per step.</div>
@@ -649,8 +653,8 @@
         </div>
         <div class="param" data-site-mode="grow">
           <div class="row"><label>λ (stop)</label><input id="p-growLambda" type="number" step="10" min="0" /></div>
-          <p class="help"><span class="unit">squared error per bit: 8-bit levels² (summed over R, G, B and pixels) per bit</span></p>
-          <div class="tip" role="tooltip">Only cells whose split would remove more than λ × 128 levels² of error (a site costs 128 bits) are split; a step adds fewer sites if fewer qualify, and growth ends early once none do. Example: λ = 400 → 51,200 levels², e.g. 100 pixels each off by about 13 levels in all three channels. Higher λ stops sooner. 0 = never stop early (any site that helps at all qualifies). The log says which limit ended growth.</div>
+          <p class="help"><span class="unit">error per bit: 8-bit levels² (summed over R, G, B and pixels); with insert and L1 loss, levels</span></p>
+          <div class="tip" role="tooltip">With <b>insert</b>, gains are measured in the training loss: levels (absolute error) under L1, levels² under L2. Only cells whose split would remove more than λ × 128 levels² of error (a site costs 128 bits) are split; a step adds fewer sites if fewer qualify, and growth ends early once none do. Example: λ = 400 → 51,200 levels², e.g. 100 pixels each off by about 13 levels in all three channels. Higher λ stops sooner. 0 = never stop early (any site that helps at all qualifies). The log says which limit ended growth.</div>
         </div>
 
         <h3>Logging</h3>
@@ -776,6 +780,6 @@
       </section>
     </div>
 
-    <script type="module" src="train.js?v=presets-20261018"></script>
+    <script type="module" src="train.js?v=insert-20261018"></script>
   </body>
 </html>

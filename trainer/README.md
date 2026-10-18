@@ -12,6 +12,10 @@ both import it. Hyperparameter defaults come from `training_config.json`.
   across the cell): the site moves to one half, a new site takes the other. Only splits whose
   gain beats `growLambda × BITS_PER_SITE` qualify (0 = any positive gain), so λ can
   shrink a batch or end growth early. Sites are never removed.
+  `growMode` picks how sites are added: `"split"` (default, the split above) or `"insert"`
+  (`insert.js`): new sites are placed one at a time where they cut the training loss most,
+  computed exactly from the current fit (candidate positions, median colors), and
+  existing sites are left alone; λ is then in the training loss's units.
 - `"fixed"`: exactly `sites` for the whole run.
 
 `lrSchedule` is `"warmup-cosine"` (default), `"fixed"` (constant after warmup) or
