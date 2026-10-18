@@ -6,16 +6,14 @@ both import it. Hyperparameter defaults come from `training_config.json`.
 
 `siteMode` picks how many sites a run uses:
 
-- `"grow"` (default): start from `growInitSites` and add sites by rate-distortion. Every
-  `growEvery` iterations, each site-spacing cell gets a site if the best error one site could
-  remove there (scored over the cell's dyadic sub-blocks) beats `growLambda × BITS_PER_SITE`, so
-  growth runs coarse to fine and stops when sites no longer pay for their bits. `growMaxSites`
-  is a hard cap (and sizes the buffers); if growth hits it, the trainer logs it and reports
-  `growCapped`, since the cap rather than λ then sets the count. Sites are never removed.
+- `"grow"` (default): start from `growInitSites` and add one site every `growEvery` iterations,
+  greedily at the single best place (the dyadic block where one site would remove the most
+  error), until `growMaxSites`. `growLambda` stops growth early once the best gain falls under
+  `growLambda × BITS_PER_SITE` (0 = no early stop). Sites are never removed.
 - `"fixed"`: exactly `sites` for the whole run.
 
-Without an explicit `siteMode`, `growLambda <= 0` means fixed, so older `growLambda=0` configs
-still work.
+`lrSchedule` is `"warmup-cosine"` (default), `"fixed"` (constant after warmup) or
+`"decay-after-growth"` (constant until growth ends, then cosine to 0 by the end of the run).
 
 ## Modules
 

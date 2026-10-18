@@ -202,7 +202,7 @@ async function runOne(ctx, run) {
     }
     return {
       name, ...run, startedAt, status: "ok",
-      finalPsnr, bestPsnr: final.bestPsnr, sites: final.count, growCapped: final.growCapped,
+      finalPsnr, bestPsnr: final.bestPsnr, sites: final.count, growStop: final.growStop, growDoneIter: final.growDoneIter,
       bpp: computeBpp(final.count, final.width, final.height), bitsPerSite: BITS_PER_SITE,
       trainSeconds, itPerSecond: args.iters / Math.max(trainSeconds, 1e-6),
       args, curve,
@@ -256,7 +256,7 @@ async function main() {
       if (res.status === "ok") {
         console.error(`${tag} | final ${res.finalPsnr.toFixed(2)} dB @ ${res.bpp.toFixed(3)} bpp | best ${res.bestPsnr.toFixed(2)} dB | ` +
           `${res.itPerSecond.toFixed(1)} it/s | ${res.trainSeconds.toFixed(1)}s` +
-          (res.growCapped ? ` | hit max sites (${res.sites})` : ""));
+          (res.growStop ? ` | grew to ${res.sites} by iter ${res.growDoneIter} (${res.growStop})` : ""));
       } else {
         console.error(`${tag} | FAILED: ${res.error.split("\n")[0]}`);
       }

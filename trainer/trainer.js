@@ -83,11 +83,24 @@ const MAX_PREVIEW_IMAGE_READBACKS = 2;
 const ANI_START_ITER = 50;
 const MAX_PREVIEW_SITE_READBACKS = 8;
 
-// Linear warmup to 1 over `warmupIters`, then cosine decay to 0 over
-// `decayIters`. Returns the multiplier applied to every base LR at step `it`.
-export function lrSchedule(it, warmupIters, decayIters) {
+// LR schedules (args.lrSchedule). All start with a linear warmup to 1 over
+// `warmupIters`; the run lasts warmupIters + decayIters.
+export const LR_SCHEDULES = {
+  "warmup-cosine": "warmup + cosine",          // cosine decay to 0 over decayIters
+  fixed: "fixed",                              // stays at 1 after warmup
+  "decay-after-growth": "decay after growth",  // 1 until growth ends, then cosine to 0 by the end
+};
+
+// Multiplier applied to every base LR at step `it`. `growDoneIter` is the
+// iteration growth ended (Infinity while still growing); only
+// "decay-after-growth" uses it.
+export function lrSchedule(it, warmupIters, decayIters, kind = "warmup-cosine", growDoneIter = 0) {
   if (it < warmupIters) return (it + 1) / warmupIters;
-  const t = Math.min(1, (it - warmupIters) / Math.max(1, decayIters));
+  if (kind === "fixed") return 1;
+  const total = warmupIters + decayIters;
+  const start = kind === "decay-after-growth" ? Math.max(warmupIters, growDoneIter) : warmupIters;
+  if (it < start) return 1;
+  const t = Math.min(1, (it - start) / Math.max(1, total - start));
   return 0.5 * (1 + Math.cos(Math.PI * t));
 }
 
@@ -122,6 +135,7 @@ export function buildArgs(config, overrides = {}) {
     logFreq: Math.max(1, Number(pick("logFreq", null, 50))),
     viewerFreq: Math.max(1, Number(pick("viewerFreq", null, 50))),
     lrMult: Number(pick("lrMult", "LR_MULT", 3)),
+    lrSchedule: String(pick("lrSchedule", "LR_SCHEDULE", "warmup-cosine")),
     // Site color parameterization (a key of COLOR_SPACES in color_spaces.js).
     // Sites stay RGB outside the trainer; only the optimized params change.
     colorSpace: String(pick("colorSpace", "COLOR_SPACE", "rgb")),
@@ -137,16 +151,16 @@ export function buildArgs(config, overrides = {}) {
     beta2: Number(pick("beta2", "BETA2", 0.999)),
     eps: Number(pick("eps", "EPS", 1e-8)),
     maxDim: Number(pick("maxDim", "MAX_DIM", 2048)),
-    // Site growth (rate-distortion), used when siteMode is "grow". growLambda
-    // is the slope -dD/dR: the squared error (8-bit levels², summed over RGB) a
-    // site must remove per bit it costs (BITS_PER_SITE bits). 400 lands around
-    // 4-9k sites on Kodak; there is no single best λ, it picks the bpp/PSNR
-    // operating point. Runs start from growInitSites and never exceed
-    // growMaxSites (which also sizes the GPU buffers).
-    growLambda: Number(pick("growLambda", "GROW_LAMBDA", 400)),
-    growMaxSites: Math.max(1, Math.floor(Number(pick("growMaxSites", "GROW_MAX_SITES", 20000)))),
-    growInitSites: Math.max(1, Math.floor(Number(pick("growInitSites", "GROW_INIT_SITES", 256)))),
-    growEvery: Math.max(1, Math.floor(Number(pick("growEvery", "GROW_EVERY", 10)))),
+    // Site growth, used when siteMode is "grow": start from growInitSites and
+    // add one site every growEvery iterations, at the single best place, until
+    // growMaxSites (which also sizes the GPU buffers). growLambda stops it
+    // early: the slope -dD/dR, i.e. the squared error (8-bit levels², summed
+    // over RGB) a new site must remove per bit it costs (BITS_PER_SITE bits).
+    // 0 = no early stop (any positive gain still qualifies).
+    growLambda: Math.max(0, Number(pick("growLambda", "GROW_LAMBDA", 400))),
+    growMaxSites: Math.max(1, Math.floor(Number(pick("growMaxSites", "GROW_MAX_SITES", 64)))),
+    growInitSites: Math.max(1, Math.floor(Number(pick("growInitSites", "GROW_INIT_SITES", 1)))),
+    growEvery: Math.max(1, Math.floor(Number(pick("growEvery", "GROW_EVERY", 5)))),
     // While growing, the fit target is blurred with sigma = growBlur × site
     // spacing √(mask area / sites); 0 = always fit the original.
     growBlur: Math.max(0, Number(pick("growBlur", "GROW_BLUR", 0))),
@@ -156,19 +170,18 @@ export function buildArgs(config, overrides = {}) {
     : pick("decayIters", "DECAY_ITERS", 500))));
   args.iters = args.warmupIters + args.decayIters;
   // "fixed": exactly `sites` for the whole run. "grow": rate-distortion growth.
-  // Without an explicit siteMode, growLambda <= 0 means fixed, so older
-  // configs and sweeps that switched growth off with growLambda=0 still work.
-  const siteMode = pick("siteMode", "SITE_MODE", null);
-  args.siteMode = siteMode == null || siteMode === "" ? (args.growLambda > 0 ? "grow" : "fixed") : String(siteMode);
+  const siteMode = pick("siteMode", "SITE_MODE", "grow");
+  args.siteMode = String(siteMode);
   if (args.siteMode !== "fixed" && args.siteMode !== "grow") {
     throw new Error(`siteMode must be "fixed" or "grow" (got "${args.siteMode}")`);
   }
-  if (args.siteMode === "grow" && !(args.growLambda > 0)) {
-    throw new Error("siteMode \"grow\" needs growLambda > 0");
+  if (!(args.lrSchedule in LR_SCHEDULES)) {
+    throw new Error(`lrSchedule must be one of ${Object.keys(LR_SCHEDULES).join(", ")} (got "${args.lrSchedule}")`);
   }
-  // Growth (and the blurred target) stops here; the rest fits the original.
+  // Hidden safety stop for growth (not in the UI): growth normally ends at
+  // growMaxSites or by λ. Default: never.
   const growEnd = pick("growEndIter", "GROW_END_ITER", null);
-  args.growEndIter = Math.max(0, Math.floor(growEnd == null || growEnd === "" ? 0.6 * args.iters : Number(growEnd)));
+  args.growEndIter = growEnd == null || growEnd === "" ? args.iters : Math.max(0, Math.floor(Number(growEnd)));
   colorSpaceFor(args.colorSpace); // fail early on an unknown name
   if (!Number.isFinite(args.initLogTau) || !Number.isFinite(args.initRadius)) {
     throw new Error("training_config.json missing INIT_LOG_TAU / INIT_RADIUS (required).");
@@ -321,13 +334,12 @@ export class Trainer {
       this.growBlurParams = createUniform32(device);
       this.growGainParams = createUniform32(device);
       this.growSeedParams = createParamsBuffer(device, this._paramsArgs(initSiteCount, 0, 0));
-      if (args.growBlur > 0 && args.growEndIter > 0) {
+      if (args.growBlur > 0) {
         this.blurTex = createRgba32FloatTexture(device, width, height, { storage: true, copyDst: false });
         this.blurTmpTex = createRgba32FloatTexture(device, width, height, { storage: true, copyDst: false });
       }
       this.growCellsBuf = null;
       this.growCellsCap = 0;
-      this.growCapped = false; // set once growth wanted more sites than growMaxSites allows
     }
 
     // Initialize sites
@@ -388,6 +400,9 @@ export class Trainer {
       device.queue.submit([encoder.finish()]);
     }
 
+    // Growth state: the iteration it ended (null while growing) and why.
+    this.growDoneIter = this.usesGrow ? null : 0;
+    this.growStop = null;
     if (this.usesGrow) this._updateFitTarget();
 
     this.jumpPassIndex = 0;
@@ -470,7 +485,8 @@ export class Trainer {
         }
       }
 
-      const lrScale = args.lrMult * lrSchedule(it, args.warmupIters, args.decayIters);
+      const lrScale = args.lrMult * lrSchedule(it, args.warmupIters, args.decayIters, args.lrSchedule,
+        this.growDoneIter ?? Infinity);
       const lrDir = it >= this.aniStartIter ? args.lrDirBase * lrScale : 0;
       const lrAniso = it >= this.aniStartIter ? args.lrAnisoBase * lrScale : 0;
       updateAdamParamsBuffer(queue, this.adamParams,
@@ -580,7 +596,7 @@ export class Trainer {
             activeSites,
             totalSites: siteCount,
             fitSigma: this.fitSigma || 0,
-            growCapped: Boolean(this.growCapped),
+            growDoneIter: this.growDoneIter,
             itsPerSec,
             elapsedSec: elapsed,
             renderRgba: rgba,
@@ -609,22 +625,22 @@ export class Trainer {
   }
 
   // ---- Site growth ----
-  // Rate-distortion: minimize D + λ·R, with R = BITS_PER_SITE bits per site.
-  // Every growEvery iterations (before growEndIter), each cell of a grid at the
-  // current site spacing h = √(mask area / sites) is scored by the most error
-  // one new site could remove in it (pickGrowthBlocks); cells whose gain beats
-  // λ·BITS_PER_SITE get a site. One site per cell caps a step at roughly
-  // doubling the count, so growth runs coarse to fine and stops by itself once
-  // no cell pays for a site. Optionally (growBlur > 0) the fit target is the
-  // image blurred to the current spacing; in tests that cost 0.5-2 dB at a
-  // matched site count, since sites place edges far finer than their spacing.
+  // Greedy rate-distortion growth, one site at a time. Every growEvery
+  // iterations, every dyadic block of a grid finer than the site spacing is
+  // scored by the error one new site taking it over would remove
+  // (bestGrowthBlock); the single best block gets a site. Growth ends at
+  // growMaxSites, when the best gain no longer beats λ·BITS_PER_SITE (the cost
+  // of a site's bits; λ = 0 only requires a positive gain), or at the hidden
+  // growEndIter safety stop. Optionally (growBlur > 0) the fit target is the
+  // image blurred to the current spacing until growth ends; in tests that cost
+  // 0.5-2 dB at a matched site count, since sites place edges far finer than
+  // their spacing.
 
   _siteSpacing() { return Math.sqrt(this.maskArea / Math.max(1, this.siteCount)); }
 
   // Point the gradients at the blurred (while growing) or original target.
   _updateFitTarget() {
-    const sigma = this.blurTex && this._growing(this._iter ?? 0)
-      ? this.args.growBlur * this._siteSpacing() : 0;
+    const sigma = this.blurTex && this.growDoneIter === null ? this.args.growBlur * this._siteSpacing() : 0;
     this.fitSigma = sigma >= 0.25 ? sigma : 0;
     if (!this.fitSigma) {
       this.fitTex = this.targetTex;
@@ -639,26 +655,27 @@ export class Trainer {
     this.fitTex = this.blurTex;
   }
 
-  _growing(it) { return it < this.args.growEndIter; }
+  _endGrowth(it, reason) {
+    this.growDoneIter = it;
+    this.growStop = reason;
+    this._updateFitTarget();
+    this._log(`Growth done at iter ${it}: ${this.siteCount} sites (${reason}).`);
+  }
 
   async _growStep(it) {
-    this._iter = it;
     const args = this.args;
-    if (!this._growing(it)) {
-      if (this.fitTex !== this.targetTex) {
-        this._updateFitTarget();
-        this._log(`Growth done at iter ${it}: ${this.siteCount} sites; fitting the original target.`);
-      }
-      return;
-    }
-    if (it === 0 || it % args.growEvery !== 0 || this.growCapped) return;
+    if (this.growDoneIter !== null) return;
+    if (this.siteCount >= this.bufferCapacity) { this._endGrowth(it, "max sites"); return; }
+    if (it >= args.growEndIter) { this._endGrowth(it, "end iter"); return; }
+    if (it === 0 || it % args.growEvery !== 0) return;
 
     const device = this.device;
     const queue = device.queue;
     const n0 = this.siteCount;
-    // Stats on a grid of h/4 cells; each spacing-sized parent of 4×4 of them
-    // can receive one site (so a step at most about doubles the count).
-    const cell = Math.max(1, Math.round(this._siteSpacing() / GROW_SUBDIV));
+    // Stats on cells of a quarter site spacing, but at most GROW_MAX_CELL px so
+    // even the first few sites can land on a specific feature.
+    const spacing = this._siteSpacing();
+    const cell = Math.max(1, Math.min(GROW_MAX_CELL, Math.round(spacing / 4)));
     const cellsX = Math.ceil(this.width / cell);
     const cellsY = Math.ceil(this.height / cell);
     const cellCount = cellsX * cellsY;
@@ -684,62 +701,72 @@ export class Trainer {
     staging.unmap();
     staging.destroy();
 
-    const lambda = args.growLambda;
-    const picked = pickGrowthBlocks(cells, cellsX, cellsY, cell, lambda * BITS_PER_SITE);
-    picked.sort((a, b) => b.gain - a.gain);
-    const room = this.bufferCapacity - n0;
-    if (picked.length > room && !this.growCapped) {
-      this.growCapped = true;
-      this._log(`Hit max sites (${this.bufferCapacity}) at iter ${it}: ${picked.length - room} more sites ` +
-                `would pay for their bits, so the cap now sets the count, not λ. Raise max sites or λ.`);
+    const best = bestGrowthBlock(cells, cellsX, cellsY, cell, Math.max(cell, spacing));
+    const threshold = args.growLambda * BITS_PER_SITE;
+    if (!best || !(best.gain > threshold)) {
+      const g = best ? Math.max(0, best.gain) : 0;
+      this._endGrowth(it, `λ: best site would remove ${fmtLambda(g / BITS_PER_SITE)} levels²/bit, ` +
+                          `under λ = ${args.growLambda}`);
+      return;
     }
-    picked.length = Math.min(picked.length, room);
-    if (!picked.length) return;
 
-    // New sites: error centroid of the block, its mean fit color, its owners'
+    // New site: error centroid of the block, its mean fit color, its owners'
     // tau and radius (so it competes as an equal), isotropic. A small jitter
-    // keeps them off existing positions.
-    const k = picked.length;
-    const data = new Float32Array(k * SITE_FLOATS);
-    picked.forEach((blk, i) => {
-      const o = i * SITE_FLOATS;
-      data[o] = Math.min(this.width - 1, Math.max(0, blk.x + (Math.random() - 0.5) * 0.5));
-      data[o + 1] = Math.min(this.height - 1, Math.max(0, blk.y + (Math.random() - 0.5) * 0.5));
-      data[o + 2] = blk.ownerW > 0 ? blk.tau / blk.ownerW : args.initLogTau;
-      data[o + 3] = blk.ownerW > 0 ? blk.radius / blk.ownerW : args.initRadius;
-      data[o + 4] = blk.color[0];
-      data[o + 5] = blk.color[1];
-      data[o + 6] = blk.color[2];
-      data[o + 7] = 1;
-      data[o + 8] = 0;
-      data[o + 9] = 0;
-    });
-    queue.writeBuffer(this.sitesBuf, n0 * SITE_FLOATS * 4, encodeSiteColors(data, k, this.colorSpace));
+    // keeps it off an existing position.
+    const data = new Float32Array(SITE_FLOATS);
+    data[0] = Math.min(this.width - 1, Math.max(0, best.x + (Math.random() - 0.5) * 0.5));
+    data[1] = Math.min(this.height - 1, Math.max(0, best.y + (Math.random() - 0.5) * 0.5));
+    data[2] = best.ownerW > 0 ? best.tau / best.ownerW : args.initLogTau;
+    data[3] = best.ownerW > 0 ? best.radius / best.ownerW : args.initRadius;
+    data.set(best.color, 4);
+    data[7] = 1;
+    queue.writeBuffer(this.sitesBuf, n0 * SITE_FLOATS * 4, encodeSiteColors(data, 1, this.colorSpace));
     // Fresh Adam moments, with the birth step for per-site bias correction.
-    const adam = new Float32Array(k * ADAM_FLOATS);
-    for (let i = 0; i < k; i += 1) adam[i * ADAM_FLOATS + 20] = it;
+    const adam = new Float32Array(ADAM_FLOATS);
+    adam[20] = it;
     queue.writeBuffer(this.adamBuf, n0 * ADAM_FLOATS * 4, adam);
 
-    const n1 = n0 + k;
+    const n1 = n0 + 1;
     this.siteCount = n1;
     this.actualSites = n1;
-    this.activeEstimate += k;
+    this.activeEstimate += 1;
     updateClearParamsBuffer(queue, this.countParams, n1);
     updateGradParamsBuffer(queue, this.gradParams, n1, this.invScaleSq);
 
-    // Seed only the new sites into their home candidate pixels; the regular
-    // candidate updates spread them from there.
+    // Seed the new site into its home candidate pixel, then run a full
+    // jump-flood sequence of candidate passes (long jumps down to 1 px) so it
+    // claims its whole region now. Left to the regular updates (every candFreq
+    // iterations, 1 px steps by then) it would barely spread before the next
+    // check, which would then see the same error and pick the same spot.
     updateParamsBuffer(queue, this.growSeedParams, this._paramsArgs(n1, n0, 0));
+    const stages = Math.max(1, Math.ceil(Math.log2(Math.max(this.candWidth, this.candHeight, 2))));
+    this.growJfaParams ??= [];
+    for (let st = 0; st < stages; st += 1) {
+      this.growJfaParams[st] ??= createParamsBuffer(device, this._paramsArgs(n1, 0, 0));
+      updateParamsBuffer(queue, this.growJfaParams[st],
+        this._paramsArgs(n1, packJumpStep(st, this.candWidth, this.candHeight), 0));
+    }
     const seedEnc = device.createCommandEncoder();
     seedEnc.copyTextureToTexture({ texture: this.cand0A }, { texture: this.cand0B },
       [this.candWidth, this.candHeight, 1]);
-    this.seedEnc.encode(seedEnc, this.sitesBuf, this.growSeedParams, this.cand0A, this.cand0B, k);
-    queue.submit([seedEnc.finish()]);
+    this.seedEnc.encode(seedEnc, this.sitesBuf, this.growSeedParams, this.cand0A, this.cand0B, 1);
     [this.cand0A, this.cand0B] = [this.cand0B, this.cand0A];
+    this._maybeRefreshHilbert(seedEnc, n1);
+    this.packEnc.encode(seedEnc, this.sitesBuf, this.packedSitesBuf, this.countParams, n1);
+    for (let st = 0; st < stages; st += 1) {
+      this.candsEnc.encodeUpdate(seedEnc, this.packedSitesBuf, this.growJfaParams[st],
+        this.cand0A, this.cand1A, this.cand0B, this.cand1B,
+        this._hilbertOrderBuf(), this._hilbertPosBuf(), this.candWidth, this.candHeight);
+      [this.cand0A, this.cand0B] = [this.cand0B, this.cand0A];
+      [this.cand1A, this.cand1B] = [this.cand1B, this.cand1A];
+    }
+    queue.submit([seedEnc.finish()]);
 
     this._updateFitTarget();
-    this._log(`Grow @${it}: +${k} → ${n1} sites | best gain ${fmtLambda(picked[0].gain / BITS_PER_SITE)}/bit | ` +
-              `cell ${cell * GROW_SUBDIV}px` + (this.fitSigma ? ` | blur σ ${this.fitSigma.toFixed(1)}px` : ""));
+    this._log(`Grow @${it}: site ${n1} at (${best.x.toFixed(0)}, ${best.y.toFixed(0)}) | ` +
+              `gain ${fmtLambda(best.gain / BITS_PER_SITE)} levels²/bit | block ${best.size}px` +
+              (this.fitSigma ? ` | blur σ ${this.fitSigma.toFixed(1)}px` : ""));
+    if (n1 >= this.bufferCapacity) this._endGrowth(it, "max sites");
   }
 
   // Encode preview readbacks into the same submission as the preview render.
@@ -954,7 +981,8 @@ export class Trainer {
       width: this.width,
       height: this.height,
       bestPsnr: this.bestPsnr,
-      growCapped: Boolean(this.growCapped),
+      growDoneIter: this.growDoneIter,
+      growStop: this.growStop,
       trainSeconds: (performance.now() - this.trainStartMs) / 1000,
     };
   }
@@ -975,7 +1003,7 @@ export class Trainer {
       this.countParams, this.gradCountParams, this.tauParams,
       this.dummyHilbertBuf, this.hilbertParams, this._tauHeatBuf,
       this.blurTex, this.blurTmpTex, this.growBlurParams, this.growGainParams, this.growSeedParams,
-      this.growCellsBuf,
+      this.growCellsBuf, ...(this.growJfaParams || []),
     ];
     if (this.hilbertRes) {
       owned.push(this.hilbertRes.pairs, this.hilbertRes.order, this.hilbertRes.pos);
@@ -993,70 +1021,77 @@ export class Trainer {
 
 const fmtLambda = (v) => (v >= 100 ? v.toFixed(0) : v.toPrecision(2));
 
-// Growth candidates from grow_gain.wgsl's per-cell stats (`cells`, 12 floats
-// per cell of `cell` px). Each parent of GROW_SUBDIV × GROW_SUBDIV cells (about
-// one site spacing) is scored by its best dyadic block (the whole parent, its
-// quarters, ... down to single cells): the error a site taking that block over
-// with the block's mean color would remove, sum|fit - pred|² - sum|fit - mean|²,
-// in 8-bit levels² summed over RGB. Remaining error concentrates at edges finer
-// than the spacing, which a whole-parent score would miss. Returns the parents
-// whose best gain beats `threshold`, as { gain, x, y, color, tau, radius, ownerW }.
-const GROW_SUBDIV = 4;
+// The best place for one new site, from grow_gain.wgsl's per-cell stats
+// (`cells`, 12 floats per cell of `cell` px). Cells are merged 2×2 into a
+// pyramid of aligned dyadic blocks, up to `maxBlock` px (about one site
+// spacing), and each block is scored by the error a site taking it over with
+// the block's mean color would remove: sum|fit - pred|² - sum|fit - mean|²,
+// in 8-bit levels² summed over RGB. Scoring sub-spacing blocks matters
+// because the remaining error concentrates at edges finer than the spacing.
+// Returns { gain, size, x, y, color, tau, radius, ownerW } or null.
+const GROW_MAX_CELL = 32;
 
-export function pickGrowthBlocks(cells, cellsX, cellsY, cell, threshold) {
-  const out = [];
+export function bestGrowthBlock(cells, cellsX, cellsY, cell, maxBlock) {
   const L2 = 255 * 255;
-  const block = (bx, by, size) => {
-    let n = 0, e = 0, ex = 0, ey = 0, tau = 0, rad = 0, ow = 0, var0 = 0;
-    const mean = [0, 0, 0];
-    const parts = [];
-    for (let y = by; y < Math.min(by + size, cellsY); y += 1) {
-      for (let x = bx; x < Math.min(bx + size, cellsX); x += 1) {
-        const b = (y * cellsX + x) * 12;
-        const ni = cells[b];
-        if (!(ni > 0)) continue;
-        n += ni;
-        for (let c = 0; c < 3; c += 1) mean[c] += ni * cells[b + 1 + c];
-        var0 += cells[b + 4];
-        const ei = cells[b + 5];
-        e += ei;
-        ex += cells[b + 6] + ei * x * cell;
-        ey += cells[b + 7] + ei * y * cell;
-        tau += cells[b + 8];
-        rad += cells[b + 9];
-        ow += cells[b + 10];
-        parts.push(b);
-      }
-    }
-    if (n < 1) return null;
-    for (let c = 0; c < 3; c += 1) mean[c] /= n;
-    // Pooled variance: within-cell spread plus spread of the cell means.
-    let v = var0;
-    for (const b of parts) {
-      let d2 = 0;
-      for (let c = 0; c < 3; c += 1) d2 += (cells[b + 1 + c] - mean[c]) ** 2;
-      v += cells[b] * d2;
-    }
-    const gain = (e - v) * L2;
-    if (!Number.isFinite(gain)) return null;
-    return { gain, x: e > 0 ? ex / e : (bx + size / 2) * cell, y: e > 0 ? ey / e : (by + size / 2) * cell,
-             color: mean, tau, radius: rad, ownerW: ow };
-  };
-  for (let py = 0; py < cellsY; py += GROW_SUBDIV) {
-    for (let px = 0; px < cellsX; px += GROW_SUBDIV) {
-      let best = null;
-      for (let size = GROW_SUBDIV; size >= 1; size >>= 1) {
-        for (let by = py; by < py + GROW_SUBDIV; by += size) {
-          for (let bx = px; bx < px + GROW_SUBDIV; bx += size) {
-            const blk = block(bx, by, size);
-            if (blk && (!best || blk.gain > best.gain)) best = blk;
-          }
-        }
-      }
-      if (best && best.gain > threshold) out.push(best);
+  // Per block: weight, color sum, variance sum (about the block's own mean),
+  // error energy, energy-weighted absolute position, owner tau/radius sums.
+  let w = cellsX, h = cellsY;
+  let lvl = new Array(w * h);
+  for (let y = 0; y < h; y += 1) {
+    for (let x = 0; x < w; x += 1) {
+      const b = (y * w + x) * 12;
+      const n = cells[b];
+      if (!(n > 0)) { lvl[y * w + x] = null; continue; }
+      const e = cells[b + 5];
+      lvl[y * w + x] = {
+        n, c: [n * cells[b + 1], n * cells[b + 2], n * cells[b + 3]], v: cells[b + 4], e,
+        ex: cells[b + 6] + e * x * cell, ey: cells[b + 7] + e * y * cell,
+        tau: cells[b + 8], rad: cells[b + 9], ow: cells[b + 10],
+      };
     }
   }
-  return out;
+  let best = null;
+  for (let size = cell; ; size *= 2) {
+    for (const blk of lvl) {
+      if (!blk) continue;
+      const gain = (blk.e - blk.v) * L2;
+      if (Number.isFinite(gain) && (!best || gain > best.gain)) best = { blk, gain, size };
+    }
+    if (size * 2 > maxBlock || (w === 1 && h === 1)) break;
+    // Merge 2×2; pooled variance = within-child spread + spread of child means.
+    const w2 = Math.ceil(w / 2), h2 = Math.ceil(h / 2);
+    const next = new Array(w2 * h2);
+    for (let y = 0; y < h2; y += 1) {
+      for (let x = 0; x < w2; x += 1) {
+        const kids = [];
+        for (let dy = 0; dy < 2; dy += 1) for (let dx = 0; dx < 2; dx += 1) {
+          const cx = 2 * x + dx, cy = 2 * y + dy;
+          if (cx < w && cy < h && lvl[cy * w + cx]) kids.push(lvl[cy * w + cx]);
+        }
+        if (!kids.length) { next[y * w2 + x] = null; continue; }
+        const m = { n: 0, c: [0, 0, 0], v: 0, e: 0, ex: 0, ey: 0, tau: 0, rad: 0, ow: 0 };
+        for (const k of kids) {
+          m.n += k.n; m.v += k.v; m.e += k.e; m.ex += k.ex; m.ey += k.ey;
+          m.tau += k.tau; m.rad += k.rad; m.ow += k.ow;
+          for (let c = 0; c < 3; c += 1) m.c[c] += k.c[c];
+        }
+        for (const k of kids) {
+          let d2 = 0;
+          for (let c = 0; c < 3; c += 1) d2 += (k.c[c] / k.n - m.c[c] / m.n) ** 2;
+          m.v += k.n * d2;
+        }
+        next[y * w2 + x] = m;
+      }
+    }
+    lvl = next; w = w2; h = h2;
+  }
+  if (!best) return null;
+  const { blk, gain, size } = best;
+  return {
+    gain, size,
+    x: blk.e > 0 ? blk.ex / blk.e : NaN, y: blk.e > 0 ? blk.ey / blk.e : NaN,
+    color: blk.c.map((v) => v / blk.n), tau: blk.tau, radius: blk.rad, ownerW: blk.ow,
+  };
 }
 
 // Gradient groups over the consolidated grads[idx*10+ch] channels. Multi-channel

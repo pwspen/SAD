@@ -561,11 +561,11 @@
           <div class="tip" role="tooltip">Start from these sites instead of the default placement (sites sampled where the image has edges). Positions are rescaled to the target size and every site's τ is reset. Its site count becomes the starting count: it replaces <b>sites</b> (fixed) or <b>start sites</b> (grow), and that field is locked to show it until the file is cleared.</div>
         </div>
 
-        <h3 class="has-tip" tabindex="0">Site count<span class="tip" role="tooltip">How many sites the run uses. <b>Fixed</b>: exactly the number you give, for the whole run. <b>Grow</b>: start small and add a site only where it pays for its bits on the rate–distortion curve, i.e. where it would remove more error than λ × 128 bits is worth. Growth runs coarse to fine and stops by itself, so λ picks the operating point (bpp vs PSNR) and the count follows. Sites are never removed. Each site costs 128 bits: bpp = sites × 128 / (width × height).</span></h3>
+        <h3 class="has-tip" tabindex="0">Site count<span class="tip" role="tooltip">How many sites the run uses. <b>Fixed</b>: exactly the number you give, for the whole run. <b>Grow</b>: start from a few sites and add one at a time, each at the single place where it removes the most error, until <b>max sites</b> (or earlier, once a new site isn't worth its bits at λ). Sites are never removed. Each site costs 128 bits: bpp = sites × 128 / (width × height).</span></h3>
         <div class="param">
-          <div class="row"><label>mode</label><select id="p-siteMode" aria-label="Site count mode"><option value="grow">grow (λ)</option><option value="fixed">fixed</option></select></div>
+          <div class="row"><label>mode</label><select id="p-siteMode" aria-label="Site count mode"><option value="grow">grow</option><option value="fixed">fixed</option></select></div>
           <p class="help"><span class="unit">choice</span></p>
-          <div class="tip" role="tooltip"><b>grow</b>: the count is decided by λ, between <b>start sites</b> and <b>max sites</b>. <b>fixed</b>: the count is <b>sites</b>. Only the fields for the chosen mode are shown.</div>
+          <div class="tip" role="tooltip"><b>grow</b>: start sites → max sites, one site per <b>add every</b> iterations. <b>fixed</b>: the count is <b>sites</b>. Only the fields for the chosen mode are shown.</div>
         </div>
         <div class="param" data-site-mode="fixed">
           <div class="row"><label>sites</label><input id="p-sites" type="number" /></div>
@@ -573,34 +573,29 @@
           <div class="tip" role="tooltip">The exact site count for the whole run, placed at iteration 0 by the default edge-based init.</div>
         </div>
         <div class="param" data-site-mode="grow">
-          <div class="row"><label>λ</label><input id="p-growLambda" type="number" step="10" min="0" /></div>
+          <div class="row"><label>start sites</label><input id="p-growInitSites" type="number" min="1" /></div>
+          <p class="help"><span class="unit">sites</span></p>
+          <div class="tip" role="tooltip">Count at iteration 0, placed by the default edge-based init. 1 works. Growth only adds, so this is also the minimum.</div>
+        </div>
+        <div class="param" data-site-mode="grow">
+          <div class="row"><label>add every</label><input id="p-growEvery" type="number" min="1" /></div>
+          <p class="help"><span class="unit">iterations per site</span></p>
+          <div class="tip" role="tooltip">Every this many iterations, add exactly one site at the best place (the block where one site would remove the most error). So site n arrives at iteration (n − start sites) × this, e.g. 1 → 64 sites with 5 finishes adding at iteration 315. Larger gives each site more time to settle before the next one is placed.</div>
+        </div>
+        <div class="param" data-site-mode="grow">
+          <div class="row"><label>max sites</label><input id="p-growMaxSites" type="number" min="1" /></div>
+          <p class="help"><span class="unit">sites</span></p>
+          <div class="tip" role="tooltip">Growth stops when the count reaches this; the rest of the run refines the sites it has. Make the run longer than (max − start) × <b>add every</b> iterations to leave time for that.</div>
+        </div>
+        <div class="param" data-site-mode="grow">
+          <div class="row"><label>λ (stop)</label><input id="p-growLambda" type="number" step="10" min="0" /></div>
           <p class="help"><span class="unit">squared error per bit: 8-bit levels² (summed over R, G, B and pixels) per bit</span></p>
-          <div class="tip" role="tooltip">One site costs 128 bits, so a new site must remove more than λ × 128 levels² of error. Example: λ = 400 → 51,200 levels², e.g. 100 pixels each off by about 13 levels in all three channels. <b>Higher λ → fewer sites, lower bpp, lower PSNR.</b> On Kodak, 1600 gave about 1–4k sites, 400 about 4–9k, 100 about 9–30k. Must be above 0.</div>
-        </div>
-        <div class="param" data-site-mode="grow">
-          <div class="row"><label>start sites</label><input id="p-growInitSites" type="number" /></div>
-          <p class="help"><span class="unit">sites</span></p>
-          <div class="tip" role="tooltip">Count at iteration 0, placed by the default edge-based init. Growth only adds, so this is also the minimum. 256 beat 16 in tests (tiny starts waste the first checks).</div>
-        </div>
-        <div class="param" data-site-mode="grow">
-          <div class="row"><label>max sites</label><input id="p-growMaxSites" type="number" /></div>
-          <p class="help"><span class="unit">sites</span></p>
-          <div class="tip" role="tooltip">Hard ceiling on the count (it also sizes GPU memory). It should not normally be reached: if growth hits it, the log says so and the status bar marks the count with “cap”, because from then on the cap, not λ, decides the count. Raise it or λ.</div>
-        </div>
-        <div class="param" data-site-mode="grow">
-          <div class="row"><label>every iters</label><input id="p-growEvery" type="number" /></div>
-          <p class="help"><span class="unit">iterations between growth checks</span></p>
-          <div class="tip" role="tooltip">Each check adds at most one site per site-spacing cell, so the count at most about doubles per check. Longer gaps let the fit settle and end with fewer sites; 10 gave the best quality per site.</div>
-        </div>
-        <div class="param" data-site-mode="grow">
-          <div class="row"><label>end iter</label><input id="p-growEndIter" type="number" placeholder="60% of iters" /></div>
-          <p class="help"><span class="unit">iteration number (blank = 60% of the run)</span></p>
-          <div class="tip" role="tooltip">No sites are added from this iteration on; the rest of the run refines the sites it has. Growth usually stops on its own well before.</div>
+          <div class="tip" role="tooltip">Early stop: growth ends before <b>max sites</b> once the best new site would remove less than λ × 128 levels² of error (a site costs 128 bits). Example: λ = 400 → 51,200 levels², e.g. 100 pixels each off by about 13 levels in all three channels. Higher λ stops sooner. 0 = never stop early (any site that helps at all is added). The log says which limit ended growth.</div>
         </div>
         <div class="param" data-site-mode="grow">
           <div class="row"><label>blur × spacing</label><input id="p-growBlur" type="number" step="0.05" /></div>
           <p class="help"><span class="unit">multiple of the site spacing (unitless); σ in px = this × √(mask pixels / sites)</span></p>
-          <div class="tip" role="tooltip">While growing, train against the image blurred with that Gaussian σ (e.g. 0.375 × 20 px spacing = 7.5 px). The blur shrinks as sites are added and stops at <b>end iter</b>. 0 = off (recommended): it cost 0.5–2 dB in tests, since sites draw edges far finer than their spacing.</div>
+          <div class="tip" role="tooltip">While growing, train against the image blurred with that Gaussian σ (e.g. 0.375 × 20 px spacing = 7.5 px). The blur shrinks as sites are added and switches off when growth ends. 0 = off (recommended): it cost 0.5–2 dB in tests, since sites draw edges far finer than their spacing.</div>
         </div>
 
         <h3>Logging</h3>
@@ -661,6 +656,11 @@
 
         <h3 class="has-tip" tabindex="0">Learning rates<span class="tip" role="tooltip">Adam step sizes. Adam moves a parameter by about its rate per iteration, in that parameter's units, so each unit below is "per iteration". Rate used = base below × <b>LR mult</b> × the warmup/decay schedule (e.g. pos 0.025 × 3 = up to 0.075 px per iteration).</span></h3>
         <div class="param">
+          <div class="row"><label>schedule</label><select id="p-lrSchedule" aria-label="LR schedule"></select></div>
+          <p class="help"><span class="unit">choice</span></p>
+          <div class="tip" role="tooltip">How the learning rate changes over the run, after the warmup. <b>warmup + cosine</b>: falls to 0 on a cosine over <b>decay iters</b>. <b>fixed</b>: stays at full for the rest of the run. <b>decay after growth</b>: stays at full while sites are being added, then falls to 0 on a cosine by the end of the run, so late sites aren't starved and the finished set still gets a cool-down (with fixed site count it equals warmup + cosine).</div>
+        </div>
+        <div class="param">
           <div class="row"><label>warmup iters</label><input id="p-warmupIters" type="number" /></div>
           <p class="help"><span class="unit">iterations</span></p>
           <div class="tip" role="tooltip">Every learning rate ramps linearly from 0 to full over this many iterations. Run length = warmup + decay.</div>
@@ -668,7 +668,7 @@
         <div class="param">
           <div class="row"><label>decay iters</label><input id="p-decayIters" type="number" /></div>
           <p class="help"><span class="unit">iterations</span></p>
-          <div class="tip" role="tooltip">After warmup, the learning rates fall to 0 on a cosine curve over this many iterations.</div>
+          <div class="tip" role="tooltip">Iterations after warmup. Run length = warmup + decay, whatever the schedule; with <b>warmup + cosine</b> the rates fall to 0 over exactly these iterations.</div>
         </div>
         <div class="param">
           <div class="row"><label>LR mult</label><input id="p-lrMult" type="number" step="0.1" /></div>
@@ -731,6 +731,6 @@
       </section>
     </div>
 
-    <script type="module" src="train.js?v=site-mode-20261017"></script>
+    <script type="module" src="train.js?v=greedy-20261017"></script>
   </body>
 </html>

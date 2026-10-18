@@ -5,7 +5,7 @@
 
 import { loadShaders, tileSlotsForLimit } from "../trainer/shader_loader.js?v=shared-wgsl-20261017";
 import { requestTrainingDevice } from "../trainer/device.js?v=shared-wgsl-20261017";
-import { Trainer, buildArgs, GRAD_GROUPS, lrSchedule } from "../trainer/trainer.js?v=site-mode-20261017";
+import { Trainer, buildArgs, GRAD_GROUPS, lrSchedule, LR_SCHEDULES } from "../trainer/trainer.js?v=greedy-20261017";
 import { loadImageToFloat32, loadMaskRgba32Float, whiteMaskRgba32Float } from "../trainer/textures.js?v=shared-wgsl-20261017";
 import { loadSitesFromFile, serializeSitesTxt, triggerDownload, floatImageToRgba8, computeBpp, BITS_PER_SITE } from "../trainer/io.js?v=shared-wgsl-20261017";
 import { SITE_FLOATS } from "../trainer/params.js?v=shared-wgsl-20261017";
@@ -38,6 +38,7 @@ const UI_FIELDS = [
   ["candHilbertWindow", "p-candHilbertWindow"],
   ["candHilbertProbes", "p-candHilbertProbes"],
   ["lrMult", "p-lrMult"],
+  ["lrSchedule", "p-lrSchedule"],
   ["lrPosBase", "p-lrPosBase"],
   ["lrTauBase", "p-lrTauBase"],
   ["lrRadiusBase", "p-lrRadiusBase"],
@@ -50,7 +51,6 @@ const UI_FIELDS = [
   ["growInitSites", "p-growInitSites"],
   ["growMaxSites", "p-growMaxSites"],
   ["growEvery", "p-growEvery"],
-  ["growEndIter", "p-growEndIter", { blankDefault: true }], // blank = 60% of iters
   ["growBlur", "p-growBlur"],
 ];
 
@@ -72,14 +72,13 @@ const state = {
   lastSiteCount: 0,
   lastPsnr: null,        // persists between log ticks so preview updates don't blank the PSNR
   lastLrScale: null,     // schedule × LR mult at the last log tick
-  growCapped: false,     // the current run's growth hit max sites (marked in the status bar)
   lastActiveSites: 0,    // active sites at the last log tick (site-spacing reference lines)
   psnrHistory: [],       // [{ it, psnr }] from log ticks, plotted in the PSNR card
   psnrIters: 0,
   bppRuns: [],           // [{ sites, bpp, colorSpace, points: [{ it, psnr }] }] per run on this target; last is current
   gradHistory: [],       // [{ it, stats }] per-param |grad| mean/max from log ticks
   lrHistory: [],         // [{ it, lr }] LR multiplier (schedule × LR mult) from log ticks
-  lrPlan: null,          // { warmupIters, decayIters, lrMult } of the current run
+  lrPlan: null,          // { warmupIters, decayIters, lrMult, kind, growDoneIter } of the current run
   bandHistory: [],       // [{ it, snr: [dB per band] }] from every render
   targetAnalysis: null,  // viewer-side target luma / pyramid / spectrum (see targetAnalysis())
   spectra: null,         // spectra of the latest render (see currentSpectra())
@@ -133,6 +132,8 @@ function appendLog(line) {
 function applyConfigToForm(config) {
   const spaceSelect = document.getElementById("p-colorSpace");
   spaceSelect.replaceChildren(...Object.entries(COLOR_SPACES).map(([key, space]) => new Option(space.label, key)));
+  document.getElementById("p-lrSchedule")
+    .replaceChildren(...Object.entries(LR_SCHEDULES).map(([key, label]) => new Option(label, key)));
   const defaults = buildArgs(config, {});
   for (const [key, elId, opts] of UI_FIELDS) {
     const el = document.getElementById(elId);
@@ -1207,7 +1208,7 @@ function drawLrPlot(view) {
     const total = plan.warmupIters + plan.decayIters;
     for (let i = 0; i <= n; i += 1) {
       const it = Math.round((i / n) * Math.max(0, total - 1));
-      planned.push([it, plan.lrMult * lrSchedule(it, plan.warmupIters, plan.decayIters)]);
+      planned.push([it, plan.lrMult * lrSchedule(it, plan.warmupIters, plan.decayIters, plan.kind, plan.growDoneIter)]);
     }
   }
   let hi = 0;
@@ -1875,9 +1876,15 @@ async function startTraining() {
   state.gradHistory = [];
   state.bandHistory = [];
   state.lrHistory = [];
-  state.lrPlan = { warmupIters: args.warmupIters, decayIters: args.decayIters, lrMult: args.lrMult };
+  // Growth adds one site per growEvery iterations, so its end (where
+  // "decay after growth" starts decaying) is predictable unless λ stops it
+  // early; the plan is corrected once the trainer reports the real end.
+  const startCount = init ? init.count : args.growInitSites;
+  const plannedGrowEnd = args.siteMode !== "grow" ? 0
+    : Math.min(args.growEndIter, Math.max(0, args.growMaxSites - startCount) * args.growEvery);
+  state.lrPlan = { warmupIters: args.warmupIters, decayIters: args.decayIters, lrMult: args.lrMult,
+                   kind: args.lrSchedule, growDoneIter: plannedGrowEnd };
   state.lastActiveSites = initSiteCount;
-  state.growCapped = false;
   state.bppRuns.push({
     sites: initSiteCount, bpp: computeBpp(initSiteCount, width, height), colorSpace: args.colorSpace, points: [],
   });
@@ -1885,10 +1892,10 @@ async function startTraining() {
   await refreshViews("run");
 
   const sitesDesc = args.siteMode === "grow"
-    ? `grow ${init ? init.count : Math.min(args.growInitSites, args.growMaxSites)} → ≤${Math.max(args.growMaxSites, init ? init.count : 0)} ` +
-      `(λ ${args.growLambda}, until iter ${args.growEndIter})`
+    ? `grow ${startCount} → ${Math.max(args.growMaxSites, startCount)}, +1 every ${args.growEvery} iters ` +
+      `(λ stop ${args.growLambda})`
     : `${initSiteCount} fixed`;
-  appendLog(`Target: ${width}×${height} | sites: ${sitesDesc} | iters: ${args.warmupIters} warmup + ${args.decayIters} decay | lr ×${args.lrMult} | color: ${COLOR_SPACES[args.colorSpace].label} | refresh: ${args.logFreq}`);
+  appendLog(`Target: ${width}×${height} | sites: ${sitesDesc} | iters: ${args.warmupIters} warmup + ${args.decayIters} decay | lr ×${args.lrMult} ${LR_SCHEDULES[args.lrSchedule]} | color: ${COLOR_SPACES[args.colorSpace].label} | refresh: ${args.logFreq}`);
   updateProgress(0, args.iters, "Preparing…");
 
   const trainer = new Trainer(state.device, state.shaders, args, {
@@ -1906,7 +1913,7 @@ async function startTraining() {
         state.lastPsnr = info.psnr;
         state.lastLrScale = info.lrScale;
         state.lastActiveSites = info.activeSites;
-        state.growCapped = Boolean(info.growCapped);
+        if (info.growDoneIter != null && state.lrPlan) state.lrPlan.growDoneIter = info.growDoneIter;
         if (Number.isFinite(info.psnr)) {
           state.psnrHistory.push({ it: info.it, psnr: info.psnr });
           const run = state.bppRuns[state.bppRuns.length - 1];
@@ -2002,9 +2009,7 @@ function renderMetrics(info) {
     `<span>iter <strong>${info.it + 1}/${info.iters}</strong></span>` +
     `<span>PSNR <strong>${psnrText}</strong></span>` +
     (state.lastLrScale != null ? `<span>lr <strong>×${state.lastLrScale.toPrecision(3)}</strong></span>` : "") +
-    `<span>active <strong>${info.activeSites}</strong>/${info.totalSites}` +
-      (state.growCapped ? ` <strong title="Growth hit max sites: the cap, not λ, set the count" style="color:var(--accent)">cap</strong>` : "") +
-      `</span>` +
+    `<span>active <strong>${info.activeSites}</strong>/${info.totalSites}</span>` +
     `<span><strong>${info.itsPerSec.toFixed(1)}</strong> it/s</span>`;
 }
 
