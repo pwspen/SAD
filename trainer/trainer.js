@@ -287,6 +287,15 @@ export function buildArgs(config, overrides = {}) {
     // out), "ward" by the rise in error with each cell at its mean color.
     mergeCriterion: String(pick("mergeCriterion", "MERGE_CRITERION", "neighbor")),
     mergeTopK: Math.max(1, Math.round(Number(pick("mergeTopK", "MERGE_TOP_K", 3)))),
+    // Turnover (_turnover): every turnoverEvery iterations while the schedule
+    // holds the count (startSites = endSites with a linear or exponential
+    // schedule, or after the schedule ends), merge this fraction of the sites
+    // (at least one) and split as many cells back, until turnoverEnd × iters.
+    // 0 = off. Each step costs a GPU sync and a candidate rebuild (~0.1 s at
+    // 256 px), so fewer, larger steps are cheaper.
+    turnover: Math.min(0.5, Math.max(0, Number(pick("turnover", "TURNOVER", 0)))),
+    turnoverEvery: Math.max(1, Math.floor(Number(pick("turnoverEvery", "TURNOVER_EVERY", 20)))),
+    turnoverEnd: Math.min(1, Math.max(0, Number(pick("turnoverEnd", "TURNOVER_END", 0.8)))),
     // Histogram layer (LAYER_MODES): a flat site behind all others, colored by
     // the peak of the target's color histogram, with a learned depth.
     layer: String(pick("layer", "LAYER", "off")),
@@ -391,8 +400,11 @@ export class Trainer {
     this.layerIndex = useLayer ? baseSiteCount : null;
     if (useLayer) initSiteCount += 1;
     this.countArgs = useLayer ? { ...args, endSites: Math.max(1, args.endSites - 1) } : args;
-    this.usesGrow = countVaries(this.countArgs, baseSiteCount);
+    this.usesGrow = countVaries(this.countArgs, baseSiteCount) || args.turnover > 0;
     this.bufferCapacity = (this.usesGrow ? countCapacity(this.countArgs, baseSiteCount) : baseSiteCount) + (useLayer ? 1 : 0);
+    // Turnover's merges leave holes and its splits append, so leave room for
+    // 8 steps between compactions (_growTo).
+    if (args.turnover > 0) this.bufferCapacity += 8 * Math.max(1, Math.ceil(args.turnover * this.bufferCapacity));
     this.siteCount = initSiteCount;
 
     // Buffers
@@ -485,6 +497,7 @@ export class Trainer {
     this.growDoneIter = this.usesGrow ? null : 0;
     this.growStop = null;
     this.growStartCount = baseSiteCount; // where the count schedule starts (ordinary sites)
+    this.heldCount = null; // active sites turnover keeps once the schedule ends
 
     this.trainStartMs = performance.now();
     this.bestPsnr = 0;
@@ -720,6 +733,7 @@ export class Trainer {
 
   _endGrowth(it, reason) {
     this.growDoneIter = it;
+    this.heldCount = this.activeEstimate;
     this.growStop = reason;
     this._log(`Growth done at iter ${it}: ${this.activeEstimate} sites (${reason}).`);
   }
@@ -892,31 +906,59 @@ export class Trainer {
   // until the count is down to endSites: a sawtooth with a big amplitude and
   // a short merge phase can't get back down in time (a "ward" step merges at most
   // half the sites), and stopping there kept up to 60% more sites than asked.
+  // Turnover steps (args.turnoverEvery) where the schedule holds the count,
+  // and all of them after it ends, turn sites over (_turnover).
   async _countStep(it) {
     const args = this.args;
     if (this.growDoneIter !== null) {
+      if (this._turnsOver(it)) {
+        await this._turnover(it, this.heldCount);
+        return;
+      }
       // One more measurement for the final batch, a growth step after it.
       if (this.growPending && it >= this.growPending.it + args.growEvery) {
         this._reportGrowthGain(it, await this._siteStats());
       }
       return;
     }
-    if (it === 0 || it % args.growEvery !== 0) return;
+    const step = it > 0 && it % args.growEvery === 0;
+    if (!step && !this._turnsOver(it)) return;
     // In active sites, the layer included.
     const layers = this.layerIndex === null ? 0 : 1;
     const target = layers + Math.max(1, Math.round(countTarget(this.countArgs, it, this.growStartCount)));
     let merged = 0;
-    if (target < this.activeEstimate) merged = await this._mergeTo(it, target);
-    else if (target > this.activeEstimate) await this._growTo(it, target);
+    if (step && target < this.activeEstimate) merged = await this._mergeTo(it, target);
+    else if (step && target > this.activeEstimate) await this._growTo(it, target);
+    else if (target === this.activeEstimate && this._turnsOver(it)) await this._turnover(it, target);
     const catchingUp = this.activeEstimate > target && merged > 0;
-    if (this.growDoneIter === null && it >= countHorizon(args) && !catchingUp) {
+    if (step && it >= countHorizon(args) && !catchingUp) {
       this._endGrowth(it, `count schedule done (${args.countSchedule}, ${this.growStartCount} → ${args.endSites})`);
     }
   }
 
+  // Whether iteration `it` is a turnover step.
+  _turnsOver(it) {
+    const args = this.args;
+    return args.turnover > 0 && it > 0 && it % args.turnoverEvery === 0 && it < args.turnoverEnd * args.iters;
+  }
+
+  // Turnover at a held count: merge args.turnover of the ordinary sites (at
+  // least one; _mergeTo, args.mergeCriterion), then split cells (_growTo,
+  // any positive gain, λ ignored) back up to `target` active sites, so sites
+  // leave where they're redundant and reappear where the error is. A step
+  // that splits fewer than it merged leaves the rest to the next one.
+  async _turnover(it, target) {
+    const args = this.args;
+    const layers = this.layerIndex === null ? 0 : 1;
+    const k = Math.max(1, Math.round(args.turnover * (this.activeEstimate - layers)));
+    if (this.activeEstimate - k > layers) await this._mergeTo(it, this.activeEstimate - k);
+    if (target > this.activeEstimate) await this._growTo(it, target, { turnover: true });
+  }
+
   // Count step up: split cells until `target` sites are active, unless λ
-  // ends the schedule first.
-  async _growTo(it, target) {
+  // ends the schedule first. With `turnover`, any positive gain qualifies and
+  // finding none doesn't end the schedule.
+  async _growTo(it, target, { turnover = false } = {}) {
     const args = this.args;
     // Merged-away sites leave inactive slots; make room at the end first.
     if (this.siteCount + (target - this.activeEstimate) > this.bufferCapacity) await this._compactSites();
@@ -928,8 +970,9 @@ export class Trainer {
 
     const device = this.device;
     const queue = device.queue;
-    const threshold = args.growLambda * BITS_PER_SITE;
+    const threshold = turnover ? 0 : args.growLambda * BITS_PER_SITE;
     const batch = await this._splitBatch(it, stats, n0, want, threshold);
+    if (!batch && turnover) return;
     if (!batch) {
       this._endGrowth(it, `λ (stop): no split would remove more than λ × ${BITS_PER_SITE} = ` +
                           `${fmtLambda(threshold)} levels²`);
@@ -955,7 +998,7 @@ export class Trainer {
     this.cands.encodeAdded(seedEnc, this.sitesBuf, n0, n1);
     queue.submit([seedEnc.finish()]);
 
-    this._log(`Grow @${it}: +${k} → ${this.activeEstimate} sites` +
+    this._log(`${turnover ? "Turnover" : "Grow"} @${it}: +${k} → ${this.activeEstimate} sites` +
               (k < want ? ` (${want} wanted; the rest under λ` +
                 (want > this.activeEstimate - k ? " or no cell left to split)" : ")") : "") +
               ` | best split ${fmtLambda(batch.best / BITS_PER_SITE)} levels²/bit`);
