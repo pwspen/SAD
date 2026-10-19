@@ -379,6 +379,12 @@ const VIEWS = {
   residual:   { label: "Residual |recon − target|", kind: "image", source: "derived", blank: "#000004",
                 on: ["render"], draw: drawResidual,
                 note: "Mean |recon − target| over RGB on a fixed 0–0.25 scale." },
+  errEma:     { label: "Persistent error |EWMA(recon − target)|", kind: "image", source: "train", blank: "#000004",
+                on: ["render"], draw: drawErrEma,
+                note: "The trainer's per-pixel running average of the signed error (decay = persist decay), as mean " +
+                      "|ē| over RGB on the residual card's 0–0.25 scale. Error that keeps its sign stays bright; " +
+                      "error that flips averages to dark. With persist weight > 0 this is what weights the loss. " +
+                      "Read back from the GPU on each render while the card is shown." },
   importance: { label: "Importance (Laplacian bands)", kind: "image", source: "derived", on: ["target"], draw: drawImportance,
                 note: `Luma Laplacian band energy, mask · (ε + √Σ β_k L_k²)^γ with β = [${IMPORTANCE.bandWeights.join(", ")}]. ` +
                       "Not used by the optimizer." },
@@ -472,8 +478,8 @@ const LAYOUTS = {
   },
   images: {
     label: "Images 2×2",
-    areas: `"target   preview"
-            "residual importance"`,
+    areas: `"target   preview importance"
+            "residual errEma  ."`,
   },
   sites: {
     label: "Sites & tau",
@@ -2382,6 +2388,32 @@ function drawResidual() {
   const scale = 255 / (3 * RESIDUAL_MAX);
   for (let p = 0, i = 0; p < width * height; p += 1, i += 4) {
     const err = Math.abs(a[i] - b[i]) + Math.abs(a[i + 1] - b[i + 1]) + Math.abs(a[i + 2] - b[i + 2]);
+    const idx = Math.min(255, Math.round(err * scale)) * 3;
+    out[i] = RESIDUAL_LUT[idx];
+    out[i + 1] = RESIDUAL_LUT[idx + 1];
+    out[i + 2] = RESIDUAL_LUT[idx + 2];
+    out[i + 3] = 255;
+  }
+  putImage(canvas, out, width, height);
+}
+
+// The trainer's error EWMA (Trainer.readErrEma), drawn like the residual.
+async function drawErrEma() {
+  const render = state.lastRender;
+  if (!VIEWS.errEma.canvas || !state.trainer || !renderMatchesTarget(render)) return;
+  let ema;
+  try {
+    ema = await state.trainer.readErrEma();
+  } catch (err) {
+    return; // the trainer was torn down mid-readback
+  }
+  const canvas = VIEWS.errEma.canvas;
+  const { width, height } = render;
+  if (!canvas || !ema || ema.length !== width * height * 4) return;
+  const out = new Uint8ClampedArray(width * height * 4);
+  const scale = 255 / (3 * RESIDUAL_MAX);
+  for (let i = 0; i < out.length; i += 4) {
+    const err = Math.abs(ema[i]) + Math.abs(ema[i + 1]) + Math.abs(ema[i + 2]);
     const idx = Math.min(255, Math.round(err * scale)) * 3;
     out[i] = RESIDUAL_LUT[idx];
     out[i + 1] = RESIDUAL_LUT[idx + 1];

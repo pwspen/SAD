@@ -362,7 +362,7 @@ export class Trainer {
     this.errInvCount = 1 / Math.max(1, maskCount);
     const ema0 = new Float32Array(width * height * 4);
     for (let i = 3; i < ema0.length; i += 4) ema0[i] = 1;
-    this.errEmaBuf = device.createBuffer({ size: ema0.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    this.errEmaBuf = device.createBuffer({ size: ema0.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
     device.queue.writeBuffer(this.errEmaBuf, 0, ema0);
     this.errEmaSumBuf = device.createBuffer({ size: 8, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
     this.errSlot = 0;
@@ -1060,6 +1060,23 @@ export class Trainer {
     }
     queue.submit([encoder.finish()]);
     return await readRgba32FloatTexture(device, this.renderTex, this.width, this.height);
+  }
+
+  // The persistent-error state (gradients_tiled.wgsl) as of the last
+  // gradient pass: Float32Array of W·H·4, per pixel the EWMA ē of the signed
+  // error (pred − target, RGB) and the loss weight w. Null once destroyed.
+  async readErrEma() {
+    if (this._destroyed) return null;
+    const bytes = this.width * this.height * 16;
+    const staging = this.device.createBuffer({ size: bytes, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    const encoder = this.device.createCommandEncoder();
+    encoder.copyBufferToBuffer(this.errEmaBuf, 0, staging, 0, bytes);
+    this.device.queue.submit([encoder.finish()]);
+    await staging.mapAsync(GPUMapMode.READ);
+    const out = new Float32Array(staging.getMappedRange()).slice();
+    staging.unmap();
+    staging.destroy();
+    return out;
   }
 
   _taskHeatmapParamsBuffer() {
