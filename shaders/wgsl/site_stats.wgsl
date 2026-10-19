@@ -3,11 +3,10 @@
 // does, then
 //   - credit the pixel to its owner (largest weight) with moments of the fit
 //     target over the owner's pixels, in offsets d = pixel - owner position
-//     (so sums stay small): channels 0..16. A pinned owner (sitePin, e.g. the
-//     histogram layer) can't split, so its pixels go to the best unpinned
-//     candidate instead, weighted by how far the render is from exact there
-//     (info_update's u: 0 within 1/4 bin, 1 from 1/2), so only what the layer
-//     doesn't explain counts;
+//     (so sums stay small): channels 0..16. The histogram layer (globalCand)
+//     can't split, so its pixels go to the best other candidate instead,
+//     weighted by how far the render is from exact there (0 within 1/4 of an
+//     8-bit level, 1 from 1/2), so only what the layer doesn't explain counts;
 //   - credit every candidate with the error increase if it were removed and
 //     the others renormalized (the "removal delta"): channel 17.
 // Output `stats[site * 18 + ch]` (f32 bits, summed with a CAS loop):
@@ -32,10 +31,9 @@ struct SiteStatsParams {
 @group(0) @binding(1) var<uniform> params : SiteStatsParams;
 @group(0) @binding(2) var inCand0 : texture_2d<u32>;
 @group(0) @binding(3) var inCand1 : texture_2d<u32>;
-@group(0) @binding(4) var fitTex : texture_2d<f32>;
-@group(0) @binding(5) var<storage, read> lossWeight : array<f32>; // mask or info weights (W*H)
+@group(0) @binding(4) var targetTex : texture_2d<f32>;
+@group(0) @binding(5) var<storage, read> mask : array<f32>; // f32 per pixel (W*H)
 @group(0) @binding(6) var<storage, read_write> stats : array<atomic<u32>>;
-@group(0) @binding(7) var<storage, read> sitePin : array<u32>;
 
 const STATS_CH : u32 = 18u;
 const ST_SLOTS : u32 = 128u;
@@ -90,10 +88,10 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>,
   for (var i = local_idx; i < ST_SLOTS * STATS_CH; i = i + 256u) { atomicStore(&st_vals[i], 0u); }
   workgroupBarrier();
 
-  let dims = textureDimensions(fitTex);
+  let dims = textureDimensions(targetTex);
   let in_bounds = gid.x < dims.x && gid.y < dims.y;
   var m = 0.0;
-  if (in_bounds) { m = lossWeight[gid.y * dims.x + gid.x]; }
+  if (in_bounds) { m = mask[gid.y * dims.x + gid.x]; }
 
   if (in_bounds && m > 0.0) {
     let uv = vec2<f32>(f32(gid.x), f32(gid.y));
@@ -121,17 +119,18 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>,
         pred = pred + w[i] * cols[i];
         if (w[i] > w[owner]) { owner = i; }
       }
-      let t = textureLoad(fitTex, vec2<i32>(gid.xy), 0).rgb;
+      let t = textureLoad(targetTex, vec2<i32>(gid.xy), 0).rgb;
       let et = t - pred;
       let err = dot(et, et);
 
-      // Owner moments (a pinned owner hands the pixel to the best unpinned
-      // candidate, weighted by the render's error in bins beyond half a bin).
+      // Owner moments (the layer, which can't split, hands the pixel to the
+      // best other candidate, weighted by the render's error in bins beyond a
+      // quarter bin).
       var oid = ids[owner];
-      if (sitePin[oid] != 0u) {
+      if (oid == params.globalCand) {
         var alt = NCAND;
         for (var i = 0u; i < NCAND; i = i + 1u) {
-          if (w[i] > 0.0 && sitePin[ids[i]] == 0u && (alt == NCAND || w[i] > w[alt])) { alt = i; }
+          if (w[i] > 0.0 && ids[i] != params.globalCand && (alt == NCAND || w[i] > w[alt])) { alt = i; }
         }
         let ed = abs(clamp(pred, vec3<f32>(0.0), vec3<f32>(1.0)) - t) * 255.0;
         m = m * clamp((max(ed.x, max(ed.y, ed.z)) - 0.25) * 4.0, 0.0, 1.0);

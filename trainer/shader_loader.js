@@ -38,15 +38,8 @@ const SHADER_FILES = [
   "adam",
   "clear_buffer_u32",
   "clear_buffer_i32",
-  "tau_extract",
-  "tau_diffuse",
-  "tau_writeback",
-  "hilbert",
-  "radix_sort",
   "render_tau_heatmap",
-  "grow_blur",
   "site_stats",
-  "info_update",
 ];
 
 let _cache = null;
@@ -94,15 +87,8 @@ export async function loadShaders({ tileSlots = 128, readText = fetchText } = {}
     ADAM: out.adam,
     CLEAR_BUFFER_U32: out.clear_buffer_u32,
     CLEAR_BUFFER_I32: out.clear_buffer_i32,
-    TAU_EXTRACT: out.tau_extract,
-    TAU_DIFFUSE: out.tau_diffuse,
-    TAU_WRITEBACK: out.tau_writeback,
-    HILBERT: out.hilbert,
-    RADIX_SORT: out.radix_sort,
     RENDER_TAU_HEATMAP: out.render_tau_heatmap,
-    GROW_BLUR: out.grow_blur,
     SITE_STATS: out.site_stats,
-    INFO_UPDATE: out.info_update,
     tileSlots,
   };
   return _cache;

@@ -1,15 +1,12 @@
-// Merging neighbouring sites (args.pruneEvery), scored by description length.
+// Merging neighbouring sites, for a count schedule going down (trainer.js
+// _mergeTo).
 //
 // Each pixel goes to its owner (the candidate with the largest logit, as in
 // site_stats.wgsl) and its runner-up; a pair of sites is adjacent where one
 // owns pixels the other is runner-up on. With each cell at its mean target
 // color, merging cells i and j (nᵢ, nⱼ pixels, means μᵢ, μⱼ) raises the
-// squared error by Ward's criterion nᵢnⱼ/(nᵢ + nⱼ)·‖μᵢ − μⱼ‖². A merge
-// saves BITS_PER_SITE bits and costs (S/2)·log2(1 + ΔE/E) bits of residual
-// (Gaussian at 8-bit precision, E the summed squared error of all cells, S
-// samples; the model of trainer.js's cellMdlBits), so it pays if
-// ΔE < E·(2^(2B/S) − 1). Merges are taken cheapest first, each site in at most
-// one per step, with E growing by each accepted ΔE.
+// squared error by Ward's criterion nᵢnⱼ/(nᵢ + nⱼ)·‖μᵢ − μⱼ‖². Merges are
+// taken cheapest first, each site in at most one per step.
 //
 // The merged site is the pixel-count-weighted average of the pair's
 // parameters (position, log τ, radius, RGB color, log anisotropy), and of
@@ -19,7 +16,7 @@
 import { SITE_FLOATS } from "./params.js?v=20261019";
 
 // Logit of the site at sites[b..b+SITE_FLOATS) at pixel (x, y): the CPU copy
-// of site_logit in sad_shared.wgsl (merge.js and insert.js use it).
+// of site_logit in sad_shared.wgsl.
 export function siteLogit(sites, b, x, y, invScale) {
   const dx = x - sites[b], dy = y - sites[b + 1];
   const dirX = sites[b + 7], dirY = sites[b + 8];
@@ -35,10 +32,10 @@ export function siteLogit(sites, b, x, y, invScale) {
 // `global` (the site every pixel blends, as cand_ids in sad_shared.wgsl; -1 =
 // none). Merging leaves `global` out: a layer behind everything would be the
 // runner-up almost everywhere and hide which sites are neighbours. `sites` holds RGB colors; `cand` is 8 u32 site ids per candidate pixel.
-// Returns { count, sum (RGB), sumSq (|t|², summed over RGB), pairs: Map of
+// Returns { count, sum (RGB), pairs: Map of
 // "i,j" (i < j) → pixels where one owns and the other is runner-up }.
 export function cellMoments({ width, height, sites, n, cand, candWidth, candHeight, target, mask, global = -1 }) {
-  const count = new Float64Array(n), sum = new Float64Array(n * 3), sumSq = new Float64Array(n);
+  const count = new Float64Array(n), sum = new Float64Array(n * 3);
   const pairs = new Map();
   const invScale = 1 / Math.max(width, height);
   for (let y = 0; y < height; y += 1) {
@@ -63,7 +60,6 @@ export function cellMoments({ width, height, sites, n, cand, candWidth, candHeig
       for (let c = 0; c < 3; c += 1) {
         const t = target[p * 4 + c];
         sum[best * 3 + c] += t;
-        sumSq[best] += t * t;
       }
       if (second >= 0) {
         const key = best < second ? `${best},${second}` : `${second},${best}`;
@@ -71,20 +67,7 @@ export function cellMoments({ width, height, sites, n, cand, candWidth, candHeig
       }
     }
   }
-  return { count, sum, sumSq, pairs };
-}
-
-// Summed squared error (0..1 colors, summed over RGB) of every cell at its
-// mean color.
-export function cellSse({ count, sum, sumSq }) {
-  let e = 0;
-  for (let i = 0; i < count.length; i += 1) {
-    if (!(count[i] > 0)) continue;
-    let s = sumSq[i];
-    for (let c = 0; c < 3; c += 1) s -= sum[i * 3 + c] ** 2 / count[i];
-    e += Math.max(0, s);
-  }
-  return e;
+  return { count, sum, pairs };
 }
 
 // Ward's criterion for merging cells i and j (0..1 colors, summed over RGB).
@@ -96,15 +79,11 @@ export function mergeCost({ count, sum }, i, j) {
   return (ni * nj) / (ni + nj) * d2;
 }
 
-// The merges that pay for themselves, cheapest first, each site at most once:
-// [{ keep, drop, cost }] with `keep` the larger cell. `samples` = masked
-// pixels × 3. With `count`, the `count` cheapest merges instead, paying or
-// not (a count schedule going down). Sites in `pinned` (a Set, e.g. the
-// histogram layer) never merge: what a layer would take over depends on its
-// depth, which Ward's criterion knows nothing about.
-export function pickMerges(moments, samples, bitsPerSite, { count = null, pinned = new Set() } = {}) {
-  const frac = Math.pow(2, (2 * bitsPerSite) / Math.max(1, samples)) - 1;
-  let err = cellSse(moments);
+// The `count` cheapest merges, each site at most once: [{ keep, drop, cost }]
+// with `keep` the larger cell. Sites in `pinned` (a Set, e.g. the histogram
+// layer) never merge: what a layer would take over depends on its depth,
+// which Ward's criterion knows nothing about.
+export function pickMerges(moments, count, pinned = new Set()) {
   const options = [];
   for (const key of moments.pairs.keys()) {
     const [i, j] = key.split(",").map(Number);
@@ -115,11 +94,10 @@ export function pickMerges(moments, samples, bitsPerSite, { count = null, pinned
   const used = new Set();
   const merges = [];
   for (const { i, j, cost } of options) {
-    if (count != null ? merges.length >= count : !(cost < err * frac)) break;
+    if (merges.length >= count) break;
     if (used.has(i) || used.has(j)) continue;
     used.add(i);
     used.add(j);
-    err += cost;
     const keep = moments.count[i] >= moments.count[j] ? i : j;
     merges.push({ keep, drop: keep === i ? j : i, cost });
   }

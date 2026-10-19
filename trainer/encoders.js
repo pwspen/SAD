@@ -105,7 +105,7 @@ export class CandidatesEncoder {
       Math.ceil(candWidth / 16), Math.ceil(candHeight / 16));
   }
   encodeUpdate(encoder, packedSitesBuffer, paramsBuf, cand0In, cand1In, cand0Out, cand1Out,
-                hilbertOrder, hilbertPos, candWidth, candHeight) {
+                candWidth, candHeight) {
     const entries = [
       { binding: 0, resource: { buffer: packedSitesBuffer } },
       { binding: 1, resource: { buffer: paramsBuf } },
@@ -113,8 +113,6 @@ export class CandidatesEncoder {
       { binding: 3, resource: getTextureView(this._views, cand1In) },
       { binding: 4, resource: getTextureView(this._views, cand0Out) },
       { binding: 5, resource: getTextureView(this._views, cand1Out) },
-      { binding: 6, resource: { buffer: hilbertOrder } },
-      { binding: 7, resource: { buffer: hilbertPos } },
     ];
     const layout = this.updatePipeline.getBindGroupLayout(0);
     const bg = getBindGroup(this.device, this._bgs, layout, entries);
@@ -197,9 +195,8 @@ export class GradientsEncoder {
     this._bgs = new Map();
   }
   // gradsBuffer is the consolidated interleaved atomic<i32> buffer of size
-  // capacity * 10; index with `idx * 10 + channel`. weightBuffer: per-pixel
-  // loss weight, f32 W*H (the mask, or info_update's weights).
-  encode(encoder, sitesBuffer, gradParams, cand0, cand1, targetTex, weightBuffer,
+  // capacity * 10; index with `idx * 10 + channel`. maskBuffer: f32 per pixel.
+  encode(encoder, sitesBuffer, gradParams, cand0, cand1, targetTex, maskBuffer,
          gradsBuffer, width, height) {
     const entries = [
       { binding: 0, resource: { buffer: sitesBuffer } },
@@ -208,7 +205,7 @@ export class GradientsEncoder {
       { binding: 3, resource: getTextureView(this._views, cand1) },
       { binding: 4, resource: getTextureView(this._views, targetTex) },
       { binding: 5, resource: { buffer: gradsBuffer } },
-      { binding: 6, resource: { buffer: weightBuffer } },
+      { binding: 6, resource: { buffer: maskBuffer } },
     ];
     const layout = this.pipeline.getBindGroupLayout(0);
     const bg = getBindGroup(this.device, this._bgs, layout, entries);
@@ -223,68 +220,16 @@ export class AdamEncoder {
     this.pipeline = makePipeline(device, shaders.ADAM);
     this._bgs = new Map();
   }
-  // sitePin / siteLive: u32 per site (see adam.wgsl).
-  encode(encoder, sitesBuffer, adamBuffer, gradsBuffer, adamParams, siteCount, sitePin, siteLive) {
+  encode(encoder, sitesBuffer, adamBuffer, gradsBuffer, adamParams, siteCount) {
     const entries = [
       { binding: 0, resource: { buffer: sitesBuffer } },
       { binding: 1, resource: { buffer: adamBuffer } },
       { binding: 2, resource: { buffer: gradsBuffer } },
       { binding: 3, resource: { buffer: adamParams } },
-      { binding: 4, resource: { buffer: sitePin } },
-      { binding: 5, resource: { buffer: siteLive } },
     ];
     const layout = this.pipeline.getBindGroupLayout(0);
     const bg = getBindGroup(this.device, this._bgs, layout, entries);
     dispatch1D(encoder, this.pipeline, bg, Math.ceil(siteCount / 256));
-  }
-}
-
-export class TauEncoder {
-  constructor(device, shaders) {
-    this.device = device;
-    this.extractPipeline = makePipeline(device, shaders.TAU_EXTRACT);
-    this.diffusePipeline = makePipeline(device, shaders.TAU_DIFFUSE);
-    this.writebackPipeline = makePipeline(device, shaders.TAU_WRITEBACK);
-    this._views = new Map();
-    this._bgs = new Map();
-  }
-  // gradsBuffer is the consolidated gradient buffer; extract reads channel 2
-  // (log_tau) into a plain f32 buffer.
-  encodeExtract(encoder, gradsBuffer, gradOut, clearParams, siteCount) {
-    const entries = [
-      { binding: 0, resource: { buffer: gradsBuffer } },
-      { binding: 1, resource: { buffer: gradOut } },
-      { binding: 2, resource: { buffer: clearParams } },
-    ];
-    const layout = this.extractPipeline.getBindGroupLayout(0);
-    const bg = getBindGroup(this.device, this._bgs, layout, entries);
-    dispatch1D(encoder, this.extractPipeline, bg, Math.ceil(siteCount / 256));
-  }
-  encodeDiffuse(encoder, cand0, cand1, sitesBuffer, gradRaw, gradIn, gradOut, tauParams, siteCount) {
-    const entries = [
-      { binding: 0, resource: getTextureView(this._views, cand0) },
-      { binding: 1, resource: getTextureView(this._views, cand1) },
-      { binding: 2, resource: { buffer: sitesBuffer } },
-      { binding: 3, resource: { buffer: gradRaw } },
-      { binding: 4, resource: { buffer: gradIn } },
-      { binding: 5, resource: { buffer: gradOut } },
-      { binding: 6, resource: { buffer: tauParams } },
-    ];
-    const layout = this.diffusePipeline.getBindGroupLayout(0);
-    const bg = getBindGroup(this.device, this._bgs, layout, entries);
-    dispatch1D(encoder, this.diffusePipeline, bg, Math.ceil(siteCount / 256));
-  }
-  // gradsBuffer is the consolidated gradient buffer; writeback writes diffused
-  // tau values back to channel 2.
-  encodeWriteback(encoder, gradIn, gradsBuffer, clearParams, siteCount) {
-    const entries = [
-      { binding: 0, resource: { buffer: gradIn } },
-      { binding: 1, resource: { buffer: gradsBuffer } },
-      { binding: 2, resource: { buffer: clearParams } },
-    ];
-    const layout = this.writebackPipeline.getBindGroupLayout(0);
-    const bg = getBindGroup(this.device, this._bgs, layout, entries);
-    dispatch1D(encoder, this.writebackPipeline, bg, Math.ceil(siteCount / 256));
   }
 }
 
@@ -306,8 +251,6 @@ export class ClearBufferEncoder {
   }
 }
 
-// Softmax-blended hashColor rendering — same bindings as the normal render
-// kernel (sites, params, cand0, cand1, outTex).
 // Tau heatmap overlay — adds a TauHeatmapParams uniform (bind 5) on top of the
 // normal render bindings.
 export class RenderTauHeatmapEncoder {
@@ -333,64 +276,6 @@ export class RenderTauHeatmapEncoder {
   }
 }
 
-export class HilbertEncoder {
-  constructor(device, shaders) {
-    this.device = device;
-    this.buildPipeline = makePipeline(device, shaders.HILBERT, "buildHilbertPairs");
-    this.writePipeline = makePipeline(device, shaders.HILBERT, "writeHilbertOrder");
-    this._bgs = new Map();
-  }
-  encodePairs(encoder, sitesBuffer, pairsBuffer, paramsBuf, paddedCount) {
-    const entries = [
-      { binding: 0, resource: { buffer: sitesBuffer } },
-      { binding: 1, resource: { buffer: pairsBuffer } },
-      { binding: 2, resource: { buffer: paramsBuf } },
-    ];
-    const layout = this.buildPipeline.getBindGroupLayout(0);
-    const bg = getBindGroup(this.device, this._bgs, layout, entries);
-    dispatch1D(encoder, this.buildPipeline, bg, Math.ceil(paddedCount / 256));
-  }
-  encodeOrder(encoder, pairsBuffer, orderBuffer, posBuffer, paramsBuf, siteCount) {
-    const entries = [
-      { binding: 0, resource: { buffer: pairsBuffer } },
-      { binding: 1, resource: { buffer: orderBuffer } },
-      { binding: 2, resource: { buffer: posBuffer } },
-      { binding: 3, resource: { buffer: paramsBuf } },
-    ];
-    const layout = this.writePipeline.getBindGroupLayout(0);
-    const bg = getBindGroup(this.device, this._bgs, layout, entries);
-    dispatch1D(encoder, this.writePipeline, bg, Math.ceil(siteCount / 256));
-  }
-}
-
-// Site growth: mask-normalized separable Gaussian blur of the target (into
-// `outTex`, via `tmpTex`).
-export class GrowEncoder {
-  constructor(device, shaders) {
-    this.device = device;
-    this.blurHPipeline = makePipeline(device, shaders.GROW_BLUR, "blur_h");
-    this.blurVPipeline = makePipeline(device, shaders.GROW_BLUR, "blur_v");
-    this._views = new Map();
-  }
-  encodeBlur(encoder, blurParams, srcTex, maskTex, tmpTex, outTex, width, height) {
-    const dev = this.device;
-    const view = (t) => getTextureView(this._views, t);
-    let bg = dev.createBindGroup({ layout: this.blurHPipeline.getBindGroupLayout(0), entries: [
-      { binding: 0, resource: { buffer: blurParams } },
-      { binding: 1, resource: view(srcTex) },
-      { binding: 2, resource: view(maskTex) },
-      { binding: 3, resource: view(tmpTex) },
-    ] });
-    dispatch2D(encoder, this.blurHPipeline, bg, Math.ceil(width / 16), Math.ceil(height / 16));
-    bg = dev.createBindGroup({ layout: this.blurVPipeline.getBindGroupLayout(0), entries: [
-      { binding: 0, resource: { buffer: blurParams } },
-      { binding: 1, resource: view(tmpTex) },
-      { binding: 3, resource: view(outTex) },
-    ] });
-    dispatch2D(encoder, this.blurVPipeline, bg, Math.ceil(width / 16), Math.ceil(height / 16));
-  }
-}
-
 // Site growth: per-site owner moments and removal deltas (site_stats.wgsl).
 export class SiteStatsEncoder {
   constructor(device, shaders) {
@@ -398,45 +283,19 @@ export class SiteStatsEncoder {
     this.pipeline = makePipeline(device, shaders.SITE_STATS);
     this._views = new Map();
   }
-  encode(encoder, sitesBuffer, statsParams, cand0, cand1, fitTex, weightBuffer, statsBuffer, width, height, sitePin) {
+  encode(encoder, sitesBuffer, statsParams, cand0, cand1, targetTex, maskBuffer, statsBuffer, width, height) {
     const view = (t) => getTextureView(this._views, t);
     const bg = this.device.createBindGroup({ layout: this.pipeline.getBindGroupLayout(0), entries: [
       { binding: 0, resource: { buffer: sitesBuffer } },
       { binding: 1, resource: { buffer: statsParams } },
       { binding: 2, resource: view(cand0) },
       { binding: 3, resource: view(cand1) },
-      { binding: 4, resource: view(fitTex) },
-      { binding: 5, resource: { buffer: weightBuffer } },
+      { binding: 4, resource: view(targetTex) },
+      { binding: 5, resource: { buffer: maskBuffer } },
       { binding: 6, resource: { buffer: statsBuffer } },
-      { binding: 7, resource: { buffer: sitePin } },
     ] });
     encoder.clearBuffer(statsBuffer);
     dispatch2D(encoder, this.pipeline, bg, Math.ceil(width / 16), Math.ceil(height / 16));
   }
 }
 
-// Remaining-information pass (info_update.wgsl): per-pixel loss weights and
-// commit counts, plus which sites still serve a pixel in the loss.
-export class InfoEncoder {
-  constructor(device, shaders) {
-    this.device = device;
-    this.pipeline = makePipeline(device, shaders.INFO_UPDATE);
-    this._views = new Map();
-  }
-  encode(encoder, { sites, params, cand0, cand1, targetTex, mask, weight, settled, siteLive, width, height }) {
-    const view = (t) => getTextureView(this._views, t);
-    const bg = this.device.createBindGroup({ layout: this.pipeline.getBindGroupLayout(0), entries: [
-      { binding: 0, resource: { buffer: sites } },
-      { binding: 1, resource: { buffer: params } },
-      { binding: 2, resource: view(cand0) },
-      { binding: 3, resource: view(cand1) },
-      { binding: 4, resource: view(targetTex) },
-      { binding: 5, resource: { buffer: mask } },
-      { binding: 6, resource: { buffer: weight } },
-      { binding: 7, resource: { buffer: settled } },
-      { binding: 8, resource: { buffer: siteLive } },
-    ] });
-    encoder.clearBuffer(siteLive);
-    dispatch2D(encoder, this.pipeline, bg, Math.ceil(width / 16), Math.ceil(height / 16));
-  }
-}

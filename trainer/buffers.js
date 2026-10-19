@@ -45,37 +45,6 @@ export function createGradsBuffer(device, capacity) {
   });
 }
 
-export function createAtomicU32Buffer(device, count) {
-  return device.createBuffer({
-    size: Math.max(1, count) * 4,
-    usage: GPUBufferUsage.STORAGE,
-  });
-}
-
-export function createHilbertBuffers(device, capacity) {
-  const order = device.createBuffer({
-    size: Math.max(4, capacity * 4),
-    usage: GPUBufferUsage.STORAGE,
-  });
-  const pos = device.createBuffer({
-    size: Math.max(4, capacity * 4),
-    usage: GPUBufferUsage.STORAGE,
-  });
-  const paddedCount = Math.floor((capacity + 1023) / 1024) * 1024;
-  const pairs = device.createBuffer({
-    size: Math.max(8, paddedCount * 8),
-    usage: GPUBufferUsage.STORAGE,
-  });
-  return { order, pos, pairs, paddedCount };
-}
-
-export function createDummyStorageBuffer(device) {
-  return device.createBuffer({
-    size: 4,
-    usage: GPUBufferUsage.STORAGE,
-  });
-}
-
 // Read `count` sites from `sitesBuffer` as a Float32Array of shape (count, SITE_FLOATS).
 // Mirrors read_sites() in train_wgpu.py.
 export async function readSites(device, sitesBuffer, count) {

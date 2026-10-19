@@ -646,7 +646,7 @@
 
     <div class="main">
       <aside class="panel hidden" id="paramsPanel">
-        <h3 class="has-tip" tabindex="0">Site count<span class="tip" role="tooltip">The only settings that decide how many sites the run uses. The count goes from <b>start sites</b> at iteration 0 to <b>end sites</b> by <b>reach end by</b>, on the chosen curve, then holds while the rest of the run refines. Start &lt; end grows (splitting or inserting sites, see <b>grow by</b>); start &gt; end prunes, merging the cheapest neighbouring pairs into one site (the pixel-weighted average of both); start = end is a fixed count. Each site costs 128 bits: bpp = sites × 128 / (width × height).</span></h3>
+        <h3 class="has-tip" tabindex="0">Site count<span class="tip" role="tooltip">The only settings that decide how many sites the run uses. The count goes from <b>start sites</b> at iteration 0 to <b>end sites</b> by <b>reach end by</b>, on the chosen curve, then holds while the rest of the run refines. Start &lt; end grows by splitting the cells a second site would explain best; start &gt; end prunes, merging the cheapest neighbouring pairs into one site (the pixel-weighted average of both); start = end is a fixed count. Each site costs 128 bits: bpp = sites × 128 / (width × height).</span></h3>
         <div class="param">
           <div class="row"><label>start sites</label><input id="p-startSites" type="number" min="1" /></div>
           <p class="help"><span class="unit">sites at iteration 0</span></p>
@@ -715,11 +715,6 @@
           <div class="tip" role="tooltip">Start from these sites instead of the default placement (sites sampled where the image has edges). Positions are rescaled to the target size and every site's τ is reset. Its site count becomes the starting count: it replaces <b>start sites</b>, which is locked to show it until the file is cleared.</div>
         </div>
 
-        <div class="param" data-site-mode="grow">
-          <div class="row"><label>blur × spacing</label><input id="p-growBlur" type="number" step="0.05" /></div>
-          <p class="help"><span class="unit">multiple of the site spacing (unitless); σ in px = this × √(mask pixels / sites)</span></p>
-          <div class="tip" role="tooltip">While growing, train against the image blurred with that Gaussian σ (e.g. 0.375 × 20 px spacing = 7.5 px). The blur shrinks as sites are added and switches off when growth ends. 0 = off (recommended): it cost 0.5–2 dB in tests, since sites draw edges far finer than their spacing.</div>
-        </div>
 
         <h3 class="has-tip" tabindex="0">Schedule<span class="tip" role="tooltip">Everything that decides when things happen in a run: how long it is, how the learning rate moves, and (in grow mode) when sites are added and when growth stops. The summary below is worked out from these fields as you edit them; after a run it also says when and why growth actually ended.</span></h3>
         <div class="plan-summary" id="planSummary"></div>
@@ -733,46 +728,15 @@
           <div class="tip" role="tooltip">How the learning rate changes over the run. <b>cosine</b>: falls from full to 0 on a cosine over the run. <b>fixed</b>: stays at full. <b>decay after growth</b>: stays at full while sites are being added, then falls to 0 on a cosine by the end of the run, so late sites aren't starved and the finished set still gets a cool-down (with fixed site count it equals cosine). The cool-down matters: without it MNIST lost 1–1.5 dB.</div>
         </div>
         <div class="param" data-site-mode="grow">
-          <div class="row"><label>grow by</label><select id="p-growMode" aria-label="Growth mode"></select></div>
-          <div class="tip" role="tooltip">How each step adds sites. <b>split cells</b>: the cells whose colors a linear ramp explains best are each split in two; the site moves to one half and a new site takes the other. <b>insert (exact loss)</b>: new sites are placed one at a time where they cut the training loss most, computed exactly from the current fit; candidates are every pixel (or the worst-fit pixels on large images), with the shape of the site that owns it, colored with the median of the pixels it would win. Existing sites are left alone. Insertion is slower per step on large images.</div>
-        </div>
-        <div class="param" data-site-mode="grow">
-          <div class="row"><label>LR decay</label><input id="p-growLrDecay" type="number" step="0.05" min="0" /></div>
-          <p class="help"><span class="unit">× per growth step, for sites older than it</span></p>
-          <div class="tip" role="tooltip">Each growth step multiplies the learning rates of every site that was already there by this, so early sites settle while later ones refine around them. A split's parent counts as new (it moves and gets fresh Adam moments), so only sites that stop being split slow down. A site 3 steps old at 0.5 learns at 0.125× the normal rate. 1 = off. Applies to every parameter, color included.</div>
-        </div>
-        <div class="param" data-site-mode="grow">
-          <div class="row"><label>stop by</label><select id="p-growCriterion" aria-label="Growth stop criterion"></select></div>
-          <div class="tip" role="tooltip">What can end growth before <b>max sites</b>. <b>λ</b>: a new site's predicted gain must beat λ × 128 bits (below). <b>description length</b>: at every growth step the cells are scored as the bits to send them, 128 per site plus the error of each cell at its mean color coded at 8-bit precision, and growth ends once a batch hasn't lowered that score; λ is ignored. It's judged on what each batch actually achieved after <b>grow every</b> iterations, so it can stop too early where new sites need longer to pay off: on Kodak at 256 px it ended at 315–473 sites, about the best fixed budget for each image, but on MNIST digits at ~2 sites.</div>
-        </div>
-        <div class="param" data-site-mode="grow">
           <div class="row"><label>λ (stop)</label><input id="p-growLambda" type="number" step="10" min="0" /></div>
-          <p class="help"><span class="unit">error per bit: 8-bit levels² (summed over R, G, B and pixels); with insert and L1 loss, levels</span></p>
-          <div class="tip" role="tooltip">With <b>insert</b>, gains are measured in the training loss: levels (absolute error) under L1, levels² under L2. Only cells whose split would remove more than λ × 128 levels² of error (a site costs 128 bits) are split; a step adds fewer sites if fewer qualify, and growth ends early once none do. Example: λ = 400 → 51,200 levels², e.g. 100 pixels each off by about 13 levels in all three channels. Higher λ stops sooner. 0 = never stop early (any site that helps at all qualifies). The log says which limit ended growth.</div>
+          <p class="help"><span class="unit">error per bit: 8-bit levels² (summed over R, G, B and pixels)</span></p>
+          <div class="tip" role="tooltip">Only cells whose split would remove more than λ × 128 levels² of error (a site costs 128 bits) are split; a step adds fewer sites if fewer qualify, and growth ends early once none do. Example: λ = 400 → 51,200 levels², e.g. 100 pixels each off by about 13 levels in all three channels. Higher λ stops sooner. 0 = never stop early (any site that helps at all qualifies). The log says which limit ended growth.</div>
         </div>
 
-        <div class="param">
-          <div class="row"><label>keep best</label><select id="p-keepBest" aria-label="Keep best state by"></select></div>
-          <div class="tip" role="tooltip">At every refresh the state is scored, and the run ends on the best one seen (restored exactly), not the last. <b>lowest training loss</b>: only ever swaps the final state for one with lower loss at the same or fewer sites; in tests about 1 run in 10 ended a few % worse than an earlier refresh. <b>description length</b>: the bits to send the sites (128 per site) plus the residual coded at 8-bit precision under the training loss's own likelihood (Laplace for L1, Gaussian for L2); fewer sites at the same loss score better, and a site is worth keeping only if it saves more than its 128 bits (on 28×28 about 4% less error per site, on 768×512 under 0.01%). Caveat: states in the middle of growth are far from converged, so within a growing run this tends to pick an early, half-fitted state. <b>off</b>: the last state.</div>
-        </div>
-        <div class="param" data-site-mode="grow">
-          <div class="row"><label>patience</label><input id="p-growPatience" type="number" min="0" /></div>
-          <p class="help"><span class="unit">growth steps without a better score</span></p>
-          <div class="tip" role="tooltip">With <b>keep best</b> on: if this many growth steps in a row haven't produced a better score, growth ends, the run goes back to the best state and spends the remaining iterations refining it. 0 = never (grow to <b>max sites</b> or λ, and only go back at the end of the run).</div>
-        </div>
-        <div class="param">
-          <div class="row"><label>prune every</label><input id="p-pruneEvery" type="number" min="0" /></div>
-          <p class="help"><span class="unit">iterations between merge steps (0 = off)</span></p>
-          <div class="tip" role="tooltip">Once growth is over (any time with a fixed count), merge neighbouring sites that don't pay for their 128 bits. Each step scores every pair of neighbouring cells by how much squared error merging them would add with the merged cell at its mean color (Ward's criterion), and merges the cheapest pairs whose cost is below what a site's bits are worth. The merged site is the pixel-count-weighted average of both sites' parameters (anisotropy axes averaged as orientations). The next step keeps the batch only if the render's description length (as <b>keep best → description length</b>) went down; otherwise it's undone and pruning ends. In tests on MNIST, growing to 64 and pruning ended at ~18 sites, better in both sites and error than a fixed 16; on Kodak at 256 px it kept all 800.</div>
-        </div>
 
         <div class="param">
           <div class="row"><label>layer</label><select id="p-layer" aria-label="Histogram layer"></select></div>
-          <div class="tip" role="tooltip">When one exact 8-bit color covers at least half the pixels (MNIST's black: ~80%), that color becomes a flat layer behind every site: a pinned site with a constant logit of 0, offered to every pixel. A site then wins wherever it reaches past the layer (inside its radius), and the layer's color shows everywhere else, so no sites are spent drawing it. It never moves or splits, counts as one of the sites, and is an ordinary site in the saved file. Images without a dominant color (Kodak) are left alone. <b>learned depth</b>: the layer is always there, colored by the peak of the smoothed color histogram, and how far forward it sits (its constant logit β) is learned, starting from how common that color is: on MNIST it comes forward and takes the background, on Kodak it stays mostly behind.</div>
-        </div>
-        <div class="param">
-          <div class="row"><label>remaining info</label><select id="p-info" aria-label="Remaining-information weighting"></select></div>
-          <div class="tip" role="tooltip">Every candidate update, each pixel's error is measured in 8-bit levels; under half a level the decoded pixel is already exact. <b>dead zone</b>: pixels under 1/4 level drop out of the loss and the growth statistics, ramping back in by 1/2 level. <b>commit settled pixels</b>: pixels exact for 4 checks in a row leave the loss (re-checked each pass, and back if they drift); sites that only touch committed pixels stop moving. PSNR, keep best and pruning still score every pixel.</div>
+          <div class="tip" role="tooltip"><b>learned depth</b>: the peak of the image's smoothed color histogram (MNIST's black) becomes a flat layer behind every site, a site with a constant logit β that every pixel blends. A site wins wherever its own logit beats β, and the layer's color shows everywhere else, so no sites are spent drawing it. β is learned, starting from how common that color is: on MNIST the layer comes forward and takes the background (+3 dB at 32 sites); on Kodak it stays mostly behind (−0.1 dB). It never splits or merges, counts as one of the sites, and is an ordinary site in the saved file.</div>
         </div>
 
         <h3>Logging</h3>
@@ -812,16 +776,6 @@
           <div class="row"><label>inject count</label><input id="p-candInjectCount" type="number" /></div>
           <p class="help"><span class="unit">random sites per pixel per pass</span></p>
           <div class="tip" role="tooltip">Also try this many sites picked at random from all sites: a global safety net so no site stays undiscovered.</div>
-        </div>
-        <div class="param">
-          <div class="row"><label>hilbert window</label><input id="p-candHilbertWindow" type="number" /></div>
-          <p class="help"><span class="unit">± positions in the Hilbert-sorted site list</span></p>
-          <div class="tip" role="tooltip">Sites are sorted along a Hilbert curve, which keeps nearby sites close in the list; Hilbert probes pick within this many places either side of the pixel's best site. 0 = off.</div>
-        </div>
-        <div class="param">
-          <div class="row"><label>hilbert probes</label><input id="p-candHilbertProbes" type="number" /></div>
-          <p class="help"><span class="unit">sites per pixel per pass</span></p>
-          <div class="tip" role="tooltip">How many of those Hilbert neighbours each pixel tries. 0 = off.</div>
         </div>
 
         <h3>Color</h3>

@@ -1,13 +1,12 @@
 // SAD training loop. Originally ported from the wgpu-py trainer (train_wgpu.py
-// at the `multi-backend` tag), minus densify/prune. By default it optimizes a
-// fixed site count; with growLambda > 0 it adds sites by rate-distortion (see
-// "Site growth" below). Sites are never removed.
+// at the `multi-backend` tag). The site count follows a schedule from
+// startSites to endSites (countTarget), growing by splitting cells and
+// shrinking by merging neighbours (see "Site count" below); optionally with a
+// histogram layer behind the sites (LAYER_MODES).
 
 import {
   SITE_FLOATS,
   ADAM_FLOATS,
-  TAU_DIFFUSE_PASSES,
-  TAU_DIFFUSE_LAMBDA,
   createParamsBuffer,
   updateParamsBuffer,
   createInitParamsBuffer,
@@ -15,13 +14,8 @@ import {
   createAdamParamsBuffer,
   updateAdamParamsBuffer,
   createClearParamsBuffer,
-  createTauParamsBuffer,
-  updateTauParamsBuffer,
   updateGradParamsBuffer,
-  updateClearParamsBuffer,
   createUniform32,
-  updateGrowBlurParamsBuffer,
-  updateInfoParamsBuffer,
 } from "./params.js?v=20261019";
 
 import {
@@ -29,7 +23,6 @@ import {
   createAdamBuffer,
   createSeedCounter,
   createGradsBuffer,
-  createAtomicU32Buffer,
   readSites,
 } from "./buffers.js?v=20261019";
 
@@ -46,15 +39,11 @@ import {
   RenderTauHeatmapEncoder,
   GradientsEncoder,
   AdamEncoder,
-  TauEncoder,
   ClearBufferEncoder,
-  GrowEncoder,
   SiteStatsEncoder,
-  InfoEncoder,
 } from "./encoders.js?v=20261019";
 
 import { BITS_PER_SITE } from "./io.js?v=20261019";
-import { insertionField, pickInsertions } from "./insert.js?v=20261019";
 import { cellMoments, pickMerges, mergedSite } from "./merge.js?v=20261019";
 import { CandidateLists } from "./candidates.js?v=20261019";
 import {
@@ -65,74 +54,17 @@ import {
 } from "./color_spaces.js?v=20261019";
 
 const MAX_PREVIEW_IMAGE_READBACKS = 2;
-// Direction/anisotropy start learning here. Previously derived from the prune
-// schedule as max(10, PRUNE_START / 2) = 50 with the shared config.
-const ANI_START_ITER = 50;
 const MAX_PREVIEW_SITE_READBACKS = 8;
+// Direction and anisotropy only start learning at this iteration. Removing the
+// delay cost 0.82 ± 0.24 dB on 40 held-out MNIST digits at 8 sites (5 repeats;
+// -0.08 at 32, within noise on Kodak).
+const ANI_START_ITER = 50;
 
 // Training losses (args.loss): label, and the LOSS id gradients_tiled.wgsl
 // switches on. Growth, λ and PSNR measure squared error either way.
 export const LOSSES = {
   l1: { label: "L1 (absolute error)", id: 1 },
   l2: { label: "L2 (squared error)", id: 0 },
-};
-
-// Keeping the best state (args.keepBest): every log tick is scored and the run
-// ends on the best state seen, restored exactly (sites and Adam moments).
-// "loss": the training loss alone (default); it only ever trades the final
-// state for one with lower loss, at the same or a lower site count.
-// "mdl": total bits of a two-part code, sites × BITS_PER_SITE plus the
-// residual coded at 8-bit precision under the training loss's likelihood
-// (L1 → Laplace, L2 → Gaussian; selectionScore). Fewer sites at the same loss
-// always win, and a site is kept only if it pays for its own bits. Compared on
-// converged fits it picks 8-16 sites on MNIST digits and 400-800 on Kodak at
-// 256 px, but mid-growth states are far from converged (2-10× the converged
-// loss with the MNIST preset), so within one growing run it tends to return
-// an unconverged early state; use it to compare finished runs, or with
-// growPatience only once growth checkpoints have settled. "off": the last state.
-export const KEEP_BEST = {
-  loss: "lowest training loss",
-  mdl: "description length (bits)",
-  off: "off (final state)",
-};
-
-// Score of a state for args.keepBest (lower is better). `err` is the mean
-// training loss per sample (mean |r| for L1, mean r² for L2, colors in 0..1),
-// `samples` the number of residuals (masked pixels × 3). For "mdl" it's bits:
-// the ML Laplace (L1) / Gaussian (L2) fit to the residual has entropy
-// log2(2e·b) / ½·log2(2πe·σ²) per sample, at a quantization step of 1/255,
-// floored at 0 bits per sample.
-const QUANT = 1 / 255;
-export function selectionScore(kind, { err, sites, samples, loss }) {
-  if (!Number.isFinite(err)) return Infinity;
-  if (kind !== "mdl") return err;
-  const perSample = loss === "l2"
-    ? 0.5 * Math.log2(2 * Math.PI * Math.E * Math.max(err, 1e-30) / (QUANT * QUANT))
-    : Math.log2(2 * Math.E * Math.max(err, 1e-30) / QUANT);
-  return sites * BITS_PER_SITE + samples * Math.max(0, perSample);
-}
-
-// When growth stops early (args.growCriterion).
-// "lambda": a new site's predicted gain must beat λ × BITS_PER_SITE
-// (growLambda), in the gain's units.
-// "mdl": growth goes on while each batch pays for its bits. At every growth
-// step the current cells are scored by description length,
-// sites × BITS_PER_SITE + (S/2)·log2(2πe·σ²) with σ² the squared error per
-// sample of every cell at its mean color (S samples; cellMdlBits), and growth
-// ends once a batch, after growEvery iterations to settle, hasn't lowered it.
-// Scoring the cells at their best colors leaves out the error the fit simply
-// hasn't removed yet. Predicted gains can't be used here: at small counts they
-// miss most of what a new site does once optimized (a ramp across a centred
-// digit explains almost nothing), and an MDL bar on them stops MNIST at 1 site.
-export const GROW_CRITERIA = {
-  lambda: "λ (predicted gain per bit)",
-  mdl: "description length (realized)",
-};
-
-// How growth adds sites (args.growMode).
-export const GROW_MODES = {
-  split: "split cells",       // split the cells a linear color ramp explains best (siteSplit)
-  insert: "insert (exact loss)", // insert new sites where they cut the training loss most (insert.js)
 };
 
 // LR schedules (args.lrSchedule), over a run of `iters` iterations. No warmup:
@@ -209,31 +141,26 @@ export function countCapacity(args, start = args.startSites) {
   return countPlan(args, start).reduce((m, p) => Math.max(m, p.count), Math.max(start, args.endSites));
 }
 
-// Histogram layer (args.layer). "auto": if the target's most common exact
-// 8-bit color (histogramMode) covers at least layerModeMin of the pixels, that
-// color gets a flat layer: a pinned site whose logit is ~0 everywhere
-// (τ = e^LAYER_LOG_TAU, radius 0), so a site wins a pixel where -τ(d - r) > 0,
-// i.e. inside its radius, and the layer's color shows wherever no site
-// reaches. Every pixel blends the layer besides its 8 listed candidates
-// (globalCand; it never takes a list slot), it never moves (sitePin), never
-// splits or merges, and it's an ordinary site in the sites file.
-// "learn": the continuous version. The layer is always there, colored by the
-// peak of the target's smoothed color histogram (colorPeak), and its depth β
-// (its constant logit) is learned like any other parameter, starting from
-// log(p / (1 - p)) of the peak's probability mass p. A common color starts in
-// front of the sites' boundaries and takes the background; a rare one starts
-// behind them, and the gradient decides how far forward it comes. (A per-site
-// bias b(c) on every site would not do this: logits are -τ(d - r), so a
-// constant b is exactly a radius change r + b/τ and the optimizer undoes it.
-// Only a flat site can sit behind everything.)
+// Histogram layer (args.layer). "learn": a flat site behind all the others,
+// colored by the peak of the target's smoothed color histogram (colorPeak).
+// Its logit is a constant β (τ = e^LEARN_LOG_TAU, so flat to 0.03 logits
+// across the image): a site wins a pixel where its own logit -τ(d - r) beats
+// β, and the layer's color shows wherever none does. β is learned like any
+// other parameter (adam.wgsl, params.layer_site), starting from log(p / (1 - p)) of
+// the peak's mass p: a common color starts in front of the sites' edges and
+// takes the background, a rare one starts behind and the gradient decides.
+// Every pixel blends the layer besides its 8 listed candidates (globalCand;
+// it never takes a list slot); it never splits or merges, counts against
+// endSites, and is an ordinary site in the sites file ("# Global site").
+// A per-site bias from p(color) on every site would not do this: a constant
+// added to -τ(d - r) is exactly a radius change, which the optimizer undoes.
+// MNIST: +0.78 / +3.06 dB at 8 / 32 sites; Kodak at 256 px: -0.13 dB, the
+// layer staying behind (β ≈ -4.7, ~4% of pixels).
 export const LAYER_MODES = {
   off: "off",
-  auto: "auto (dominant color)",
-  learn: "learned depth (always on)",
+  learn: "learned depth",
 };
-const LAYER_LOG_TAU = -9;
-// "learn": τ of the layer (flat to 0.03 logits across the image) and its depth
-// range. β is stored as radius β / (τ · inv_scale).
+// τ of the layer and its depth range; β is stored as radius β / (τ · inv_scale).
 const LEARN_LOG_TAU = -4;
 const LAYER_BETA_MAX = 8; // also in adam.wgsl
 // Color bins (8-bit levels per bin and channel) of colorPeak's histogram.
@@ -275,42 +202,6 @@ export function colorPeak(target, n, mask = null) {
   return { color: [(key >> 16) / 255, ((key >> 8) & 255) / 255, (key & 255) / 255], mass: total ? bestMass / total : 0 };
 }
 
-// Most common exact 8-bit RGB color over the masked pixels: { color (0..1
-// RGB), mass (fraction of pixels) }.
-export function histogramMode(target, n, mask = null) {
-  const counts = new Map();
-  let total = 0;
-  for (let p = 0; p < n; p += 1) {
-    if (mask && !(mask[p] > 0)) continue;
-    const key = (Math.round(target[p * 4] * 255) << 16) | (Math.round(target[p * 4 + 1] * 255) << 8) |
-      Math.round(target[p * 4 + 2] * 255);
-    counts.set(key, (counts.get(key) || 0) + 1);
-    total += 1;
-  }
-  let best = 0, bestCount = 0;
-  for (const [k, c] of counts) if (c > bestCount) { best = k; bestCount = c; }
-  return { color: [(best >> 16) / 255, ((best >> 8) & 255) / 255, (best & 255) / 255], mass: total ? bestCount / total : 0 };
-}
-
-// Remaining-information pass (args.info, info_update.wgsl), every infoEvery
-// iterations. Pixels are measured in quantization bins of the target (1/255):
-// within half a bin the decoded pixel is exact and has nothing left to explain.
-// "deadzone": loss weight = 0 below 1/4 bin of error, ramping to 1 at 1/2
-// bin (where rounding would go wrong), per pixel, each pass.
-// "commit": full weight until a pixel has been exact for commitAfter passes
-// in a row, then 0 (committed); with commitRecheck it's still checked and comes
-// back if it drifts, without it it's never looked at again. With commitFreeze,
-// sites with no weight above INFO_LIVE_EPS on an uncommitted pixel don't move.
-// The weights replace the mask in the gradients and the growth statistics;
-// PSNR, keepBest and pruning still score every masked pixel.
-export const INFO_MODES = {
-  off: "off",
-  deadzone: "dead zone (exact pixels)",
-  commit: "commit settled pixels",
-};
-const INFO_QUANT = 1 / 255;
-const INFO_LIVE_EPS = 1e-3;
-
 // Collect default args from a training_config.json-style object + user
 // overrides. Overrides use the argument name (e.g. "iters") and take precedence
 // over the matching config-style key (e.g. "DEFAULT_ITERS").
@@ -324,16 +215,12 @@ export function buildArgs(config, overrides = {}) {
     return fallback;
   };
   const args = {
-    // WebGPU-specific defaults; training_config.json's DEFAULT_ITERS/SITES are
-    // tuned for the other backends' densify/prune schedule, which JS doesn't run.
     // Run length. The schedule, LR and growth defaults (and LR_POS_BASE / LR_TAU_BASE in
     // training_config.json) were tuned for growing 1 -> 100 sites over 1000
     // iterations, by mean final PSNR over 8 Kodak images, then checked on the
     // other 16.
     iters: Math.max(1, Math.floor(Number(pick("iters", null, 1000)))),
     candFreq: Number(pick("candFreq", "CAND_UPDATE_FREQ", 1)),
-    candHilbertWindow: Number(pick("candHilbertWindow", "CAND_HILBERT_WINDOW", 0)),
-    candHilbertProbes: Number(pick("candHilbertProbes", "CAND_HILBERT_PROBES", 0)),
     candDownscale: Math.max(1, Number(pick("candDownscale", "CAND_DOWNSCALE", 1))),
     candUpdatePasses: Math.max(1, Number(pick("candUpdatePasses", "CAND_UPDATE_PASSES", 1))),
     candRadiusScale: Number(pick("candRadiusScale", "CAND_RADIUS_SCALE", 64.0)),
@@ -361,7 +248,7 @@ export function buildArgs(config, overrides = {}) {
     maxDim: Number(pick("maxDim", "MAX_DIM", 2048)),
     // Site count: from startSites at iteration 0 to endSites by countEnd ×
     // iters on the countSchedule curve (COUNT_SCHEDULES), stepping every
-    // growEvery iterations: up by splitting / inserting (growMode), down by
+    // growEvery iterations: up by splitting cells (siteSplit), down by
     // merging the cheapest neighbouring pairs (merge.js). sawTeeth, sawAmp and
     // sawRatio shape "sawtooth" (countTarget). These are the only settings
     // that set the count; the buffers hold countCapacity sites.
@@ -379,43 +266,9 @@ export function buildArgs(config, overrides = {}) {
     // site must remove per bit it costs (BITS_PER_SITE bits). 0 = no early
     // stop (any positive gain still qualifies).
     growLambda: Math.max(0, Number(pick("growLambda", "GROW_LAMBDA", 400))),
-    // While growing, the fit target is blurred with sigma = growBlur × site
-    // spacing √(mask area / sites); 0 = always fit the original.
-    growBlur: Math.max(0, Number(pick("growBlur", "GROW_BLUR", 0))),
-    // Each growth step multiplies the learning rates of every site that
-    // existed before it (split parents count as new) by this; 1 = off.
-    growLrDecay: Math.max(0, Number(pick("growLrDecay", "GROW_LR_DECAY", 1))),
-    growMode: String(pick("growMode", "GROW_MODE", "split")),
-    // What a new site's gain must beat (GROW_CRITERIA); growLambda applies
-    // only to "lambda".
-    growCriterion: String(pick("growCriterion", "GROW_CRITERION", "lambda")),
-    // Keep the best log tick by this score (KEEP_BEST) and end on it.
-    keepBest: String(pick("keepBest", "KEEP_BEST", "loss")),
-    // While growing: end growth and go back to the best state once that many
-    // growth steps in a row haven't beaten it (keepBest score; 0 = never).
-    growPatience: Math.max(0, Math.floor(Number(pick("growPatience", "GROW_PATIENCE", 0)))),
-    // Merge neighbouring sites that don't pay for their bits (merge.js) every
-    // this many iterations once the count schedule is over (0 = never); see
-    // _pruneStep.
-    pruneEvery: Math.max(0, Math.floor(Number(pick("pruneEvery", "PRUNE_EVERY", 0)))),
-    // Histogram layer (LAYER_MODES): when one exact 8-bit color holds at least
-    // layerModeMin of the (masked) pixels, add a pinned flat site of that
-    // color offered to every pixel. It counts as one of the sites.
+    // Histogram layer (LAYER_MODES): a flat site behind all others, colored by
+    // the peak of the target's color histogram, with a learned depth.
     layer: String(pick("layer", "LAYER", "off")),
-    layerModeMin: Number(pick("layerModeMin", "LAYER_MODE_MIN", 0.5)),
-    // Remaining-information pass (INFO_MODES), every infoEvery iterations
-    // (0 = candFreq): per-pixel loss weights from the error in 8-bit bins.
-    info: String(pick("info", "INFO", "off")),
-    infoEvery: Math.max(0, Math.floor(Number(pick("infoEvery", "INFO_EVERY", 0)))),
-    // Whether the info weights also weight the training gradients (else only
-    // growth's site statistics use them).
-    infoGrad: Boolean(pick("infoGrad", "INFO_GRAD", true)),
-    // "commit": passes in a row a pixel must be exact to leave the loss;
-    // whether committed pixels are still checked (and come back if they
-    // drift); whether sites serving no uncommitted pixel freeze.
-    commitAfter: Math.max(1, Math.floor(Number(pick("commitAfter", "COMMIT_AFTER", 4)))),
-    commitRecheck: Boolean(pick("commitRecheck", "COMMIT_RECHECK", true)),
-    commitFreeze: Boolean(pick("commitFreeze", "COMMIT_FREEZE", true)),
   };
   if (!COUNT_SCHEDULES[args.countSchedule]) {
     throw new Error(`countSchedule must be one of ${Object.keys(COUNT_SCHEDULES).join(", ")} (got "${args.countSchedule}")`);
@@ -424,23 +277,11 @@ export function buildArgs(config, overrides = {}) {
     throw new Error(`lrSchedule must be one of ${Object.keys(LR_SCHEDULES).join(", ")} (got "${args.lrSchedule}")`);
   }
   colorSpaceFor(args.colorSpace); // fail early on an unknown name
-  if (!GROW_MODES[args.growMode]) {
-    throw new Error(`growMode must be one of ${Object.keys(GROW_MODES).join(", ")} (got "${args.growMode}")`);
-  }
-  if (!GROW_CRITERIA[args.growCriterion]) {
-    throw new Error(`growCriterion must be one of ${Object.keys(GROW_CRITERIA).join(", ")} (got "${args.growCriterion}")`);
-  }
-  if (!KEEP_BEST[args.keepBest]) {
-    throw new Error(`keepBest must be one of ${Object.keys(KEEP_BEST).join(", ")} (got "${args.keepBest}")`);
-  }
   if (!LOSSES[args.loss]) {
     throw new Error(`loss must be one of ${Object.keys(LOSSES).join(", ")} (got "${args.loss}")`);
   }
   if (!LAYER_MODES[args.layer]) {
     throw new Error(`layer must be one of ${Object.keys(LAYER_MODES).join(", ")} (got "${args.layer}")`);
-  }
-  if (!INFO_MODES[args.info]) {
-    throw new Error(`info must be one of ${Object.keys(INFO_MODES).join(", ")} (got "${args.info}")`);
   }
   if (!Number.isFinite(args.initLogTau) || !Number.isFinite(args.initRadius)) {
     throw new Error("training_config.json missing INIT_LOG_TAU / INIT_RADIUS (required).");
@@ -474,13 +315,8 @@ export class Trainer {
     this.renderTauEnc = new RenderTauHeatmapEncoder(device, shaders);
     this.gradsEnc = new GradientsEncoder(device, shaders, { loss: LOSSES[args.loss].id });
     this.adamEnc = new AdamEncoder(device, shaders);
-    this.tauEnc = new TauEncoder(device, shaders);
     this.clearI32Enc = new ClearBufferEncoder(device, shaders, { useI32: true });
-    // Whether the count changes is settled in prepare() (a loaded sites file
-    // sets the start), so the growth kernels are always built.
-    this.growEnc = new GrowEncoder(device, shaders);
     this.statsEnc = new SiteStatsEncoder(device, shaders);
-    this.infoEnc = new InfoEncoder(device, shaders);
   }
 
   async prepare({ width, height, targetRgba32f, maskRgba32f, maskSum, initSites, initSiteCount }) {
@@ -504,21 +340,23 @@ export class Trainer {
     this.maskTex = createRgba32FloatTexture(device, width, height, { storage: true, copyDst: true });
     const maskData = maskRgba32f || whiteMaskRgba32Float(width, height).rgba;
     writeFloat32ToRgba32FloatTexture(device, this.maskTex, maskData, width, height);
+    // The mask again as f32 per pixel (0 or 1), for gradients and site stats.
+    const maskF = new Float32Array(width * height);
+    for (let i = 0; i < width * height; i += 1) maskF[i] = this.maskCpu ? (this.maskCpu[i] > 0 ? 1 : 0) : 1;
+    this.maskBuf = device.createBuffer({ size: maskF.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    device.queue.writeBuffer(this.maskBuf, 0, maskF);
 
-    // The run starts from startSites (or the loaded sites); the buffers hold
-    // the most the count schedule ever wants. Unused slots are inactive
-    // (position.x < 0), which every kernel skips.
+    // The run starts from startSites (or the loaded sites), plus the layer
+    // (LAYER_MODES) after them; the buffers hold the most the count schedule
+    // ever wants. Unused slots are inactive (position.x < 0), which every
+    // kernel skips. The schedule runs over the ordinary sites, and the layer
+    // counts against endSites (countArgs).
     if (!initSites) initSiteCount = args.startSites;
-    // Histogram layer: one more site after the initial ones (LAYER_MODES).
-    this.histMode = args.layer === "learn"
-      ? colorPeak(targetRgba32f, width * height, this.maskCpu)
-      : histogramMode(targetRgba32f, width * height, this.maskCpu);
-    const useLayer = args.layer === "learn" || (args.layer === "auto" && this.histMode.mass >= args.layerModeMin);
+    const useLayer = args.layer === "learn";
+    if (useLayer) this.histPeak = colorPeak(targetRgba32f, width * height, this.maskCpu);
     const baseSiteCount = initSiteCount;
     this.layerIndex = useLayer ? baseSiteCount : null;
     if (useLayer) initSiteCount += 1;
-    // The count schedule runs over the ordinary sites; the layer is one more
-    // and counts against endSites (countArgs).
     this.countArgs = useLayer ? { ...args, endSites: Math.max(1, args.endSites - 1) } : args;
     this.usesGrow = countVaries(this.countArgs, baseSiteCount);
     this.bufferCapacity = (this.usesGrow ? countCapacity(this.countArgs, baseSiteCount) : baseSiteCount) + (useLayer ? 1 : 0);
@@ -529,53 +367,19 @@ export class Trainer {
     this.adamBuf = createAdamBuffer(device, this.bufferCapacity);
     this.seedCounter = createSeedCounter(device);
     this.grads = createGradsBuffer(device, this.bufferCapacity);
-    this.tauGradRaw = createAtomicU32Buffer(device, this.bufferCapacity);
-    this.tauGradTmp = createAtomicU32Buffer(device, this.bufferCapacity);
-    this.tauGradTmp2 = createAtomicU32Buffer(device, this.bufferCapacity);
-    // Per-site flags: sitePin (CPU-set, never optimized) and siteLive (set by
-    // the info pass; all live until one runs). See adam.wgsl.
-    const storage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC;
-    this.sitePinned = new Uint32Array(this.bufferCapacity);
-    // 1 = fixed; 2 = the "learn" layer, whose depth Adam updates (adam.wgsl).
-    if (useLayer) this.sitePinned[this.layerIndex] = args.layer === "learn" ? 2 : 1;
-    this.sitePinBuf = device.createBuffer({ size: this.bufferCapacity * 4, usage: storage });
-    device.queue.writeBuffer(this.sitePinBuf, 0, this.sitePinned);
-    this.siteLiveBuf = device.createBuffer({ size: this.bufferCapacity * 4, usage: storage });
-    this._markAllLive();
-    // Per-pixel loss weights (the mask unless an info pass rewrites them),
-    // the mask itself, and the info pass's commit counts.
-    const maskF = new Float32Array(width * height);
-    for (let i = 0; i < width * height; i += 1) maskF[i] = this.maskCpu ? (this.maskCpu[i] > 0 ? 1 : 0) : 1;
-    this.maskBuf = device.createBuffer({ size: maskF.byteLength, usage: storage });
-    device.queue.writeBuffer(this.maskBuf, 0, maskF);
-    this.lossWeightBuf = device.createBuffer({ size: maskF.byteLength, usage: storage });
-    device.queue.writeBuffer(this.lossWeightBuf, 0, maskF);
-    this.settledBuf = device.createBuffer({ size: width * height * 4, usage: storage });
-    this.infoParams = createUniform32(device);
 
     // Candidate lists (candidates.js)
     this.cands = new CandidateLists(device, shaders, { ...args, width, height, capacity: this.bufferCapacity });
-    this.cands.globalCand = this._globalCand();
     this.candWidth = this.cands.candWidth;
     this.candHeight = this.cands.candHeight;
-    this.candDownscale = this.cands.downscale;
 
-    // Render texture
+    // Render texture and param buffers
     this.renderTex = createRgba32FloatTexture(device, width, height, { storage: true, copyDst: false, copySrc: true });
-
-    // Param buffers
-    this.renderParams = createParamsBuffer(device, this._paramsArgs(initSiteCount, 0, 0));
-
-    const invScaleSq = 1.0 / Math.pow(Math.max(width, height), 2);
-    this.invScaleSq = invScaleSq;
-    this.gradParams = createGradParamsBuffer(device, initSiteCount, invScaleSq, this._globalCand());
-    this.adamParams = createAdamParamsBuffer(device,
-      args.lrPosBase, args.lrTauBase, args.lrRadiusBase, args.lrColorBase,
-      args.lrDirBase, args.lrAnisoBase, args.beta1, args.beta2, args.eps,
-      1, width, height);
-    this.countParams = createClearParamsBuffer(device, initSiteCount, Math.sqrt(invScaleSq));
+    this.renderParams = createParamsBuffer(device, this._paramsArgs(initSiteCount));
+    this.invScaleSq = 1.0 / Math.pow(Math.max(width, height), 2);
+    this.gradParams = createGradParamsBuffer(device, initSiteCount, this.invScaleSq, this._globalCand());
+    this.adamParams = createAdamParamsBuffer(device, { width, height, layerSite: this._globalCand() });
     this.gradCountParams = createClearParamsBuffer(device, this.bufferCapacity * 10);
-    this.tauParams = createTauParamsBuffer(device, initSiteCount, TAU_DIFFUSE_LAMBDA, this.candDownscale);
 
     if (this.bufferCapacity > initSiteCount) {
       const inactive = new Float32Array((this.bufferCapacity - initSiteCount) * SITE_FLOATS);
@@ -583,22 +387,14 @@ export class Trainer {
       device.queue.writeBuffer(this.sitesBuf, initSiteCount * SITE_FLOATS * 4, inactive);
     }
 
-    // Site growth: the fit target (blurred while growing) and gain resources.
-    this.fitTex = this.targetTex;
+    // Site growth: per-site statistics, and the predicted vs realized gain of
+    // each batch (diagnostic only; never feeds back into growth).
     if (this.usesGrow) {
-      this.maskArea = maskSum > 0 ? maskSum : width * height;
-      this.growBlurParams = createUniform32(device);
-      if (args.growBlur > 0) {
-        this.blurTex = createRgba32FloatTexture(device, width, height, { storage: true, copyDst: false });
-        this.blurTmpTex = createRgba32FloatTexture(device, width, height, { storage: true, copyDst: false });
-      }
       this.siteStatsParams = createUniform32(device);
       this.siteStatsBuf = device.createBuffer({
         size: this.bufferCapacity * SITE_STAT_CH * 4,
         usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
       });
-      // Predicted vs realized gain (diagnostic only; never feeds back into
-      // growth): the last batch's predicted gains, scored at the next step.
       this.growPending = null;
       this.growGainHistory = [];
     }
@@ -613,11 +409,10 @@ export class Trainer {
         encodeSiteColors(src.slice(0, baseSiteCount * SITE_FLOATS), baseSiteCount, this.colorSpace));
       if (useLayer) this._writeLayerSite();
       this.actualSites = initSiteCount;
-      this.activeEstimate = 0;
+      this.activeEstimate = useLayer ? 1 : 0;
       for (let i = 0; i < baseSiteCount; i += 1) {
         if (initSites[i * SITE_FLOATS] >= 0) this.activeEstimate += 1;
       }
-      if (useLayer) this.activeEstimate += 1;
       this._log(`Loaded init sites: ${baseSiteCount} (active ${this.activeEstimate})`);
     } else {
       const gradThreshold = 0.01;
@@ -638,13 +433,13 @@ export class Trainer {
       this._log(`Initialized sites: ${initSiteCount} (active ${this.activeEstimate})`);
     }
     if (useLayer) {
-      const c = this.histMode.color.map((v) => Math.round(v * 255)).join(", ");
-      this._log(`Histogram layer: rgb(${c}) covers ${(100 * this.histMode.mass).toFixed(1)}% of pixels → pinned site ${this.layerIndex}` +
-        (args.layer === "learn" ? `, depth β starts at ${this._layerBeta0().toFixed(2)}` : ""));
+      const c = this.histPeak.color.map((v) => Math.round(v * 255)).join(", ");
+      this._log(`Histogram layer: rgb(${c}) covers ${(100 * this.histPeak.mass).toFixed(1)}% of pixels → ` +
+                `site ${this.layerIndex}, depth β starts at ${this._layerBeta0().toFixed(2)}`);
     }
 
     // Candidate lists for the initial sites.
-    this.cands.rebuild(this.sitesBuf, initSiteCount);
+    this._rebuildCandidates(initSiteCount);
 
     // Zero the gradient accumulators once; Adam re-zeroes each site after use.
     {
@@ -655,77 +450,11 @@ export class Trainer {
 
     // Growth state: the iteration it ended (null while growing) and why.
     this.growDoneIter = this.usesGrow ? null : 0;
-    this.growGen = 0; // growth steps that added sites (see growLrDecay)
-    this.growStartCount = baseSiteCount; // where the count schedule starts (ordinary sites)
-    // CPU copy of each site's birth growth step (adam[21]), for per-site LRs.
-    this.siteBirthGen = new Uint32Array(this.bufferCapacity);
-    this.growSteps = 0; // growth steps taken (growPatience)
-    this.growMdlBits = undefined; // cellMdlBits at the last growth step ("mdl" criterion)
-    // Pruning: the merge batch on trial ({ it, bits, k }) and why pruning ended.
-    this.prunePending = null;
-    this.pruneStop = null;
-    this.pruneMerged = 0;
     this.growStop = null;
-    if (this.usesGrow) this._updateFitTarget();
+    this.growStartCount = baseSiteCount; // where the count schedule starts (ordinary sites)
 
-    this.aniStartIter = ANI_START_ITER;
     this.trainStartMs = performance.now();
     this.bestPsnr = 0;
-
-    // Best state by args.keepBest: GPU copies of the sites and Adam buffers
-    // (so a restore resumes exactly, growth LR ages included) and its stats.
-    this.best = null;
-    this.restoredBest = null;
-    if (args.keepBest !== "off") {
-      const usage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST;
-      this.bestSitesBuf = device.createBuffer({ size: this.bufferCapacity * SITE_FLOATS * 4, usage });
-      this.bestAdamBuf = device.createBuffer({ size: this.bufferCapacity * ADAM_FLOATS * 4, usage });
-    }
-    this.samples = 3 * (this.maskCpu ? this.maskCpu.reduce((a, m) => a + (m > 0 ? 1 : 0), 0) : width * height);
-  }
-
-  // Score the state just rendered (log tick) and snapshot it if it's the best.
-  _trackBest(it, rgba, psnr) {
-    if (this.args.keepBest === "off") return;
-    const err = computeLoss(rgba, this.target, this.width, this.height, this.maskCpu, this.args.loss);
-    const sites = this.activeEstimate;
-    const score = selectionScore(this.args.keepBest, { err, sites, samples: this.samples, loss: this.args.loss });
-    this.lastScore = { it, score, err, sites, psnr };
-    if (this.best && !(score < this.best.score)) return;
-    const encoder = this.device.createCommandEncoder();
-    encoder.copyBufferToBuffer(this.sitesBuf, 0, this.bestSitesBuf, 0, this.bufferCapacity * SITE_FLOATS * 4);
-    encoder.copyBufferToBuffer(this.adamBuf, 0, this.bestAdamBuf, 0, this.bufferCapacity * ADAM_FLOATS * 4);
-    this.device.queue.submit([encoder.finish()]);
-    this.best = {
-      it, score, err, psnr, sites, siteCount: this.siteCount, growGen: this.growGen,
-      growStep: this.growSteps, siteBirthGen: this.siteBirthGen.slice(),
-      sitePinned: this.sitePinned.slice(), layerIndex: this.layerIndex,
-    };
-  }
-
-  // Put the best state back: sites, Adam moments, counts, and fresh candidate
-  // lists (a full jump flood from the restored sites), then render it.
-  _restoreBest(reason) {
-    const b = this.best;
-    const device = this.device;
-    const queue = device.queue;
-    const encoder = device.createCommandEncoder();
-    encoder.copyBufferToBuffer(this.bestSitesBuf, 0, this.sitesBuf, 0, this.bufferCapacity * SITE_FLOATS * 4);
-    encoder.copyBufferToBuffer(this.bestAdamBuf, 0, this.adamBuf, 0, this.bufferCapacity * ADAM_FLOATS * 4);
-    queue.submit([encoder.finish()]);
-    this.siteCount = this.actualSites = b.siteCount;
-    this.activeEstimate = b.sites;
-    this.growGen = b.growGen;
-    this.siteBirthGen.set(b.siteBirthGen);
-    this.layerIndex = b.layerIndex;
-    this._setPinned(b.sitePinned.slice());
-    this._markAllLive();
-    updateClearParamsBuffer(queue, this.countParams, b.siteCount, Math.sqrt(this.invScaleSq));
-    updateGradParamsBuffer(queue, this.gradParams, b.siteCount, this.invScaleSq, this._globalCand());
-    this._rebuildCandidates(b.siteCount);
-    this.restoredBest = { ...b, reason };
-    this._log(`Restored best state from iter ${b.it} (${reason}): ${b.sites} sites, ` +
-              `${this.args.keepBest === "mdl" ? `${(b.score / 8192).toFixed(2)} KiB` : `loss ${b.err.toPrecision(4)}`}.`);
   }
 
   // Candidate lists from scratch for sites [0, n) (CandidateLists.rebuild).
@@ -743,19 +472,26 @@ export class Trainer {
   // sad_shared.wgsl): the histogram layer, or none.
   _globalCand() { return this.layerIndex ?? 0xffffffff; }
 
+  // Site count, gradient and Adam params after the site count or the layer's
+  // index changed.
+  _updateCountParams(n) {
+    const queue = this.device.queue;
+    updateGradParamsBuffer(queue, this.gradParams, n, this.invScaleSq, this._globalCand());
+    this.cands.globalCand = this._globalCand();
+  }
+
   _log(msg) { if (this.onLog) this.onLog({ type: "msg", message: msg }); }
 
-  // The histogram layer as a site at layerIndex: the mode color, logit
-  // -e^LAYER_LOG_TAU · d ≈ 0 everywhere (radius 0, isotropic, image center).
+  // The histogram layer as a site at layerIndex: the peak color, logit
+  // -e^LEARN_LOG_TAU · (d - r) ≈ β everywhere (isotropic, image center).
   _writeLayerSite() {
-    const learn = this.args.layer === "learn";
     const site = new Float32Array(SITE_FLOATS);
     site[0] = (this.width - 1) / 2;
     site[1] = (this.height - 1) / 2;
-    site[2] = learn ? LEARN_LOG_TAU : LAYER_LOG_TAU;
+    site[2] = LEARN_LOG_TAU;
     // Logit -τ(d - r·inv_scale) at d = 0 is the depth β.
-    site[3] = learn ? this._layerBeta0() * Math.max(this.width, this.height) / Math.exp(LEARN_LOG_TAU) : 0;
-    site.set(this.histMode.color, 4);
+    site[3] = this._layerBeta0() * Math.max(this.width, this.height) / Math.exp(LEARN_LOG_TAU);
+    site.set(this.histPeak.color, 4);
     site[7] = 1;
     site[8] = 0;
     site[9] = 0;
@@ -763,18 +499,12 @@ export class Trainer {
       encodeSiteColors(site, 1, this.colorSpace));
   }
 
-  // "learn" layer's starting depth: the log-odds of its color's peak mass.
-  // The start carries the prior: on MNIST, starting at β = -6 instead of
-  // from p cost 1.4 dB at 32 sites (β only climbed back to -4, vs +3.4).
+  // The layer's starting depth: the log-odds of its color's peak mass. The
+  // start carries the prior: on MNIST, starting at β = -6 instead of from p
+  // cost 1.4 dB at 32 sites (β only climbed back to -4, vs +3.4).
   _layerBeta0() {
-    const p = Math.min(1 - 1e-3, Math.max(1e-3, this.histMode.mass));
+    const p = Math.min(1 - 1e-3, Math.max(1e-3, this.histPeak.mass));
     return Math.max(-LAYER_BETA_MAX, Math.min(LAYER_BETA_MAX, Math.log(p / (1 - p))));
-  }
-
-  // Every site counts as serving a pixel in the loss until the next info pass
-  // (after anything that adds, removes or moves sites wholesale).
-  _markAllLive() {
-    this.device.queue.writeBuffer(this.siteLiveBuf, 0, new Uint32Array(this.bufferCapacity).fill(1));
   }
 
   async run() {
@@ -793,72 +523,30 @@ export class Trainer {
       }
 
       if (this.usesGrow) await this._countStep(it);
-      if (args.pruneEvery > 0) await this._pruneStep(it);
       const siteCount = this.siteCount;
       const activeSites = this.activeEstimate;
-      const updateCandidates = (it % candUpdateFreq === 0);
 
       const lrScale = args.lrMult * lrSchedule(it, args.iters, args.lrSchedule, this.growDoneIter ?? Infinity);
-      const lrDir = it >= this.aniStartIter ? args.lrDirBase * lrScale : 0;
-      const lrAniso = it >= this.aniStartIter ? args.lrAnisoBase * lrScale : 0;
-      updateAdamParamsBuffer(queue, this.adamParams,
-        args.lrPosBase * lrScale, args.lrTauBase * lrScale, args.lrRadiusBase * lrScale,
-        args.lrColorBase * lrScale, lrDir, lrAniso, args.beta1, args.beta2, args.eps, it + 1, this.width, this.height,
-        this.growGen, args.growLrDecay, args.info === "commit" && args.commitFreeze);
-      const infoEvery = args.infoEvery || candUpdateFreq;
-      const runInfo = args.info !== "off" && it % infoEvery === 0;
-      if (runInfo) {
-        updateInfoParamsBuffer(queue, this.infoParams, {
-          siteCount, mode: args.info === "commit" ? 2 : 1, commitAfter: args.commitAfter,
-          recheck: args.commitRecheck, invScaleSq: this.invScaleSq, quant: INFO_QUANT, liveEps: INFO_LIVE_EPS,
-          globalCand: this._globalCand(),
-        });
-      }
-
-      const blend = it / Math.max(1, iters);
-      const lambda = TAU_DIFFUSE_LAMBDA * (0.1 + 0.9 * blend);
-      updateTauParamsBuffer(queue, this.tauParams, siteCount, lambda, this.candDownscale);
+      updateAdamParamsBuffer(queue, this.adamParams, {
+        lrPos: args.lrPosBase * lrScale, lrTau: args.lrTauBase * lrScale, lrRadius: args.lrRadiusBase * lrScale,
+        lrColor: args.lrColorBase * lrScale,
+        lrDir: it >= ANI_START_ITER ? args.lrDirBase * lrScale : 0,
+        lrAniso: it >= ANI_START_ITER ? args.lrAnisoBase * lrScale : 0,
+        beta1: args.beta1, beta2: args.beta2, eps: args.eps, t: it + 1,
+        width: this.width, height: this.height, layerSite: this._globalCand(),
+      });
 
       const shouldLog = (it % logFreq === 0) || (it === iters - 1);
       const shouldPreview = shouldLog || (it % viewerFreq === 0);
       if (shouldLog || shouldPreview) {
-        updateParamsBuffer(queue, this.renderParams, this._paramsArgs(siteCount, 0, 0));
+        updateParamsBuffer(queue, this.renderParams, this._paramsArgs(siteCount));
       }
 
       const encoder = device.createCommandEncoder();
-
-      // Candidate update
-      if (updateCandidates) {
-        this.cands.globalCand = this._globalCand();
-        this.cands.encodeUpdate(encoder, this.sitesBuf, siteCount);
-      }
-
-      // Remaining information: per-pixel loss weights from the current lists.
-      if (runInfo) this._encodeInfo(encoder);
-
-      // Gradients
+      if (it % candUpdateFreq === 0) this.cands.encodeUpdate(encoder, this.sitesBuf, siteCount);
       this.gradsEnc.encode(encoder, this.sitesBuf, this.gradParams,
-        this.cands.cand0, this.cands.cand1, this.fitTex, args.infoGrad ? this.lossWeightBuf : this.maskBuf,
+        this.cands.cand0, this.cands.cand1, this.targetTex, this.maskBuf,
         this.grads, this.width, this.height);
-
-      // Tau diffusion
-      if (TAU_DIFFUSE_PASSES > 0 && TAU_DIFFUSE_LAMBDA > 0) {
-        this.tauEnc.encodeExtract(encoder, this.grads, this.tauGradRaw,
-          this.countParams, siteCount);
-        let curIn = this.tauGradRaw;
-        let curOut = this.tauGradTmp;
-        for (let p = 0; p < TAU_DIFFUSE_PASSES; p += 1) {
-          this.tauEnc.encodeDiffuse(encoder, this.cands.cand0, this.cands.cand1,
-            this.sitesBuf, this.tauGradRaw, curIn, curOut, this.tauParams, siteCount);
-          if (curOut === this.tauGradTmp) {
-            [curIn, curOut] = [curOut, this.tauGradTmp2];
-          } else {
-            [curIn, curOut] = [curOut, this.tauGradTmp];
-          }
-        }
-        this.tauEnc.encodeWriteback(encoder, curIn, this.grads,
-          this.countParams, siteCount);
-      }
 
       // Snapshot the accumulated gradients on log ticks — Adam zeroes them.
       let gradStaging = null;
@@ -871,9 +559,7 @@ export class Trainer {
         encoder.copyBufferToBuffer(this.grads, 0, gradStaging, 0, gradBytes);
       }
 
-      // Adam
-      this.adamEnc.encode(encoder, this.sitesBuf, this.adamBuf, this.grads,
-        this.adamParams, siteCount, this.sitePinBuf, this.siteLiveBuf);
+      this.adamEnc.encode(encoder, this.sitesBuf, this.adamBuf, this.grads, this.adamParams, siteCount);
 
       // Preview/log renders. The log path does a blocking readback for PSNR.
       // Viewer ticks wait only for the small site readback so centroid overlays
@@ -899,7 +585,6 @@ export class Trainer {
         gradStaging.destroy();
         const psnr = computePsnrSafe(rgba, this.target, this.width, this.height, this.maskCpu, this.maskSum);
         this.bestPsnr = Math.max(this.bestPsnr, psnr);
-        this._trackBest(it, rgba, psnr);
         const elapsed = (performance.now() - this.trainStartMs) / 1000;
         const itsPerSec = (it + 1) / Math.max(elapsed, 1e-6);
         if (this.onLog) {
@@ -907,16 +592,12 @@ export class Trainer {
             type: "iter",
             it, iters,
             lrScale,
-            siteLr: this._siteLrs(lrScale, sitesData, siteCount),
             psnr,
             gradStats,
             activeSites,
             totalSites: siteCount,
-            fitSigma: this.fitSigma || 0,
             growDoneIter: this.growDoneIter,
             growStop: this.growStop,
-            score: this.lastScore,
-            best: this.best,
             itsPerSec,
             elapsedSec: elapsed,
             renderRgba: rgba,
@@ -933,52 +614,23 @@ export class Trainer {
       } else if (((it + 1) & 0x1f) === 0) {
         await yieldToBrowser();
       }
-
     }
 
-    if (this.best && this.lastScore && this.best.it !== this.lastScore.it) this._restoreBest("end of run");
-    const queue2 = device.queue;
-    updateParamsBuffer(queue2, this.renderParams, this._paramsArgs(this.actualSites, 0, 0));
+    updateParamsBuffer(queue, this.renderParams, this._paramsArgs(this.actualSites));
     const encoder = device.createCommandEncoder();
     this.renderEnc.encode(encoder, this.sitesBuf, this.renderParams,
       this.cands.cand0, this.cands.cand1, this.renderTex, this.width, this.height);
-    device.queue.submit([encoder.finish()]);
+    queue.submit([encoder.finish()]);
   }
 
   // ---- Site count: growth and merging ----
   // Every growEvery iterations the count moves to the schedule's value
   // (countTarget, _countStep): down by merging (_mergeTo), up in a growth
-  // batch (_growTo). growMode "split": each existing
-  // site is scored by the error a two-way split of its cell would remove
-  // (siteSplit, from site_stats.wgsl's moments) and the best cells are split,
-  // one new site each. growMode "insert": new sites are picked one at a time
-  // by their exact gain in the training loss (insert.js), leaving existing
-  // sites alone. Only batches whose gain beats λ·BITS_PER_SITE (the cost of a
-  // site's bits, in squared error for splits and in the training loss for
-  // insertions; λ = 0 only requires a positive gain) qualify; when nothing
-  // does, the count schedule ends there. Optionally (growBlur > 0) the fit target is the
-  // image blurred to the current spacing until growth ends; in tests that cost
-  // 0.5-2 dB at a matched site count, since sites place edges far finer than
-  // their spacing.
-
-  _siteSpacing() { return Math.sqrt(this.maskArea / Math.max(1, this.siteCount)); }
-
-  // Point the gradients at the blurred (while growing) or original target.
-  _updateFitTarget() {
-    const sigma = this.blurTex && this.growDoneIter === null ? this.args.growBlur * this._siteSpacing() : 0;
-    this.fitSigma = sigma >= 0.25 ? sigma : 0;
-    if (!this.fitSigma) {
-      this.fitTex = this.targetTex;
-      return;
-    }
-    updateGrowBlurParamsBuffer(this.device.queue, this.growBlurParams,
-      { width: this.width, height: this.height, sigma: this.fitSigma });
-    const encoder = this.device.createCommandEncoder();
-    this.growEnc.encodeBlur(encoder, this.growBlurParams, this.targetTex, this.maskTex,
-      this.blurTmpTex, this.blurTex, this.width, this.height);
-    this.device.queue.submit([encoder.finish()]);
-    this.fitTex = this.blurTex;
-  }
+  // batch (_growTo). Growth scores each site by the error a two-way split of
+  // its cell would remove (siteSplit, from site_stats.wgsl's moments) and
+  // splits the best cells, one new site each. Only splits whose gain beats
+  // λ·BITS_PER_SITE (squared error; λ = 0 only requires a positive gain)
+  // qualify; when none does, the count schedule ends there.
 
   // Per-site stats of the current state (site_stats.wgsl): Float32Array of
   // SITE_STAT_CH per site, for sites [0, siteCount).
@@ -994,7 +646,7 @@ export class Trainer {
     const staging = device.createBuffer({ size: bytes, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
     const encoder = device.createCommandEncoder();
     this.statsEnc.encode(encoder, this.sitesBuf, this.siteStatsParams, this.cands.cand0, this.cands.cand1,
-      this.fitTex, this.lossWeightBuf, this.siteStatsBuf, this.width, this.height, this.sitePinBuf);
+      this.targetTex, this.maskBuf, this.siteStatsBuf, this.width, this.height);
     encoder.copyBufferToBuffer(this.siteStatsBuf, 0, staging, 0, bytes);
     device.queue.submit([encoder.finish()]);
     await staging.mapAsync(GPUMapMode.READ);
@@ -1019,24 +671,9 @@ export class Trainer {
     if (this.onLog) this.onLog({ type: "growthGain", ...entry });
   }
 
-  // LR multiplier of each site this step: lrScale × growLrDecay^age, as in
-  // adam.wgsl (age = growth steps since the site's birth). NaN for removed
-  // sites. `sites` is the RGB readback (SITE_FLOATS each).
-  _siteLrs(lrScale, sites, n) {
-    const out = new Float32Array(n);
-    for (let i = 0; i < n; i += 1) {
-      const age = this.growGen - this.siteBirthGen[i];
-      out[i] = sites[i * SITE_FLOATS] >= 0
-        ? lrScale * (age > 0 ? this.args.growLrDecay ** age : 1)
-        : NaN;
-    }
-    return out;
-  }
-
   _endGrowth(it, reason) {
     this.growDoneIter = it;
     this.growStop = reason;
-    this._updateFitTarget();
     this._log(`Growth done at iter ${it}: ${this.activeEstimate} sites (${reason}).`);
   }
 
@@ -1044,12 +681,11 @@ export class Trainer {
   // above `threshold`. Rewrites the split parents in place and returns the new
   // sites (RGB) as { data, k, predicted, best }, or null.
   async _splitBatch(it, stats, n0, count, threshold) {
-    const device = this.device;
-    const queue = device.queue;
-    const sitesRaw = await readSites(device, this.sitesBuf, n0);
+    const queue = this.device.queue;
+    const sitesRaw = await readSites(this.device, this.sitesBuf, n0);
     const splits = [];
     for (let i = 0; i < n0; i += 1) {
-      if (sitesRaw[i * SITE_FLOATS] < 0 || this.sitePinned[i]) continue;
+      if (sitesRaw[i * SITE_FLOATS] < 0 || i === this.layerIndex) continue;
       const sp = siteSplit(stats, i);
       if (sp && sp.gain > threshold) splits.push(sp);
     }
@@ -1063,10 +699,8 @@ export class Trainer {
     // two lands on the split line. Both get fresh Adam moments.
     const k = splits.length;
     const data = new Float32Array(k * SITE_FLOATS);
-    this.growGen += 1;
     const adam = new Float32Array(ADAM_FLOATS);
     adam[20] = it;
-    adam[21] = this.growGen;
     const clampPos = (v, max) => Math.min(max - 1, Math.max(0, v));
     splits.forEach((sp, j) => {
       const b = sp.site * SITE_FLOATS;
@@ -1082,10 +716,8 @@ export class Trainer {
       data.set(sp.newColor, o + 4);
       // Rewrite the existing site whole: its stored colors are in the run's
       // color space, so re-encode from RGB like the new site.
-      const enc = encodeSiteColors(old, 1, this.colorSpace);
-      queue.writeBuffer(this.sitesBuf, sp.site * SITE_FLOATS * 4, enc);
+      queue.writeBuffer(this.sitesBuf, sp.site * SITE_FLOATS * 4, encodeSiteColors(old, 1, this.colorSpace));
       queue.writeBuffer(this.adamBuf, sp.site * ADAM_FLOATS * 4, adam);
-      this.siteBirthGen[sp.site] = this.growGen;
     });
     return { data, k, predicted: splits.map((sp) => sp.gain), best: splits[0].gain };
   }
@@ -1093,80 +725,25 @@ export class Trainer {
   // The candidate lists as 8 u32 site ids per candidate pixel.
   _readCandidates() { return this.cands.read(); }
 
-  // ---- Pruning (args.pruneEvery) ----
-  // Every pruneEvery iterations after growth (any time in fixed mode), until
-  // pruneEvery before the end: the last merge batch, refined since, is kept
-  // only if the render's description length (selectionScore "mdl": sites ×
-  // BITS_PER_SITE + the training loss's residual bits) went down, else it's
-  // undone and pruning ends. Ward costs on cells at their mean colors
-  // underestimate what a merge costs the soft render, so they only pick the
-  // candidates: judged on the cell model instead, Kodak at 256 px went from
-  // 800 to 300 sites for a worse render score than keeping all 800. Then the
-  // merges that pay for their bits are applied (pickMerges): the larger cell's site becomes
-  // the pixel-weighted average of the pair, the other is deactivated, both
-  // get fresh Adam moments, and the candidate lists are rebuilt. Pruning also
-  // ends when no merge pays. An accepted batch restarts keepBest, which
-  // would otherwise go back to a state with more sites.
-
-  async _pruneStep(it) {
-    const args = this.args;
-    const every = args.pruneEvery;
-    if (this.pruneStop || it === 0 || it % every !== 0) return;
-    if (this.usesGrow && (this.growDoneIter === null || it - this.growDoneIter < every)) return;
+  // Count step down: merge the cheapest neighbouring pairs (Ward's criterion,
+  // merge.js) until `target` sites are left, each site in at most one merge,
+  // so a step removes at most half of them. Each `keep` site becomes the
+  // pixel-weighted average of the pair (mergedSite), each `drop` site is
+  // deactivated, both get fresh Adam moments, and the candidate lists are
+  // rebuilt. Returns the number merged.
+  async _mergeTo(it, target) {
     const n = this.siteCount;
     const sites = await this._readSitesRgb(n);
     const moments = cellMoments({
       width: this.width, height: this.height, sites, n, cand: await this._readCandidates(),
       candWidth: this.candWidth, candHeight: this.candHeight, target: this.target, mask: this.maskCpu,
     });
-    const bits = selectionScore("mdl", {
-      err: await this._renderLoss(), sites: this.activeEstimate, samples: this.samples, loss: args.loss,
-    });
-    const pending = this.prunePending;
-    this.prunePending = null;
-    if (pending) {
-      if (!(bits < pending.bits)) {
-        this._restorePruneSnapshot();
-        await this._endPrune(it, `the last ${pending.k} merge(s) didn't pay for their bits ` +
-          `(${(pending.bits / 8192).toFixed(2)} → ${(bits / 8192).toFixed(2)} KiB), undone`);
-        return;
-      }
-      this.pruneMerged += pending.k;
-      this.best = null; // keepBest restarts from the pruned state
-    }
-    if (it > args.iters - every) { await this._endPrune(it, "too close to the end of the run"); return; }
-    const merges = pickMerges(moments, this.samples, BITS_PER_SITE, { pinned: this._pinnedIds(n) });
-    if (!merges.length) { await this._endPrune(it, "no merge would pay for its bits"); return; }
-
-    const device = this.device;
-    const queue = device.queue;
-    const snap = device.createCommandEncoder();
-    this.pruneSitesBuf ??= device.createBuffer({ size: this.bufferCapacity * SITE_FLOATS * 4,
-      usage: GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
-    this.pruneAdamBuf ??= device.createBuffer({ size: this.bufferCapacity * ADAM_FLOATS * 4,
-      usage: GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
-    snap.copyBufferToBuffer(this.sitesBuf, 0, this.pruneSitesBuf, 0, this.bufferCapacity * SITE_FLOATS * 4);
-    snap.copyBufferToBuffer(this.adamBuf, 0, this.pruneAdamBuf, 0, this.bufferCapacity * ADAM_FLOATS * 4);
-    queue.submit([snap.finish()]);
-    this.pruneSnapshot = { active: this.activeEstimate, growGen: this.growGen };
-    this._applyMerges(it, sites, moments, merges);
-    this.prunePending = { it, bits, k: merges.length };
-    this._log(`Prune @${it}: merged ${merges.length} pair(s) → ${this.activeEstimate} sites ` +
-              `| cheapest ${fmtLambda(merges[0].cost * 255 * 255)} levels², on trial until iter ${it + every}`);
-  }
-
-  // Writes `merges` (pickMerges) out: each `keep` site becomes the
-  // pixel-weighted average of the pair (mergedSite), each `drop` site is
-  // deactivated, both get fresh Adam moments, and the candidate lists are
-  // rebuilt. `sites` is the RGB readback the merges were picked from.
-  _applyMerges(it, sites, moments, merges) {
+    const pinned = new Set(this.layerIndex === null ? [] : [this.layerIndex]);
+    const merges = pickMerges(moments, this.activeEstimate - target, pinned);
+    if (!merges.length) return 0;
     const queue = this.device.queue;
-    // Merged sites restart at age 0 (adam[21] = growGen), but a merge step
-    // isn't a growth step: it doesn't age everyone else (growLrDecay), which
-    // over a long prune schedule froze every site.
     const adam = new Float32Array(ADAM_FLOATS);
     adam[20] = it;
-    adam[21] = this.growGen;
     const inactive = new Float32Array(SITE_FLOATS);
     inactive[0] = -1;
     inactive[1] = -1;
@@ -1176,73 +753,11 @@ export class Trainer {
       queue.writeBuffer(this.sitesBuf, drop * SITE_FLOATS * 4, inactive);
       queue.writeBuffer(this.adamBuf, keep * ADAM_FLOATS * 4, adam);
       queue.writeBuffer(this.adamBuf, drop * ADAM_FLOATS * 4, adam);
-      this.siteBirthGen[keep] = this.growGen;
     }
     this.activeEstimate -= merges.length;
-    this._markAllLive();
     this._rebuildCandidates(this.siteCount);
-  }
-
-  // Ids of the pinned sites among [0, n), which never merge (pickMerges).
-  _pinnedIds(n) {
-    const out = new Set();
-    for (let i = 0; i < n; i += 1) if (this.sitePinned[i]) out.add(i);
-    return out;
-  }
-
-  // The remaining-information pass (info_update.wgsl) into `encoder`.
-  _encodeInfo(encoder) {
-    this.infoEnc.encode(encoder, {
-      sites: this.sitesBuf, params: this.infoParams, cand0: this.cands.cand0, cand1: this.cands.cand1,
-      targetTex: this.targetTex, mask: this.maskBuf, weight: this.lossWeightBuf,
-      settled: this.settledBuf, siteLive: this.siteLiveBuf, width: this.width, height: this.height,
-    });
-  }
-
-  // Count step down: merge the cheapest neighbouring pairs (Ward's criterion,
-  // merge.js) until `target` sites are left, each site in at most one merge,
-  // so a step removes at most half of them. Returns the number merged.
-  async _mergeTo(it, target) {
-    const n = this.siteCount;
-    const sites = await this._readSitesRgb(n);
-    const moments = cellMoments({
-      width: this.width, height: this.height, sites, n, cand: await this._readCandidates(),
-      candWidth: this.candWidth, candHeight: this.candHeight, target: this.target, mask: this.maskCpu,
-    });
-    const merges = pickMerges(moments, this.samples, BITS_PER_SITE,
-      { count: this.activeEstimate - target, pinned: this._pinnedIds(n) });
-    if (!merges.length) return 0;
-    this._applyMerges(it, sites, moments, merges);
-    this.best = null; // keepBest restarts, so it can't go back to more sites
     this._log(`Merge @${it}: ${merges.length} pair(s) → ${this.activeEstimate} sites (schedule wants ${target})`);
     return merges.length;
-  }
-
-  // Mean training loss per sample of the current state (renders and reads back).
-  async _renderLoss() {
-    updateParamsBuffer(this.device.queue, this.renderParams, this._paramsArgs(this.siteCount, 0, 0));
-    const encoder = this.device.createCommandEncoder();
-    this.renderEnc.encode(encoder, this.sitesBuf, this.renderParams,
-      this.cands.cand0, this.cands.cand1, this.renderTex, this.width, this.height);
-    this.device.queue.submit([encoder.finish()]);
-    const rgba = await readRgba32FloatTexture(this.device, this.renderTex, this.width, this.height);
-    return computeLoss(rgba, this.target, this.width, this.height, this.maskCpu, this.args.loss);
-  }
-
-  _restorePruneSnapshot() {
-    const encoder = this.device.createCommandEncoder();
-    encoder.copyBufferToBuffer(this.pruneSitesBuf, 0, this.sitesBuf, 0, this.bufferCapacity * SITE_FLOATS * 4);
-    encoder.copyBufferToBuffer(this.pruneAdamBuf, 0, this.adamBuf, 0, this.bufferCapacity * ADAM_FLOATS * 4);
-    this.device.queue.submit([encoder.finish()]);
-    this.activeEstimate = this.pruneSnapshot.active;
-    this.growGen = this.pruneSnapshot.growGen;
-    this._rebuildCandidates(this.siteCount);
-  }
-
-  async _endPrune(it, reason) {
-    // A batch still on trial at the end of the run stays (keepBest decides).
-    this.pruneStop = reason;
-    this._log(`Pruning done at iter ${it}: ${this.activeEstimate} sites, ${this.pruneMerged} merged (${reason}).`);
   }
 
   // Moves the active sites (and their Adam moments) to the front, in order,
@@ -1263,60 +778,22 @@ export class Trainer {
     const outSites = new Float32Array(n * SITE_FLOATS);
     const outAdam = new Float32Array(n * ADAM_FLOATS);
     let m = 0;
-    const pinned = new Uint32Array(this.bufferCapacity);
+    let layer = null;
     for (let i = 0; i < n; i += 1) {
       if (!(sites[i * SITE_FLOATS] >= 0)) continue;
       outSites.set(sites.subarray(i * SITE_FLOATS, (i + 1) * SITE_FLOATS), m * SITE_FLOATS);
       outAdam.set(adam.subarray(i * ADAM_FLOATS, (i + 1) * ADAM_FLOATS), m * ADAM_FLOATS);
-      this.siteBirthGen[m] = this.siteBirthGen[i];
-      pinned[m] = this.sitePinned[i];
-      if (i === this.layerIndex) this.layerIndex = m;
+      if (i === this.layerIndex) layer = m;
       m += 1;
     }
-    this._setPinned(pinned);
-    this._markAllLive();
+    this.layerIndex = layer;
     for (let i = m; i < n; i += 1) { outSites[i * SITE_FLOATS] = -1; outSites[i * SITE_FLOATS + 1] = -1; }
     device.queue.writeBuffer(this.sitesBuf, 0, outSites);
     device.queue.writeBuffer(this.adamBuf, 0, outAdam);
     this.siteCount = this.actualSites = this.activeEstimate = m;
-    updateClearParamsBuffer(device.queue, this.countParams, m, Math.sqrt(this.invScaleSq));
-    updateGradParamsBuffer(device.queue, this.gradParams, m, this.invScaleSq, this._globalCand());
+    this._updateCountParams(m);
     this.growPending = null; // site ids changed
     this._rebuildCandidates(m);
-  }
-
-  _setPinned(pinned) {
-    this.sitePinned = pinned;
-    this.device.queue.writeBuffer(this.sitePinBuf, 0, pinned);
-  }
-
-  // Insertion growth (insert.js): up to `count` new sites picked greedily by
-  // their exact gain in the training loss; existing sites are untouched.
-  async _insertBatch(n0, count, threshold) {
-    const sitesRgb = await this._readSitesRgb(n0);
-    const cand = await this._readCandidates();
-    const field = insertionField({
-      width: this.width, height: this.height, sites: sitesRgb, siteCount: n0,
-      cand, candWidth: this.candWidth, candHeight: this.candHeight, global: this.layerIndex ?? -1,
-    });
-    const picks = pickInsertions({
-      width: this.width, height: this.height, target: this.target, mask: this.maskCpu,
-      sites: sitesRgb, field, count, threshold, loss: this.args.loss,
-      spacing: Math.sqrt(this.maskArea / (n0 + count)),
-    });
-    if (!picks.length) return null;
-    this.growGen += 1;
-    const k = picks.length;
-    const data = new Float32Array(k * SITE_FLOATS);
-    picks.forEach((pk, j) => data.set(pk.site, j * SITE_FLOATS));
-    // predicted: squared-error gains, to match the realized-gain diagnostic.
-    return { data, k, predicted: picks.map((pk) => pk.gainL2), best: picks[0].gain };
-  }
-
-  // Units of growth gains and λ: split gains are squared error; insertion
-  // gains are in the training loss.
-  _gainUnit() {
-    return this.args.growMode === "insert" && this.args.loss === "l1" ? "levels" : "levels²";
   }
 
   // One count step (every growEvery iterations, until the schedule's horizon):
@@ -1347,8 +824,8 @@ export class Trainer {
     }
   }
 
-  // Count step up: add sites (growMode) until `target` are active, unless λ,
-  // the MDL criterion or patience ends the schedule first.
+  // Count step up: split cells until `target` sites are active, unless λ
+  // ends the schedule first.
   async _growTo(it, target) {
     const args = this.args;
     // Merged-away sites leave inactive slots; make room at the end first.
@@ -1356,72 +833,42 @@ export class Trainer {
     const n0 = this.siteCount;
     const want = Math.min(target - this.activeEstimate, this.bufferCapacity - n0);
     if (want <= 0) return;
-    if (args.growPatience > 0 && this.best && this.growSteps - this.best.growStep >= args.growPatience) {
-      this._restoreBest(`no better ${args.keepBest} score in ${args.growPatience} growth step(s)`);
-      this._endGrowth(it, `patience: ${args.growPatience} growth step(s) without a better ${args.keepBest} score`);
-      return;
-    }
-    this.growSteps += 1;
     const stats = await this._siteStats();
     this._reportGrowthGain(it, stats);
 
     const device = this.device;
     const queue = device.queue;
-    const mdl = args.growCriterion === "mdl";
-    if (mdl) {
-      const bits = cellMdlBits(stats, n0, this.activeEstimate, this.samples);
-      const prev = this.growMdlBits;
-      this.growMdlBits = bits;
-      if (prev !== undefined && !(bits < prev)) {
-        this._endGrowth(it, `MDL (stop): the last batch didn't pay for its bits ` +
-          `(${(prev / 8192).toFixed(2)} → ${(bits / 8192).toFixed(2)} KiB)`);
-        return;
-      }
-    }
-    const threshold = mdl ? 0 : args.growLambda * BITS_PER_SITE;
-    const batch = args.growMode === "insert"
-      ? await this._insertBatch(n0, want, threshold)
-      : await this._splitBatch(it, stats, n0, want, threshold);
+    const threshold = args.growLambda * BITS_PER_SITE;
+    const batch = await this._splitBatch(it, stats, n0, want, threshold);
     if (!batch) {
-      const what = args.growMode === "insert" ? "insertion" : "split";
-      this._endGrowth(it, `λ (stop): no ${what} would remove more than λ × ${BITS_PER_SITE} = ` +
-                          `${fmtLambda(threshold)} ${this._gainUnit()}`);
+      this._endGrowth(it, `λ (stop): no split would remove more than λ × ${BITS_PER_SITE} = ` +
+                          `${fmtLambda(threshold)} levels²`);
       return;
     }
     const { data, k } = batch;
     queue.writeBuffer(this.sitesBuf, n0 * SITE_FLOATS * 4, encodeSiteColors(data, k, this.colorSpace));
     const adamNew = new Float32Array(k * ADAM_FLOATS);
-    for (let j = 0; j < k; j += 1) {
-      adamNew[j * ADAM_FLOATS + 20] = it;
-      adamNew[j * ADAM_FLOATS + 21] = this.growGen;
-    }
+    for (let j = 0; j < k; j += 1) adamNew[j * ADAM_FLOATS + 20] = it;
     queue.writeBuffer(this.adamBuf, n0 * ADAM_FLOATS * 4, adamNew);
-    this.siteBirthGen.fill(this.growGen, n0, n0 + k);
-    this._markAllLive();
     this.growPending = { it, sites: batch.predicted.map((predicted, j) => ({ id: n0 + j, predicted })) };
 
     const n1 = n0 + k;
     this.siteCount = n1;
     this.actualSites = n1;
     this.activeEstimate += k;
-    updateClearParamsBuffer(queue, this.countParams, n1, Math.sqrt(this.invScaleSq));
-    updateGradParamsBuffer(queue, this.gradParams, n1, this.invScaleSq, this._globalCand());
+    this._updateCountParams(n1);
 
     // Seed the new sites and run a jump flood so they claim their regions now;
     // left to the regular updates (1 px steps by then) they would barely spread
     // before the next step, which would then see the same error in the same places.
     const seedEnc = device.createCommandEncoder();
-    this.cands.globalCand = this._globalCand();
     this.cands.encodeAdded(seedEnc, this.sitesBuf, n0, n1);
     queue.submit([seedEnc.finish()]);
 
-    this._updateFitTarget();
     this._log(`Grow @${it}: +${k} → ${this.activeEstimate} sites` +
               (k < want ? ` (${want} wanted; the rest under λ` +
-                (args.growMode === "split" && want > this.activeEstimate - k ? " or no cell left to split)" : ")") : "") +
-              ` | best ${args.growMode === "insert" ? "insertion" : "split"} ` +
-              `${fmtLambda(batch.best / BITS_PER_SITE)} ${this._gainUnit()}/bit` +
-              (this.fitSigma ? ` | blur σ ${this.fitSigma.toFixed(1)}px` : ""));
+                (want > this.activeEstimate - k ? " or no cell left to split)" : ")") : "") +
+              ` | best split ${fmtLambda(batch.best / BITS_PER_SITE)} levels²/bit`);
   }
 
   // Encode preview readbacks into the same submission as the preview render.
@@ -1659,7 +1106,7 @@ export class Trainer {
     const encoder = device.createCommandEncoder();
     encoder.clearBuffer(this._gnBuf);
     this.gnEnc.encode(encoder, this.sitesBuf, this.gradParams,
-      this.cands.cand0, this.cands.cand1, this.fitTex, this.maskBuf,
+      this.cands.cand0, this.cands.cand1, this.targetTex, this.maskBuf,
       this._gnBuf, this.width, this.height);
     encoder.copyBufferToBuffer(this._gnBuf, 0, staging, 0, bytes);
     device.queue.submit([encoder.finish()]);
@@ -1708,53 +1155,28 @@ export class Trainer {
       growDoneIter: this.growDoneIter,
       growStop: this.growStop,
       growthGain: this.growGainHistory || [],
-      best: this.best,
-      restoredBest: this.restoredBest,
-      pruneStop: this.pruneStop,
-      pruneMerged: this.pruneMerged,
       activeSites: this.activeEstimate,
       trainSeconds: (performance.now() - this.trainStartMs) / 1000,
-      diag: await this._infoDiag(sitesArray),
+      layer: await this._layerStats(sitesArray),
     };
   }
 
-  // Layer / info-pass state at the end of a run: the histogram mode, whether
-  // a layer was added, the mean loss weight over masked pixels, the committed
-  // fraction ("commit") and how many active unpinned sites were frozen.
-  async _infoDiag(sitesRgb) {
-    const n = this.width * this.height;
-    const [weight, settled, live] = await Promise.all([
-      readBufferF32(this.device, this.lossWeightBuf, n),
-      readBufferU32(this.device, this.settledBuf, n),
-      readBufferU32(this.device, this.siteLiveBuf, this.actualSites),
-    ]);
-    let wsum = 0, counted = 0, committed = 0;
-    for (let p = 0; p < n; p += 1) {
-      if (this.maskCpu && !(this.maskCpu[p] > 0)) continue;
-      counted += 1;
-      wsum += weight[p];
-      if (this.args.info === "commit" && settled[p] >= this.args.commitAfter) committed += 1;
-    }
-    let frozen = 0;
-    for (let i = 0; i < this.actualSites; i += 1) {
-      if (sitesRgb[i * SITE_FLOATS] >= 0 && !this.sitePinned[i] && !live[i]) frozen += 1;
-    }
-    let layerBeta = 0, layerArea = 0;
-    if (this.layerIndex !== null) {
-      const b = this.layerIndex * SITE_FLOATS;
-      layerBeta = Math.exp(sitesRgb[b + 2]) * sitesRgb[b + 3] / Math.max(this.width, this.height);
-      const moments = cellMoments({
-        width: this.width, height: this.height, sites: sitesRgb, n: this.actualSites, cand: await this._readCandidates(),
-        candWidth: this.candWidth, candHeight: this.candHeight, target: this.target, mask: this.maskCpu,
-        global: this.layerIndex ?? -1,
-      });
-      layerArea = moments.count[this.layerIndex] / Math.max(1, counted);
-    }
+  // The histogram layer at the end of a run: { peakMass, beta (its depth),
+  // area (fraction of masked pixels it owns) }, or null without one.
+  async _layerStats(sitesRgb) {
+    if (this.layerIndex === null) return null;
+    const b = this.layerIndex * SITE_FLOATS;
+    const moments = cellMoments({
+      width: this.width, height: this.height, sites: sitesRgb, n: this.actualSites, cand: await this._readCandidates(),
+      candWidth: this.candWidth, candHeight: this.candHeight, target: this.target, mask: this.maskCpu,
+      global: this.layerIndex,
+    });
+    let pixels = 0;
+    for (let i = 0; i < moments.count.length; i += 1) pixels += moments.count[i];
     return {
-      layerBeta, layerArea,
-      modeMass: this.histMode.mass, layer: this.layerIndex === null ? 0 : 1,
-      meanWeight: counted ? wsum / counted : 0, committedFrac: counted ? committed / counted : 0,
-      frozenSites: this.args.info === "commit" && this.args.commitFreeze ? frozen : 0,
+      peakMass: this.histPeak.mass,
+      beta: Math.exp(sitesRgb[b + 2]) * sitesRgb[b + 3] / Math.max(this.width, this.height),
+      area: moments.count[this.layerIndex] / Math.max(1, pixels),
     };
   }
 
@@ -1767,15 +1189,8 @@ export class Trainer {
     const owned = [
       this.targetTex, this.maskTex, this.renderTex,
       this.sitesBuf, this.adamBuf, this.seedCounter, this.grads,
-      this.tauGradRaw, this.tauGradTmp, this.tauGradTmp2,
-      this.renderParams, this.gradParams, this.adamParams,
-      this.countParams, this.gradCountParams, this.tauParams,
-      this._tauHeatBuf, this._gnBuf,
-      this.blurTex, this.blurTmpTex, this.growBlurParams,
-      this.siteStatsParams, this.siteStatsBuf,
-      this.bestSitesBuf, this.bestAdamBuf,
-      this.pruneSitesBuf, this.pruneAdamBuf,
-      this.sitePinBuf, this.siteLiveBuf, this.maskBuf, this.lossWeightBuf, this.settledBuf, this.infoParams,
+      this.renderParams, this.gradParams, this.adamParams, this.gradCountParams,
+      this._tauHeatBuf, this._gnBuf, this.siteStatsParams, this.siteStatsBuf, this.maskBuf,
     ];
     for (const res of owned) res?.destroy();
     this.cands?.destroy();
@@ -1847,23 +1262,6 @@ export function siteSplit(stats, i) {
 const SITE_STAT_CH = 18; // channels per site in site_stats.wgsl's output
 
 
-// Description length in bits of sites [0, n)'s cells, each at its mean color
-// (site_stats.wgsl's owner moments): `sites` × BITS_PER_SITE plus `samples`
-// residuals coded as a Gaussian at 8-bit precision, floored at 0 bits each.
-function cellMdlBits(stats, n, sites, samples) {
-  let sse = 0;
-  for (let i = 0; i < n; i += 1) {
-    const b = i * SITE_STAT_CH;
-    const cnt = stats[b];
-    if (!(cnt > 0)) continue;
-    let ss = stats[b + 15];
-    for (let c = 0; c < 3; c += 1) ss -= stats[b + 6 + c] ** 2 / cnt;
-    sse += Math.max(0, ss);
-  }
-  const mse = (sse * 255 * 255) / Math.max(1, samples);
-  return sites * BITS_PER_SITE + samples * Math.max(0, 0.5 * Math.log2(2 * Math.PI * Math.E * Math.max(mse, 1e-30)));
-}
-
 // Gradient groups over the consolidated grads[idx*10+ch] channels. Multi-channel
 // groups use the vector magnitude (e.g. |(dx, dy)| for position).
 export const GRAD_GROUPS = [
@@ -1905,37 +1303,6 @@ function computeGradStats(raw, siteCount, numPixels) {
   return { groups, sites: counted };
 }
 
-async function readBufferBytes(device, buffer, bytes) {
-  const staging = device.createBuffer({ size: Math.max(4, bytes), usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
-  const encoder = device.createCommandEncoder();
-  encoder.copyBufferToBuffer(buffer, 0, staging, 0, Math.max(4, bytes));
-  device.queue.submit([encoder.finish()]);
-  await staging.mapAsync(GPUMapMode.READ);
-  const out = staging.getMappedRange().slice(0);
-  staging.unmap();
-  staging.destroy();
-  return out;
-}
-const readBufferF32 = async (device, buffer, count) => new Float32Array(await readBufferBytes(device, buffer, count * 4));
-const readBufferU32 = async (device, buffer, count) => new Uint32Array(await readBufferBytes(device, buffer, count * 4));
-
-// Mean training loss per sample over the masked pixels: |r| for "l1", r² for
-// "l2" (NaN → 0, +Inf → 1, as in computePsnrSafe).
-function computeLoss(render, target, width, height, maskCpu, loss) {
-  let acc = 0;
-  let counted = 0;
-  for (let i = 0; i < width * height; i += 1) {
-    if (maskCpu && maskCpu[i] <= 0) continue;
-    for (let c = 0; c < 3; c += 1) {
-      let r = render[i * 4 + c];
-      if (!Number.isFinite(r)) r = r === Number.POSITIVE_INFINITY ? 1 : 0;
-      const d = r - target[i * 4 + c];
-      acc += loss === "l2" ? d * d : Math.abs(d);
-    }
-    counted += 3;
-  }
-  return acc / Math.max(1, counted);
-}
 
 // Mirrors main()'s PSNR computation: only pixels inside the mask count, values
 // are sanitized (NaN → 0, +Inf → 1).

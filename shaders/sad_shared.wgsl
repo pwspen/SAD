@@ -79,13 +79,13 @@ struct Params {
   radiusScale : f32,
   radiusProbes : u32,
   injectCount : u32,
-  hilbertProbes : u32,
-  hilbertWindow : u32,
   candDownscale : u32,
   candWidth : u32,
   candHeight : u32,
   globalCand : u32, // the global site (cand_ids); none if >= siteCount
+  _pad0 : u32,
   _pad1 : u32,
+  _pad2 : u32,
 }
 
 struct InitParams {
@@ -123,10 +123,10 @@ struct AdamParams {
   t : u32,
   width : u32,
   height : u32,
-  grow_gen : u32,      // growth steps so far
-  grow_lr_decay : f32, // per-site LR × this per growth step since the site's birth step
-  freeze_unlive : u32, // 1 = skip sites that serve no pixel still in the loss (siteLive == 0)
+  layer_site : u32, // the histogram layer's index (trainer.js), or none
+  _pad0 : u32,
   _pad1 : u32,
+  _pad2 : u32,
 }
 
 struct ClearParams {
@@ -134,17 +134,6 @@ struct ClearParams {
   _pad0 : u32,
   _pad1 : u32,
   _pad2 : u32,
-}
-
-struct TauDiffuseParams {
-  siteCount : u32,
-  candDownscale : u32,
-  _pad0 : u32,
-  _pad1 : u32,
-  lambda : f32,
-  _pad2 : f32,
-  _pad3 : f32,
-  _pad4 : f32,
 }
 
 // RNG

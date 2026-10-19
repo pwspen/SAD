@@ -4,8 +4,8 @@
 //
 // Lists live in two rgba32uint textures (cand0 = slots 0-3, cand1 = 4-7),
 // double-buffered. A pass offers each pixel its own list, its 4 neighbours'
-// lists at the current jump step, optional radius / Hilbert-order probes and
-// a few random sites, and keeps the 8 with the highest logit. Jump steps
+// lists at the current jump step, optional radius probes and a few random
+// sites, and keeps the 8 with the highest logit. Jump steps
 // halve from half the grid down to 1 px over the first passes (packJumpStep),
 // then stay at 1 px.
 
@@ -14,24 +14,18 @@ import {
   updateParamsBuffer,
   createClearParamsBuffer,
   updateClearParamsBuffer,
-  createHilbertParamsBuffer,
-  updateHilbertParamsBuffer,
   packJumpStep,
-  hilbertBitsForSize,
 } from "./params.js?v=20261019";
-import { createPackedCandidatesBuffer, createHilbertBuffers, createDummyStorageBuffer } from "./buffers.js?v=20261019";
-import { createCandidateTexture } from "./textures.js?v=20261019";
-import { CandidatesEncoder, SeedCandidatesEncoder, CandidatePackEncoder, HilbertEncoder } from "./encoders.js?v=20261019";
-import { RadixSortUInt2 } from "./radix_sort.js?v=20261019";
-import { readRgba32FloatTexture } from "./textures.js?v=20261019";
+import { createPackedCandidatesBuffer } from "./buffers.js?v=20261019";
+import { createCandidateTexture, readRgba32FloatTexture } from "./textures.js?v=20261019";
+import { CandidatesEncoder, SeedCandidatesEncoder, CandidatePackEncoder } from "./encoders.js?v=20261019";
 
 const NO_SITE = 0xffffffff;
 
 export class CandidateLists {
   // opts: width, height (image), capacity (sites the buffers hold), and the
   // search settings candDownscale, candUpdatePasses, candRadiusScale,
-  // candRadiusProbes, candInjectCount, candHilbertWindow, candHilbertProbes
-  // (as in buildArgs).
+  // candRadiusProbes, candInjectCount (as in buildArgs).
   constructor(device, shaders, opts) {
     this.device = device;
     this.width = opts.width;
@@ -41,7 +35,6 @@ export class CandidateLists {
     this.candWidth = Math.max(1, Math.ceil(this.width / this.downscale));
     this.candHeight = Math.max(1, Math.ceil(this.height / this.downscale));
     this.updatePasses = Math.max(1, opts.candUpdatePasses || 1);
-    this.usesHilbert = opts.candHilbertWindow > 0 && opts.candHilbertProbes > 0;
     this.globalCand = NO_SITE; // the site every pixel blends besides its list
     this.jumpPassIndex = 0;
 
@@ -52,15 +45,6 @@ export class CandidateLists {
     this.packed = createPackedCandidatesBuffer(device, opts.capacity);
     this.packParams = createClearParamsBuffer(device, 0, this._invScale());
     this.passParams = [];   // one per pass encoded before a submit
-    this.dummy = createDummyStorageBuffer(device);
-    if (this.usesHilbert) {
-      this.hilbertEnc = new HilbertEncoder(device, shaders);
-      this.hilbertRes = createHilbertBuffers(device, opts.capacity);
-      this.hilbertParams = createHilbertParamsBuffer(device, 1, this.hilbertRes.paddedCount,
-        this.width, this.height, hilbertBitsForSize(this.width, this.height));
-      this.hilbertSort = new RadixSortUInt2(device, shaders, this.hilbertRes.paddedCount);
-      this.hilbertCount = -1;
-    }
   }
 
   // Current lists.
@@ -80,8 +64,6 @@ export class CandidateLists {
     return {
       width: this.width, height: this.height, siteCount, step, seed,
       radiusScale: o.candRadiusScale, radiusProbes: o.candRadiusProbes, injectCount: o.candInjectCount,
-      hilbertProbes: this.usesHilbert ? o.candHilbertProbes : 0,
-      hilbertWindow: this.usesHilbert ? o.candHilbertWindow : 0,
       candDownscale: this.downscale, candWidth: this.candWidth, candHeight: this.candHeight,
       globalCand: this.globalCand,
     };
@@ -96,25 +78,14 @@ export class CandidateLists {
 
   _stages() { return Math.max(1, Math.ceil(Math.log2(Math.max(this.candWidth, this.candHeight, 2)))); }
 
-  // Repacks sites [0, n) for the search (and their Hilbert order if they
-  // changed count, or `force`).
-  _encodePack(encoder, sitesBuf, n, force = false) {
+  // Repacks sites [0, n) for the search.
+  _encodePack(encoder, sitesBuf, n) {
     updateClearParamsBuffer(this.device.queue, this.packParams, n, this._invScale());
     this.packEnc.encode(encoder, sitesBuf, this.packed, this.packParams, n);
-    if (!this.usesHilbert || (!force && this.hilbertCount === n)) return;
-    const bits = hilbertBitsForSize(this.width, this.height);
-    updateHilbertParamsBuffer(this.device.queue, this.hilbertParams, n, this.hilbertRes.paddedCount,
-      this.width, this.height, bits);
-    this.hilbertEnc.encodePairs(encoder, sitesBuf, this.hilbertRes.pairs, this.hilbertParams, this.hilbertRes.paddedCount);
-    this.hilbertSort.encode(encoder, this.hilbertRes.pairs, bits >= 16 ? 0xffffffff : (1 << (bits * 2)));
-    this.hilbertEnc.encodeOrder(encoder, this.hilbertRes.pairs, this.hilbertRes.order, this.hilbertRes.pos,
-      this.hilbertParams, n);
-    this.hilbertCount = n;
   }
 
   _encodePass(encoder, params) {
     this.updateEnc.encodeUpdate(encoder, this.packed, params, this.tex[0], this.tex[1], this.tex[2], this.tex[3],
-      this.usesHilbert ? this.hilbertRes.order : this.dummy, this.usesHilbert ? this.hilbertRes.pos : this.dummy,
       this.candWidth, this.candHeight);
     this._swap();
   }
@@ -128,7 +99,7 @@ export class CandidateLists {
 
   // Jump-flood stages from half the grid down to 1 px, `rounds` times.
   _encodeFlood(encoder, sitesBuf, n, rounds, k) {
-    this._encodePack(encoder, sitesBuf, n, true);
+    this._encodePack(encoder, sitesBuf, n);
     for (let r = 0; r < rounds; r += 1) {
       for (let st = 0; st < this._stages(); st += 1) {
         this._encodePass(encoder, this._params(k++, this.paramsArgs(n, packJumpStep(st, this.candWidth, this.candHeight))));
@@ -184,12 +155,7 @@ export class CandidateLists {
   }
 
   destroy() {
-    const owned = [...this.tex, this.packed, this.packParams, ...this.passParams, this.dummy];
-    if (this.usesHilbert) {
-      const s = this.hilbertSort;
-      owned.push(this.hilbertRes.pairs, this.hilbertRes.order, this.hilbertRes.pos, this.hilbertParams,
-        s.histBuffer, s.blockSums, s.scratch, ...s.paramsBuffers);
-    }
+    const owned = [...this.tex, this.packed, this.packParams, ...this.passParams];
     for (const b of owned) b?.destroy();
   }
 }

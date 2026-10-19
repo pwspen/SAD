@@ -5,7 +5,7 @@
 
 import { loadShaders, tileSlotsForLimit } from "../trainer/shader_loader.js?v=20261019";
 import { requestTrainingDevice } from "../trainer/device.js?v=20261019";
-import { Trainer, buildArgs, GRAD_GROUPS, lrSchedule, LR_SCHEDULES, LOSSES, GROW_MODES, GROW_CRITERIA, KEEP_BEST, COUNT_SCHEDULES, LAYER_MODES, INFO_MODES, countPlan, countVaries, countHorizon } from "../trainer/trainer.js?v=20261019";
+import { Trainer, buildArgs, GRAD_GROUPS, lrSchedule, LR_SCHEDULES, LOSSES, COUNT_SCHEDULES, LAYER_MODES, countPlan, countVaries, countHorizon } from "../trainer/trainer.js?v=20261019";
 import { loadImageToFloat32, loadMaskRgba32Float, whiteMaskRgba32Float } from "../trainer/textures.js?v=20261019";
 import { loadSitesFromFile, serializeSitesTxt, triggerDownload, floatImageToRgba8, computeBpp, BITS_PER_SITE } from "../trainer/io.js?v=20261019";
 import { SITE_FLOATS } from "../trainer/params.js?v=20261019";
@@ -51,8 +51,6 @@ const UI_FIELDS = [
   ["candRadiusScale", "p-candRadiusScale"],
   ["candRadiusProbes", "p-candRadiusProbes"],
   ["candInjectCount", "p-candInjectCount"],
-  ["candHilbertWindow", "p-candHilbertWindow"],
-  ["candHilbertProbes", "p-candHilbertProbes"],
   ["lrMult", "p-lrMult"],
   ["lrSchedule", "p-lrSchedule"],
   ["lrPosBase", "p-lrPosBase"],
@@ -65,15 +63,7 @@ const UI_FIELDS = [
   ["loss", "p-loss"],
   ["growLambda", "p-growLambda"],
   ["growEvery", "p-growEvery"],
-  ["growBlur", "p-growBlur"],
-  ["growLrDecay", "p-growLrDecay"],
-  ["growMode", "p-growMode"],
-  ["keepBest", "p-keepBest"],
-  ["growCriterion", "p-growCriterion"],
-  ["pruneEvery", "p-pruneEvery"],
-  ["growPatience", "p-growPatience"],
   ["layer", "p-layer"],
-  ["info", "p-info"],
 ];
 
 const state = {
@@ -95,7 +85,7 @@ const state = {
   lastPsnr: null,        // persists between log ticks so preview updates don't blank the PSNR
   lastLrScale: null,     // schedule × LR mult at the last log tick
   lastActiveSites: 0,    // active sites at the last log tick (site-spacing reference lines)
-  psnrHistory: [],       // [{ it, psnr, sites, siteLr }] from log ticks, plotted in the PSNR card
+  psnrHistory: [],       // [{ it, psnr, sites }] from log ticks, plotted in the PSNR card
   psnrIters: 0,
   bppRuns: [],           // [{ sites, bpp, colorSpace, points: [{ it, psnr, sites, bpp }] }] per run on this target; last is current
   gradHistory: [],       // [{ it, stats }] per-param |grad| mean/max from log ticks
@@ -175,18 +165,10 @@ function applyConfigToForm(config, overrides = {}) {
     .replaceChildren(...Object.entries(LR_SCHEDULES).map(([key, label]) => new Option(label, key)));
   document.getElementById("p-loss")
     .replaceChildren(...Object.entries(LOSSES).map(([key, loss]) => new Option(loss.label, key)));
-  document.getElementById("p-growMode")
-    .replaceChildren(...Object.entries(GROW_MODES).map(([key, label]) => new Option(label, key)));
   document.getElementById("p-countSchedule")
     .replaceChildren(...Object.entries(COUNT_SCHEDULES).map(([key, label]) => new Option(label, key)));
-  document.getElementById("p-growCriterion")
-    .replaceChildren(...Object.entries(GROW_CRITERIA).map(([key, label]) => new Option(label, key)));
-  document.getElementById("p-keepBest")
-    .replaceChildren(...Object.entries(KEEP_BEST).map(([key, label]) => new Option(label, key)));
   document.getElementById("p-layer")
     .replaceChildren(...Object.entries(LAYER_MODES).map(([key, label]) => new Option(label, key)));
-  document.getElementById("p-info")
-    .replaceChildren(...Object.entries(INFO_MODES).map(([key, label]) => new Option(label, key)));
   const defaults = buildArgs(config, overrides);
   for (const [key, elId, opts] of UI_FIELDS) {
     const el = document.getElementById(elId);
@@ -1263,46 +1245,29 @@ function drawRightAxis(p, g, { title, offset = 0, fmt = String, spacing = 48 }) 
 }
 
 const SITES_LINE_COLOR = SERIES_COLORS[0];
-const SITE_LR_COLOR = SERIES_COLORS[2];
-const SITE_LR_AXIS_OFFSET = 46; // the LR axis sits outside the sites axis
-const PSNR_PAD = { ...LEGEND_PAD, right: 96 }; // room for the sites and LR axes
+const PSNR_PAD = { ...LEGEND_PAD, right: 50 }; // room for the sites axis
 
 function drawPsnrPlot(view) {
   const p = beginPlot(view);
   if (!p) return;
   const data = state.psnrHistory;
-  let lo = Infinity, hi = -Infinity, maxSites = 1, lrLo = Infinity, lrHi = -Infinity, nSites = 0;
+  let lo = Infinity, hi = -Infinity, maxSites = 1;
   for (const d of data) {
     lo = Math.min(lo, d.psnr); hi = Math.max(hi, d.psnr); maxSites = Math.max(maxSites, d.sites);
-    if (!d.siteLr) continue;
-    nSites = Math.max(nSites, d.siteLr.length);
-    for (const v of d.siteLr) if (v > 0) { lrLo = Math.min(lrLo, v); lrHi = Math.max(lrHi, v); }
   }
   const top = drawLegend(p, [
     { label: "PSNR", color: PSNR_LINE_COLOR },
     { label: "sites", color: SITES_LINE_COLOR },
-    { label: "LR (one line per site)", color: SITE_LR_COLOR },
   ]) + 10;
   const box = plotBox(p, top, PSNR_PAD);
   const g = view.geom = plotAxes(box, iterRange(), linRange(lo, hi, [0, 40]));
   const gs = plotAxes(box, g.xr, { min: 0, max: Math.ceil(maxSites * 1.08) });
-  const gl = plotAxes(box, g.xr, decadeRange(lrLo, lrHi, [1e-3, 10]));
   drawAxes(p, g, { xTitle: "iteration", yTitle: "PSNR (dB)", xFmt: fmtIter });
   drawRightAxis(p, gs, { title: "sites" });
-  drawRightAxis(p, gl, { title: "LR multiplier", offset: SITE_LR_AXIS_OFFSET, fmt: fmtLogTick });
   if (!data.length) {
     drawEmpty(p, g, state.running ? "Waiting for first log tick…" : "Train to see PSNR");
     return;
   }
-  // Each site's line starts at the first tick it exists at.
-  p.ctx.save();
-  p.ctx.globalAlpha = 0.6;
-  for (let i = 0; i < nSites; i += 1) {
-    const pts = [];
-    for (const d of data) if (d.siteLr && i < d.siteLr.length) pts.push([d.it, d.siteLr[i]]);
-    drawLine(p, gl, pts, SITE_LR_COLOR, { width: 1 });
-  }
-  p.ctx.restore();
   // Sites change in steps at growth; draw them as a step line.
   drawLine(p, gs, data.flatMap((d, i) => (i && d.sites !== data[i - 1].sites
     ? [[d.it, data[i - 1].sites], [d.it, d.sites]] : [[d.it, d.sites]])), SITES_LINE_COLOR, { width: 1.5 });
@@ -1313,17 +1278,11 @@ function drawPsnrPlot(view) {
   drawMarker(p, gs, mark.it, mark.sites, SITES_LINE_COLOR);
   drawMarker(p, g, mark.it, mark.psnr, PSNR_LINE_COLOR);
   if (hover) {
-    const lrs = hover.siteLr ? [...hover.siteLr].filter(Number.isFinite) : [];
-    const lrText = !lrs.length ? []
-      : [`LR ${fmtSig3(Math.min(...lrs))}${Math.min(...lrs) !== Math.max(...lrs) ? ` – ${fmtSig3(Math.max(...lrs))}` : ""}`];
     drawTooltip(p, g, g.x(hover.it), g.y(hover.psnr), {
-      rows: [{ cells: [`iter ${hover.it} · ${hover.psnr.toFixed(2)} dB · ${hover.sites} sites`] },
-             ...lrText.map((t) => ({ color: SITE_LR_COLOR, cells: [t] }))],
+      rows: [{ cells: [`iter ${hover.it} · ${hover.psnr.toFixed(2)} dB · ${hover.sites} sites`] }],
     });
   }
 }
-
-const fmtSig3 = (v) => String(Number(v.toPrecision(3)));
 
 function hitPsnr(g, mx) {
   return nearestX(g, state.psnrHistory, (d) => d.it, mx);
@@ -2757,8 +2716,7 @@ async function startTraining() {
   const sitesDesc = varies
     ? `${startCount} → ${args.endSites} ${args.countSchedule}` +
       (args.countSchedule === "sawtooth" ? ` (${args.sawTeeth} teeth, +${Math.round(args.sawAmp * 100)}%, ${args.sawRatio}:1)` : "") +
-      ` by iter ${countHorizon(args)}, step every ${args.growEvery} iters, grow by ${GROW_MODES[args.growMode]} ` +
-      `(λ stop ${args.growLambda})` + (args.growLrDecay !== 1 ? `, older sites' LR ×${args.growLrDecay} per growth step` : "")
+      ` by iter ${countHorizon(args)}, step every ${args.growEvery} iters (λ stop ${args.growLambda})`
     : `${initSiteCount} fixed`;
   appendLog(`Target: ${width}×${height} | sites: ${sitesDesc} | iters: ${args.iters} | lr ×${args.lrMult} ${LR_SCHEDULES[args.lrSchedule]} | color: ${COLOR_SPACES[args.colorSpace].label} | loss: ${LOSSES[args.loss].label} | refresh: ${args.logFreq}`);
   updateProgress(0, args.iters, "Preparing…");
@@ -2783,7 +2741,7 @@ async function startTraining() {
                              sites: info.totalSites, it: info.it, iters: info.iters };
         updatePlanSummary();
         if (Number.isFinite(info.psnr)) {
-          state.psnrHistory.push({ it: info.it, psnr: info.psnr, sites: info.activeSites, siteLr: info.siteLr });
+          state.psnrHistory.push({ it: info.it, psnr: info.psnr, sites: info.activeSites });
           const run = state.bppRuns[state.bppRuns.length - 1];
           run.sites = info.activeSites;
           run.bpp = computeBpp(info.activeSites, info.width, info.height);

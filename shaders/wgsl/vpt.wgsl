@@ -4,8 +4,6 @@
 @group(0) @binding(3) var inCand1 : texture_2d<u32>;
 @group(0) @binding(4) var outCand0 : texture_storage_2d<rgba32uint, write>;
 @group(0) @binding(5) var outCand1 : texture_storage_2d<rgba32uint, write>;
-@group(0) @binding(6) var<storage, read> hilbertOrder : array<u32>;
-@group(0) @binding(7) var<storage, read> hilbertPos : array<u32>;
 
 fn tryInsert8(bestIdx : ptr<function, array<u32, 8>>, bestD2 : ptr<function, array<f32, 8>>,
               candIdx : u32, uv : vec2<f32>, siteCount : u32, invScaleSq : f32, inv_scale : f32) {
@@ -113,22 +111,6 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
     if (gid.x == u32(p.x) && gid.y == u32(p.y)) { continue; }
     tryInsertTexel(&bestIdx, &bestD2, textureLoad(inCand0, p, 0), textureLoad(inCand1, p, 0),
                    uv, params.siteCount, params.invScaleSq, inv_scale);
-  }
-
-  if (params.hilbertProbes > 0u && params.hilbertWindow > 0u) {
-    let bestCand = bestIdx[0];
-    if (bestCand < params.siteCount) {
-      let pos = hilbertPos[bestCand];
-      let span = params.hilbertWindow * 2u + 1u;
-      var hState = (gid.x * 2654435761u) ^ (gid.y * 1597334677u) ^ (fullStepIndex * 374761393u);
-      for (var i = 0u; i < params.hilbertProbes; i = i + 1u) {
-        hState = xorshift32(hState + i);
-        let offset = i32(hState % span) - i32(params.hilbertWindow);
-        let idx = clamp(i32(pos) + offset, 0, i32(params.siteCount - 1u));
-        let cand = hilbertOrder[u32(idx)];
-        tryInsert8(&bestIdx, &bestD2, cand, uv, params.siteCount, params.invScaleSq, inv_scale);
-      }
-    }
   }
 
   var injectState = (gid.x * 1664525u) ^ (gid.y * 1013904223u) ^ (fullStepIndex * 374761393u);

@@ -38,9 +38,8 @@ override LOSS : u32 = 0u;
 @group(0) @binding(3) var inCand1 : texture_2d<u32>;
 @group(0) @binding(4) var targetTex : texture_2d<f32>;
 @group(0) @binding(5) var<storage, read_write> grads : array<atomic<u32>>;
-// Per-pixel loss weight (row-major W*H): the mask, or the info pass's weights
-// (info_update.wgsl). 0 skips the pixel; otherwise dL/dpred is scaled by it.
-@group(0) @binding(6) var<storage, read> lossWeight : array<f32>;
+// The mask, f32 per pixel (row-major W*H): 0 skips the pixel.
+@group(0) @binding(6) var<storage, read> mask : array<f32>;
 
 fn atomicAddGrad(i : u32, val : f32) {
   if (val == 0.0 || is_bad(val)) { return; }
@@ -112,7 +111,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>,
   let in_bounds = gid.x < dims.x && gid.y < dims.y;
   var mask_val : f32 = 0.0;
   if (in_bounds) {
-    mask_val = lossWeight[gid.y * dims.x + gid.x];
+    mask_val = mask[gid.y * dims.x + gid.x];
   }
   let should_work = in_bounds && mask_val > 0.0;
 
@@ -144,7 +143,6 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>,
       let tgt = textureLoad(targetTex, vec2<i32>(gid.xy), 0).rgb;
       var dL_dpred = 2.0 * (pred - tgt);
       if (LOSS == 1u) { dL_dpred = sign(pred - tgt); } // sign(0) = 0
-      dL_dpred = mask_val * dL_dpred;
       let dL_ok = !is_bad3(dL_dpred);
       if (dL_ok) {
         for (var i = 0u; i < NCAND; i = i + 1u) {
