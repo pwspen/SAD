@@ -23,6 +23,7 @@ const PRESET_DIR = "../presets/";
 const PRESETS = { "": "defaults", kodak: "Kodak", mnist: "MNIST" };
 const DEFAULTS_NOTE = "training_config.json and the trainer's built-in defaults.";
 const DEMO_MAX_IMAGE_SIDE = 2048;
+const VALUE_BINS = 24; // bins per panel of the site parameter values view
 const MI_ROUND_ANISO = 0.05; // |log_aniso| below this, a site has no orientation (site MI view)
 const SNAP_MAP_K = 4; // snap-analysis fit drawn on the image (one of SNAP_KS)
 // Kodak set lives outside this repo; the default resolves under the
@@ -109,6 +110,7 @@ const state = {
   layoutName: null,      // active key in LAYOUTS
   editing: false,        // layout edit mode (drag to move, add / remove, rows & cols)
   dragId: null,          // view being dragged in edit mode
+  siteValues: null,      // { sites, panels } parameter value histograms for the latest readback
   baseConfig: null,      // training_config.json as loaded; state.config adds the preset's UPPER_CASE keys
   showCentroids: true,   // centroid dots over the preview (its card's checkbox)
 };
@@ -460,6 +462,12 @@ const VIEWS = {
                       "anisotropy), so compare sites within a panel, not across panels. Sites with F = 0 (no " +
                       "pixels, or not reachable) are counted in the title." },
   clusterMap: { label: `Snap clusters on the image (k = ${SNAP_MAP_K})`, kind: "image", source: "derived",
+  siteValues: { label: "Site parameter values", kind: "plot", source: "derived", on: ["render", "run"],
+                draw: drawSiteValues,
+                note: `Per parameter, how many active sites (y) have each value (x): ${VALUE_BINS} equal-width ` +
+                      "bins over the 1st–99th percentile, with values outside counted in the end bins (\"clipped\"). " +
+                      `Colors are decoded RGB. θ is the major axis mod π, skipped for near-round sites ` +
+                      `(|log_aniso| < ${MI_ROUND_ANISO}, counted as "round"). The histogram layer is left out.` },
                 blank: "#f1f1ec", on: ["render"], draw: drawClusterMap,
                 note: "The latest render, washed out, with each site's centroid in its cluster's color from the " +
                       `k = ${SNAP_MAP_K} fit of the Site snap analysis.` },
@@ -493,7 +501,7 @@ const LAYOUTS = {
   },
   siteStats: {
     label: "Site stats",
-    areas: `"preview    siteMI        sensitivity"
+    areas: `"siteValues siteMI       sensitivity"
             "clusterMap siteClusters sensitivity"`,
   },
   editor: {
@@ -2265,12 +2273,23 @@ function drawSensitivity(view) {
     drawEmpty(p, plotBox(p), msg);
     return;
   }
-  const groups = job.result;
+  drawHistPanels(p, job.result.map((g) => ({
+    title: g.label + (g.zero ? ` · ${g.zero} at 0` : ""),
+    counts: g.counts,
+    loText: `≤${fmtExp(10 ** g.lo)}`,
+    hiText: fmtExp(10 ** g.hi),
+  })));
+}
+
+// A grid of bar histograms, one per panel { title, counts, loText, hiText }:
+// y = count per bin, x labelled only at the range ends.
+function drawHistPanels(p, panels) {
+  const { ctx, col, w, h } = p;
   const cols = w > h * 1.2 ? 3 : 2;
-  const rows = Math.ceil(groups.length / cols);
+  const rows = Math.ceil(panels.length / cols);
   const head = PLOT_PAD.top; // below the card's label
   const cw = w / cols, ch = (h - head) / rows;
-  groups.forEach((g, k) => {
+  panels.forEach((g, k) => {
     const x0 = (k % cols) * cw, y0 = head + Math.floor(k / cols) * ch;
     const box = { left: x0 + 34, right: x0 + cw - 8, top: y0 + 22, bottom: y0 + ch - 22 };
     const yMax = Math.max(1, ...g.counts);
@@ -2287,7 +2306,7 @@ function drawSensitivity(view) {
       ctx.fillStyle = col.soft;
       ctx.fillText(String(v), box.left - 4, y);
     }
-    const bw = (box.right - box.left) / SENS_BINS;
+    const bw = (box.right - box.left) / g.counts.length;
     ctx.fillStyle = SERIES_COLORS[0];
     g.counts.forEach((c, b) => {
       if (!c) return;
@@ -2296,17 +2315,16 @@ function drawSensitivity(view) {
     });
     ctx.strokeStyle = col.soft;
     ctx.beginPath(); ctx.moveTo(box.left, box.bottom + 0.5); ctx.lineTo(box.right, box.bottom + 0.5); ctx.stroke();
-    // x labels: F at the range ends (log scale between).
     ctx.fillStyle = col.soft;
     ctx.textBaseline = "top";
     ctx.textAlign = "left";
-    ctx.fillText(`≤${fmtExp(10 ** g.lo)}`, box.left, box.bottom + 4);
+    ctx.fillText(g.loText, box.left, box.bottom + 4);
     ctx.textAlign = "right";
-    ctx.fillText(fmtExp(10 ** g.hi), box.right, box.bottom + 4);
+    ctx.fillText(g.hiText, box.right, box.bottom + 4);
     ctx.fillStyle = col.dim;
     ctx.textAlign = "left";
     ctx.textBaseline = "bottom";
-    ctx.fillText(g.label + (g.zero ? ` · ${g.zero} at 0` : ""), box.left, box.top - 6);
+    ctx.fillText(g.title, box.left, box.top - 6);
   });
 }
 
@@ -2407,6 +2425,68 @@ async function drawErrEma() {
   } catch (err) {
     return; // the trainer was torn down mid-readback
   }
+// ---- Site parameter values ----
+// Per parameter, a histogram over active sites of its value: VALUE_BINS
+// equal-width bins over the 1st–99th percentile (θ over [0, π)), with values
+// outside counted in the end bins and noted in the panel title. The histogram
+// layer is left out.
+
+const VALUE_COLUMNS = [
+  { label: "log τ", get: (s, b) => s[b + 2] },
+  { label: "radius", get: (s, b) => s[b + 3] },
+  { label: "log aniso", get: (s, b) => s[b + 9] },
+  { label: "θ (major axis)", range: [0, Math.PI], get: majorAxis },
+  { label: "red", get: (s, b) => s[b + 4] },
+  { label: "green", get: (s, b) => s[b + 5] },
+  { label: "blue", get: (s, b) => s[b + 6] },
+];
+
+// Panels for the latest readback, cached per readback.
+function siteValueHistograms() {
+  const sites = state.lastSites;
+  if (!sites) return null;
+  if (state.siteValues?.sites === sites) return state.siteValues.panels;
+  const layer = state.trainer?.layerIndex;
+  const active = [];
+  for (let i = 0; i < state.lastSiteCount; i += 1) {
+    if (sites[i * SITE_FLOATS] >= 0 && i !== layer) active.push(i * SITE_FLOATS);
+  }
+  const fmt = (v) => (Math.abs(v) >= 1e4 || (v !== 0 && Math.abs(v) < 1e-2) ? fmtExp(v) : String(+v.toPrecision(3)));
+  const panels = active.length ? VALUE_COLUMNS.map((c) => {
+    const vals = active.map((b) => c.get(sites, b)).filter(Number.isFinite).sort((a, b) => a - b);
+    const undef = active.length - vals.length;
+    let [lo, hi] = c.range || (vals.length
+      ? [vals[Math.floor((vals.length - 1) * 0.01)], vals[Math.ceil((vals.length - 1) * 0.99)]] : [0, 1]);
+    if (hi - lo < 1e-9) { lo -= 0.5; hi += 0.5; }
+    const counts = new Array(VALUE_BINS).fill(0);
+    let clipped = 0;
+    for (const v of vals) {
+      if (v < lo || v > hi) clipped += 1;
+      counts[Math.max(0, Math.min(VALUE_BINS - 1, Math.floor(((v - lo) / (hi - lo)) * VALUE_BINS)))] += 1;
+    }
+    const notes = [clipped && `${clipped} clipped`, undef && `${undef} round`].filter(Boolean);
+    return {
+      title: c.label + (notes.length ? ` · ${notes.join(", ")}` : ""),
+      counts,
+      loText: c.range ? "0" : fmt(lo),
+      hiText: c.range ? "π" : fmt(hi),
+    };
+  }) : null;
+  state.siteValues = { sites, panels };
+  return panels;
+}
+
+function drawSiteValues(view) {
+  const p = beginPlot(view);
+  if (!p) return;
+  const panels = siteValueHistograms();
+  if (!panels) {
+    drawEmpty(p, plotBox(p), "Sites appear after the first render");
+    return;
+  }
+  drawHistPanels(p, panels);
+}
+
   const canvas = VIEWS.errEma.canvas;
   const { width, height } = render;
   if (!canvas || !ema || ema.length !== width * height * 4) return;
