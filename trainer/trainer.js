@@ -280,12 +280,13 @@ export function buildArgs(config, overrides = {}) {
     // that set the count; the buffers hold countCapacity sites.
     startSites: Math.max(1, Math.floor(Number(pick("startSites", "START_SITES", 1)))),
     endSites: Math.max(1, Math.floor(Number(pick("endSites", "END_SITES", 100)))),
-    countSchedule: String(pick("countSchedule", "COUNT_SCHEDULE", "exponential")),
-    countEnd: Math.min(1, Math.max(0, Number(pick("countEnd", "COUNT_END", 0.7)))),
-    sawTeeth: Math.max(0, Math.floor(Number(pick("sawTeeth", "SAW_TEETH", 4)))),
-    sawAmp: Math.max(0, Number(pick("sawAmp", "SAW_AMP", 0.5))),
+    // Defaults: the Kodak preset's sawtooth (presets/kodak.json).
+    countSchedule: String(pick("countSchedule", "COUNT_SCHEDULE", "sawtooth")),
+    countEnd: Math.min(1, Math.max(0, Number(pick("countEnd", "COUNT_END", 0.5)))),
+    sawTeeth: Math.max(0, Math.floor(Number(pick("sawTeeth", "SAW_TEETH", 6)))),
+    sawAmp: Math.max(0, Number(pick("sawAmp", "SAW_AMP", 2))),
     sawRatio: Math.max(0.01, Number(pick("sawRatio", "SAW_RATIO", 3))),
-    growEvery: Math.max(1, Math.floor(Number(pick("growEvery", "GROW_EVERY", 10)))),
+    growEvery: Math.max(1, Math.floor(Number(pick("growEvery", "GROW_EVERY", 5)))),
     // growLambda stops growth (and with it the count schedule) early: the slope
     // -dD/dR, i.e. the squared error (8-bit levels², summed over RGB) a new
     // site must remove per bit it costs (BITS_PER_SITE bits). 0 = no early
@@ -1130,7 +1131,7 @@ export class Trainer {
 
   // Count step down: merge the cheapest neighbouring pairs (Ward's criterion,
   // merge.js) until `target` sites are left, each site in at most one merge,
-  // so a step removes at most half of them.
+  // so a step removes at most half of them. Returns the number merged.
   async _mergeTo(it, target) {
     const n = this.siteCount;
     const sites = await this._readSitesRgb(n);
@@ -1139,10 +1140,11 @@ export class Trainer {
       candWidth: this.candWidth, candHeight: this.candHeight, target: this.target, mask: this.maskCpu,
     });
     const merges = pickMerges(moments, this.samples, BITS_PER_SITE, { count: this.activeEstimate - target });
-    if (!merges.length) return;
+    if (!merges.length) return 0;
     this._applyMerges(it, sites, moments, merges);
     this.best = null; // keepBest restarts, so it can't go back to more sites
     this._log(`Merge @${it}: ${merges.length} pair(s) → ${this.activeEstimate} sites (schedule wants ${target})`);
+    return merges.length;
   }
 
   // Mean training loss per sample of the current state (renders and reads back).
@@ -1238,7 +1240,10 @@ export class Trainer {
 
   // One count step (every growEvery iterations, until the schedule's horizon):
   // grow or merge to the schedule's count (countTarget), then end the
-  // schedule once the horizon is reached.
+  // schedule once the horizon is reached. Merging goes on past the horizon
+  // until the count is down to endSites: a sawtooth with a big amplitude and
+  // a short merge phase can't get back down in time (a step merges at most
+  // half the sites), and stopping there kept up to 60% more sites than asked.
   async _countStep(it) {
     const args = this.args;
     if (this.growDoneIter !== null) {
@@ -1250,9 +1255,11 @@ export class Trainer {
     }
     if (it === 0 || it % args.growEvery !== 0) return;
     const target = Math.max(1, Math.round(countTarget(args, it, this.growStartCount)));
-    if (target < this.activeEstimate) await this._mergeTo(it, target);
+    let merged = 0;
+    if (target < this.activeEstimate) merged = await this._mergeTo(it, target);
     else if (target > this.activeEstimate) await this._growTo(it, target);
-    if (this.growDoneIter === null && it >= countHorizon(args)) {
+    const catchingUp = this.activeEstimate > target && merged > 0;
+    if (this.growDoneIter === null && it >= countHorizon(args) && !catchingUp) {
       this._endGrowth(it, `count schedule done (${args.countSchedule}, ${this.growStartCount} → ${args.endSites})`);
     }
   }

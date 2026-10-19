@@ -1,5 +1,5 @@
 {
-  "_note": "Trainer settings (camelCase = buildArgs args, UPPER_CASE = training_config.json keys, as in node/sweep.mjs --set) tuned on Kodak 768x512: growing 1 -> 100 sites over 1000 iterations, by mean final PSNR over 8 Kodak images, checked on the other 16 (commit adfadf0). Tuned with squared-error loss, before the loss option existed; growLrDecay 1 = off. Everything not listed comes from training_config.json. The LR warmup (200 of the 1000 iterations) was removed afterwards: within ±0.2 dB on MNIST and Kodak. Site count mapped afterwards to the start/end schedule: 1 → 100, exponential, reached at 30% of the run (countEnd 0.3): on 8 images at 256 px 24.04 dB vs 23.82 at 70%; at 5% λ 400 stopped growth at ~30 sites.",
+  "_note": "Trainer settings (camelCase = buildArgs args, UPPER_CASE = training_config.json keys, as in node/sweep.mjs --set) tuned on Kodak 768x512: growing 1 -> 100 sites over 1000 iterations, by mean final PSNR over 8 Kodak images, checked on the other 16 (commit adfadf0). Tuned with squared-error loss, before the loss option existed; growLrDecay 1 = off. Everything not listed comes from training_config.json. The LR warmup (200 of the 1000 iterations) was removed afterwards: within ±0.2 dB on MNIST and Kodak. Site count mapped afterwards to the start/end schedule: 1 → 100, exponential, reached at 30% of the run (countEnd 0.3): on 8 images at 256 px 24.04 dB vs 23.82 at 70%; at 5% λ 400 stopped growth at ~30 sites. Then a sweep of the count schedule (two rounds, 130 settings, 8 images at 256 px, 100 sites) found a plateau around 24.7 dB for sawtooth with 6–12 teeth, amplitude 2–3, any grow:merge, reached at 50%, a step every 5, vs 24.04 for the best exponential; picked 6 teeth, amplitude 2, grow:merge 3 (mid-plateau). On the 16 held-out images: 25.81 dB vs 25.08 for the exponential preset and 25.18 for the best exponential.",
   "args": {
     "iters": 1000,
     "lrMult": 8,
@@ -16,9 +16,12 @@
     "INIT_RADIUS": 4,
     "startSites": 1,
     "endSites": 100,
-    "countSchedule": "exponential",
-    "countEnd": 0.3,
-    "growEvery": 10,
+    "countSchedule": "sawtooth",
+    "countEnd": 0.5,
+    "sawTeeth": 6,
+    "sawAmp": 2,
+    "sawRatio": 3,
+    "growEvery": 5,
     "growLambda": 400,
     "growBlur": 0,
     "growLrDecay": 1,

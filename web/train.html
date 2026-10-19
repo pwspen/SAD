@@ -659,12 +659,12 @@
         </div>
         <div class="param">
           <div class="row"><label>schedule</label><select id="p-countSchedule" aria-label="Site count schedule"></select></div>
-          <div class="tip" role="tooltip">The curve from start to end. <b>linear</b>: the same number of sites per step. <b>exponential</b>: the same factor per step, so few sites change early and many late when growing (the other way round when pruning). <b>sawtooth</b>: the exponential curve with teeth on top: each tooth grows above it by <b>amplitude</b>, then merges back down to it. On MNIST (1 → 32 by 30% of the run) sawtooth scored 22.3 dB vs 20.9 for exponential; on Kodak at 256 px (1 → 400 by 70%) 27.3 vs 26.9. Teeth shorter than a few steps can't go down: the summary warns when a sawtooth never merges.</div>
+          <div class="tip" role="tooltip">The curve from start to end. <b>linear</b>: the same number of sites per step. <b>exponential</b>: the same factor per step, so few sites change early and many late when growing (the other way round when pruning). <b>sawtooth</b>: the exponential curve with teeth on top: each tooth grows above it by <b>amplitude</b>, then merges back down to it. Tuned and checked on held-out images, sawtooth beat the best exponential by about 0.8 dB on MNIST and 0.6 dB on Kodak at 256 px (the presets use it). Teeth shorter than a few steps can't go down: the summary warns when a sawtooth never merges.</div>
         </div>
         <div class="param" data-site-mode="grow">
           <div class="row"><label>reach end by</label><input id="p-countEnd" type="number" step="0.05" min="0" max="1" /></div>
           <p class="help"><span class="unit">fraction of the run (0–1)</span></p>
-          <div class="tip" role="tooltip">The count reaches <b>end sites</b> at this fraction of the iterations; the rest of the run refines that set (with <b>decay after growth</b>, the LR cools down from here). Slow ramps take many small steps, and <b>LR decay</b> compounds per growth step.</div>
+          <div class="tip" role="tooltip">The count reaches <b>end sites</b> at this fraction of the iterations (a step merges at most half the sites, so a big sawtooth may take a few more steps to get back down); the rest of the run refines that set (with <b>decay after growth</b>, the LR cools down from here). Slow ramps take many small steps, and <b>LR decay</b> compounds per growth step.</div>
         </div>
         <div class="param" data-count-schedule="sawtooth">
           <div class="row"><label>teeth</label><input id="p-sawTeeth" type="number" min="0" step="1" /></div>

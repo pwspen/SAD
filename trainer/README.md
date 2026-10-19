@@ -9,12 +9,15 @@ The site count goes from `startSites` (or a loaded sites file's count) to `endSi
 set it. Every `growEvery` iterations the count moves to the curve's value (`countTarget`):
 
 - `"linear"`: the same number of sites per step.
-- `"exponential"` (default): the same factor per step.
-- `"sawtooth"`: the exponential curve with `sawTeeth` teeth on top, each rising to
+- `"exponential"`: the same factor per step.
+- `"sawtooth"` (default): the exponential curve with `sawTeeth` teeth on top, each rising to
   (1 + `sawAmp`) × the curve over `sawRatio` / (1 + `sawRatio`) of the tooth, then merging back.
-  On 40 MNIST digits (1 → 32 by 30% of the run) it scored 22.25 dB vs 20.92 for exponential; on
-  Kodak at 256 px (1 → 400 by 70%) 27.33 vs 26.90. Teeth shorter than a few `growEvery` steps
-  never go down (`countPlan` shows it).
+  Swept against exponential (both tuned) and checked on held-out images, it won by about 2 dB on
+  MNIST (2 teeth, amplitude 2, 1:1, by 10%: 21.88 vs 19.85 dB for the old exponential preset) and
+  0.7 dB on Kodak at 256 px (6 teeth, amplitude 2, 3:1, by 50%, a step every 5: 25.81 vs 25.08);
+  these are the presets, and Kodak's are the defaults. Teeth shorter than a few `growEvery` steps
+  never go down (`countPlan` shows it). A step merges at most half the sites, so a big amplitude
+  may not be back down by `countEnd`; merging then goes on until the count is at `endSites`.
 
 Start < end grows. Each batch splits the cells whose color structure a second site would explain
 best (the variance explained by a linear color ramp across the cell): the site moves to one half, a
