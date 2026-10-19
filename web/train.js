@@ -2498,7 +2498,7 @@ function currentDataset() {
 async function selectDataset(key) {
   const dataset = DATASETS[key];
   ui.datasetSelect.value = key;
-  applyPreset(dataset.preset ?? "");
+  const presetApplied = applyPreset(dataset.preset ?? "");
   ui.itemSelect.length = 0;
   ui.itemSelect.add(new Option(`${dataset.label}…`, ""));
   const prevStatus = ui.status.textContent;
@@ -2508,13 +2508,15 @@ async function selectDataset(key) {
   } catch (err) {
     setStatus(`Failed: ${err.message}`);
     console.error(err);
-    return;
+    return false;
   }
-  if (ui.datasetSelect.value !== key) return;
+  await presetApplied;
+  if (ui.datasetSelect.value !== key) return false;
   for (let i = 0; i < dataset.count; i += 1) {
     ui.itemSelect.add(new Option(dataset.itemName(i), String(i)));
   }
   setStatus(prevStatus);
+  return true;
 }
 
 async function loadItem(i) {
@@ -3389,7 +3391,7 @@ async function main() {
   for (const [key, label] of Object.entries(PRESETS)) ui.presetSelect.add(new Option(label, key));
   ui.presetSelect.addEventListener("change", () => applyPreset(ui.presetSelect.value));
   for (const [key, dataset] of Object.entries(DATASETS)) ui.datasetSelect.add(new Option(dataset.label, key));
-  selectDataset("kodak");
+  const datasetReady = selectDataset("mnist");
   ui.datasetSelect.addEventListener("change", () => selectDataset(ui.datasetSelect.value));
   ui.itemSelect.addEventListener("change", () => {
     if (ui.itemSelect.value) loadItem(Number(ui.itemSelect.value));
@@ -3437,6 +3439,11 @@ async function main() {
   }));
   // Card sizes follow the viewer area (window resize, advanced panel toggle).
   new ResizeObserver(() => updateCanvasLayout()).observe(ui.canvases);
+
+  // Load straight into training on MNIST's first digit.
+  if (!(await datasetReady)) return;
+  await loadItem(0);
+  startTraining();
 }
 
 main();
