@@ -196,8 +196,10 @@ export class GradientsEncoder {
   }
   // gradsBuffer is the consolidated interleaved atomic<i32> buffer of size
   // capacity * 10; index with `idx * 10 + channel`. maskBuffer: f32 per pixel.
+  // errEma: vec4<f32> per pixel, errEmaSum: 2 f32 (the persistent-error
+  // weighting; GN_MODE binds them but leaves them alone).
   encode(encoder, sitesBuffer, gradParams, cand0, cand1, targetTex, maskBuffer,
-         gradsBuffer, width, height) {
+         gradsBuffer, errEma, errEmaSum, width, height) {
     const entries = [
       { binding: 0, resource: { buffer: sitesBuffer } },
       { binding: 1, resource: { buffer: gradParams } },
@@ -206,6 +208,8 @@ export class GradientsEncoder {
       { binding: 4, resource: getTextureView(this._views, targetTex) },
       { binding: 5, resource: { buffer: gradsBuffer } },
       { binding: 6, resource: { buffer: maskBuffer } },
+      { binding: 7, resource: { buffer: errEma } },
+      { binding: 8, resource: { buffer: errEmaSum } },
     ];
     const layout = this.pipeline.getBindGroupLayout(0);
     const bg = getBindGroup(this.device, this._bgs, layout, entries);
@@ -283,7 +287,7 @@ export class SiteStatsEncoder {
     this.pipeline = makePipeline(device, shaders.SITE_STATS);
     this._views = new Map();
   }
-  encode(encoder, sitesBuffer, statsParams, cand0, cand1, targetTex, maskBuffer, statsBuffer, width, height) {
+  encode(encoder, sitesBuffer, statsParams, cand0, cand1, targetTex, maskBuffer, statsBuffer, errEma, width, height) {
     const view = (t) => getTextureView(this._views, t);
     const bg = this.device.createBindGroup({ layout: this.pipeline.getBindGroupLayout(0), entries: [
       { binding: 0, resource: { buffer: sitesBuffer } },
@@ -293,6 +297,7 @@ export class SiteStatsEncoder {
       { binding: 4, resource: view(targetTex) },
       { binding: 5, resource: { buffer: maskBuffer } },
       { binding: 6, resource: { buffer: statsBuffer } },
+      { binding: 7, resource: { buffer: errEma } },
     ] });
     encoder.clearBuffer(statsBuffer);
     dispatch2D(encoder, this.pipeline, bg, Math.ceil(width / 16), Math.ceil(height / 16));

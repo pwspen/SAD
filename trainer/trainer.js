@@ -234,6 +234,16 @@ export function buildArgs(config, overrides = {}) {
     // Sites stay RGB outside the trainer; only the optimized params change.
     colorSpace: String(pick("colorSpace", "COLOR_SPACE", "rgb")),
     loss: String(pick("loss", "LOSS", "l1")),
+    // Persistent-error weighting (gradients_tiled.wgsl): each pixel's loss is
+    // scaled by (1 + errWeight · min(b / mean b, errCap)) / (1 + errWeight),
+    // b the squared (L1: absolute) EWMA of its signed error with decay
+    // errBeta per iteration, so error that keeps its sign pulls harder than
+    // error that flips. errWeight 0 = off. errGrowth: growth's split moments
+    // use the same weights, so splits go where the error persists.
+    errWeight: Math.max(0, Number(pick("errWeight", "ERR_WEIGHT", 0))),
+    errBeta: Math.min(0.9999, Math.max(0, Number(pick("errBeta", "ERR_BETA", 0.95)))),
+    errCap: Math.max(1, Number(pick("errCap", "ERR_CAP", 8))),
+    errGrowth: Boolean(pick("errGrowth", "ERR_GROWTH", false)),
     lrPosBase: Number(pick("lrPosBase", "LR_POS_BASE", 0.05)),
     lrTauBase: Number(pick("lrTauBase", "LR_TAU_BASE", 0.01)),
     lrRadiusBase: Number(pick("lrRadiusBase", "LR_RADIUS_BASE", 0.02)),
@@ -345,6 +355,18 @@ export class Trainer {
     for (let i = 0; i < width * height; i += 1) maskF[i] = this.maskCpu ? (this.maskCpu[i] > 0 ? 1 : 0) : 1;
     this.maskBuf = device.createBuffer({ size: maskF.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
     device.queue.writeBuffer(this.maskBuf, 0, maskF);
+    // Persistent-error weighting (args.errWeight): per pixel the EWMA of the
+    // signed error and the weight (w starts at 1), and the masked mean's sums.
+    let maskCount = 0;
+    for (let i = 0; i < maskF.length; i += 1) maskCount += maskF[i];
+    this.errInvCount = 1 / Math.max(1, maskCount);
+    const ema0 = new Float32Array(width * height * 4);
+    for (let i = 3; i < ema0.length; i += 4) ema0[i] = 1;
+    this.errEmaBuf = device.createBuffer({ size: ema0.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    device.queue.writeBuffer(this.errEmaBuf, 0, ema0);
+    this.errEmaSumBuf = device.createBuffer({ size: 8, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    this.errSlot = 0;
+    this.errKeep = 0;
 
     // The run starts from startSites (or the loaded sites), plus the layer
     // (LAYER_MODES) after them; the buffers hold the most the count schedule
@@ -377,7 +399,7 @@ export class Trainer {
     this.renderTex = createRgba32FloatTexture(device, width, height, { storage: true, copyDst: false, copySrc: true });
     this.renderParams = createParamsBuffer(device, this._paramsArgs(initSiteCount));
     this.invScaleSq = 1.0 / Math.pow(Math.max(width, height), 2);
-    this.gradParams = createGradParamsBuffer(device, initSiteCount, this.invScaleSq, this._globalCand());
+    this.gradParams = createGradParamsBuffer(device, initSiteCount, this.invScaleSq, this._globalCand(), this._gradEma());
     this.adamParams = createAdamParamsBuffer(device, { width, height, layerSite: this._globalCand() });
     this.gradCountParams = createClearParamsBuffer(device, this.bufferCapacity * 10);
 
@@ -476,8 +498,14 @@ export class Trainer {
   // index changed.
   _updateCountParams(n) {
     const queue = this.device.queue;
-    updateGradParamsBuffer(queue, this.gradParams, n, this.invScaleSq, this._globalCand());
+    updateGradParamsBuffer(queue, this.gradParams, n, this.invScaleSq, this._globalCand(), this._gradEma());
     this.cands.globalCand = this._globalCand();
+  }
+
+  // GradParams' persistent-error fields for the next gradient pass.
+  _gradEma() {
+    const a = this.args;
+    return { slot: this.errSlot, keep: this.errKeep, alpha: a.errWeight, cap: a.errCap, invCount: this.errInvCount };
   }
 
   _log(msg) { if (this.onLog) this.onLog({ type: "msg", message: msg }); }
@@ -542,11 +570,18 @@ export class Trainer {
         updateParamsBuffer(queue, this.renderParams, this._paramsArgs(siteCount));
       }
 
+      // The error EWMA's decay, ramped in so step t averages its t + 1
+      // residuals until that reaches errBeta.
+      this.errKeep = Math.min(args.errBeta, it / (it + 1));
+      updateGradParamsBuffer(queue, this.gradParams, siteCount, this.invScaleSq, this._globalCand(), this._gradEma());
+
       const encoder = device.createCommandEncoder();
       if (it % candUpdateFreq === 0) this.cands.encodeUpdate(encoder, this.sitesBuf, siteCount);
+      encoder.clearBuffer(this.errEmaSumBuf, (1 - this.errSlot) * 4, 4);
       this.gradsEnc.encode(encoder, this.sitesBuf, this.gradParams,
         this.cands.cand0, this.cands.cand1, this.targetTex, this.maskBuf,
-        this.grads, this.width, this.height);
+        this.grads, this.errEmaBuf, this.errEmaSumBuf, this.width, this.height);
+      this.errSlot = 1 - this.errSlot;
 
       // Snapshot the accumulated gradients on log ticks — Adam zeroes them.
       let gradStaging = null;
@@ -640,13 +675,14 @@ export class Trainer {
     const u = new Uint32Array(8);
     u[0] = n;
     u[1] = this._globalCand();
+    u[2] = this.args.errGrowth && this.args.errWeight > 0 ? 1 : 0;
     new Float32Array(u.buffer)[4] = this.invScaleSq;
     device.queue.writeBuffer(this.siteStatsParams, 0, u);
     const bytes = n * SITE_STAT_CH * 4;
     const staging = device.createBuffer({ size: bytes, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
     const encoder = device.createCommandEncoder();
     this.statsEnc.encode(encoder, this.sitesBuf, this.siteStatsParams, this.cands.cand0, this.cands.cand1,
-      this.targetTex, this.maskBuf, this.siteStatsBuf, this.width, this.height);
+      this.targetTex, this.maskBuf, this.siteStatsBuf, this.errEmaBuf, this.width, this.height);
     encoder.copyBufferToBuffer(this.siteStatsBuf, 0, staging, 0, bytes);
     device.queue.submit([encoder.finish()]);
     await staging.mapAsync(GPUMapMode.READ);
@@ -1107,7 +1143,7 @@ export class Trainer {
     encoder.clearBuffer(this._gnBuf);
     this.gnEnc.encode(encoder, this.sitesBuf, this.gradParams,
       this.cands.cand0, this.cands.cand1, this.targetTex, this.maskBuf,
-      this._gnBuf, this.width, this.height);
+      this._gnBuf, this.errEmaBuf, this.errEmaSumBuf, this.width, this.height);
     encoder.copyBufferToBuffer(this._gnBuf, 0, staging, 0, bytes);
     device.queue.submit([encoder.finish()]);
     await staging.mapAsync(GPUMapMode.READ);
@@ -1191,6 +1227,7 @@ export class Trainer {
       this.sitesBuf, this.adamBuf, this.seedCounter, this.grads,
       this.renderParams, this.gradParams, this.adamParams, this.gradCountParams,
       this._tauHeatBuf, this._gnBuf, this.siteStatsParams, this.siteStatsBuf, this.maskBuf,
+      this.errEmaBuf, this.errEmaSumBuf,
     ];
     for (const res of owned) res?.destroy();
     this.cands?.destroy();

@@ -42,6 +42,15 @@ paired against no layer, ± standard error over digits) it gains 0.78 ± 0.28 dB
 3.06 ± 0.41 at 32 (the MNIST preset); on Kodak at 256 px it stays mostly behind (β ≈ −4.7, ~4%
 of pixels) and costs 0.13 ± 0.03 dB.
 
+`errWeight` > 0 weights the loss toward persistent error. The gradient pass keeps, per pixel, an
+EWMA ē of the signed error (decay `errBeta` per iteration, ramped in from a plain average) and
+scales the pixel's loss by the stop-gradient weight (1 + α · min(b / mean b, `errCap`)) / (1 + α),
+with b = |ē|² (|ē| under L1) and the mean over masked pixels from the previous step. Error that
+keeps its sign raises b; error that flips averages out. It is part of the gradient pass (one vec4
+read and write per pixel, one atomic per tile), so it costs no extra dispatch. Gradients only reach
+a pixel's 8 candidates, so the weights pull nearby sites; `errGrowth` also weights growth's split
+moments, so new sites go where the error persists. Off by default and untested against the presets.
+
 There is no LR warmup. `lrSchedule` is `"cosine"` (1 to 0 over `iters`), `"fixed"` (default, constant) or
 `"decay-after-growth"` (constant until growth ends, then cosine to 0 by the end of the run).
 
@@ -61,4 +70,4 @@ There is no LR warmup. `lrSchedule` is `"cosine"` (1 to 0 over `iters`), `"fixed
 
 ## Storage-buffer limits
 
-The kernels bind at most 4 storage buffers per shader stage, within WebGPU's default of 8; the trainer still requests the adapter's maximum.
+The kernels bind at most 5 storage buffers per shader stage, within WebGPU's default of 8; the trainer still requests the adapter's maximum.

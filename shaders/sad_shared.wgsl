@@ -99,15 +99,22 @@ struct InitParams {
   _pad2 : u32,
 }
 
+// ema*: the persistent-error weighting (gradients_tiled.wgsl). emaSlot is the
+// errEmaSum slot holding last step's sum (this step adds to the other one),
+// emaKeep the EWMA's decay this step, emaInvCount 1 / masked pixel count.
 struct GradParams {
   siteCount : u32,
   globalCand : u32,
+  emaSlot : u32,
   _pad0 : u32,
-  _pad1 : u32,
   invScaleSq : f32,
+  emaKeep : f32,
+  emaAlpha : f32,
+  emaCap : f32,
+  emaInvCount : f32,
+  _pad1 : f32,
   _pad2 : f32,
   _pad3 : f32,
-  _pad4 : f32,
 }
 
 struct AdamParams {

@@ -12,6 +12,9 @@
 // Output `stats[site * 18 + ch]` (f32 bits, summed with a CAS loop):
 //   0 n   1,2 Σd   3,4,5 Σdx², Σdx·dy, Σdy²   6..8 Σt   9..11 Σt·dx
 //   12..14 Σt·dy   15 Σ|t|²   16 Σ|t - pred|²   17 Σ removal delta
+// With errWeighted set, each pixel counts with its persistent-error weight
+// (errEma.w, written by gradients_tiled.wgsl) on top of the mask, so splits go
+// where the error has stayed high, and gains are in weighted squared error.
 // Sums go through a per-workgroup hash table first (as in gradients_tiled),
 // so one global add per site per tile. Same uniformity rule: no early return
 // before either barrier. The buffer must be zeroed before each run.
@@ -19,7 +22,7 @@
 struct SiteStatsParams {
   siteCount : u32,
   globalCand : u32,
-  _pad1 : u32,
+  errWeighted : u32,
   _pad2 : u32,
   invScaleSq : f32,
   _pad3 : f32,
@@ -34,6 +37,7 @@ struct SiteStatsParams {
 @group(0) @binding(4) var targetTex : texture_2d<f32>;
 @group(0) @binding(5) var<storage, read> mask : array<f32>; // f32 per pixel (W*H)
 @group(0) @binding(6) var<storage, read_write> stats : array<atomic<u32>>;
+@group(0) @binding(7) var<storage, read> errEma : array<vec4<f32>>;
 
 const STATS_CH : u32 = 18u;
 const ST_SLOTS : u32 = 128u;
@@ -92,6 +96,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>,
   let in_bounds = gid.x < dims.x && gid.y < dims.y;
   var m = 0.0;
   if (in_bounds) { m = mask[gid.y * dims.x + gid.x]; }
+  if (in_bounds && params.errWeighted != 0u) { m = m * errEma[gid.y * dims.x + gid.x].w; }
 
   if (in_bounds && m > 0.0) {
     let uv = vec2<f32>(f32(gid.x), f32(gid.y));

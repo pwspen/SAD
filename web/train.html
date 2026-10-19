@@ -789,6 +789,25 @@
           <div class="row"><label>loss</label><select id="p-loss" aria-label="Training loss"></select></div>
           <div class="tip" role="tooltip">What training minimizes, per color channel. <b>L2</b> (squared error): each site's color is the mean of the pixels it covers, so a cell straddling black and white goes grey. <b>L1</b> (absolute error): the median instead, so a mostly-white cell goes white and the boundaries are pushed onto the edges. PSNR, growth and λ use squared error either way, so L1 runs score a little lower.</div>
         </div>
+        <div class="param">
+          <div class="row"><label>persist weight</label><input id="p-errWeight" type="number" step="0.5" min="0" /></div>
+          <p class="help"><span class="unit">α (0 = off)</span></p>
+          <div class="tip" role="tooltip">Pulls harder on error that stays put. Every pixel keeps a running average of its signed error; where the error keeps the same sign iteration after iteration, the average stays large, and where it flips (noise, a boundary sweeping past) it cancels. Each pixel's loss is multiplied by (1 + α · its average error² over the image mean, capped) / (1 + α), so the mean weight stays near 1 and pixels with persistent error count up to (1 + α · cap) / (1 + α) times more. Costs one extra read and write per pixel per iteration.</div>
+        </div>
+        <div class="param">
+          <div class="row"><label>persist decay</label><input id="p-errBeta" type="number" step="0.01" min="0" max="0.9999" /></div>
+          <p class="help"><span class="unit">β per iteration (memory ≈ 1 / (1 − β) iterations)</span></p>
+          <div class="tip" role="tooltip">How long the running average remembers: 0.95 ≈ the last 20 iterations. Longer memory picks out only error that has stayed for a long time, but reacts later once it's fixed.</div>
+        </div>
+        <div class="param">
+          <div class="row"><label>persist cap</label><input id="p-errCap" type="number" step="1" min="1" /></div>
+          <p class="help"><span class="unit">× the mean</span></p>
+          <div class="tip" role="tooltip">Largest average error that counts, as a multiple of the image mean. Keeps error that no site can remove (fine texture) from taking the whole loss.</div>
+        </div>
+        <div class="param" data-site-mode="grow">
+          <div class="row"><label>persist growth</label><input id="p-errGrowth" type="checkbox" /></div>
+          <div class="tip" role="tooltip">Growth weighs each pixel by the same weight when picking cells to split and placing the new site, so splits go where the error has persisted. λ then compares against weighted error. Needs persist weight &gt; 0.</div>
+        </div>
 
         <h3 class="has-tip" tabindex="0">Learning rates<span class="tip" role="tooltip">Adam step sizes. Adam moves a parameter by about its rate per iteration, in that parameter's units, so each unit below is "per iteration". Rate used = base below × <b>LR mult</b> × the LR schedule (set under <b>Schedule</b>), e.g. pos 0.025 × 3 = up to 0.075 px per iteration.</span></h3>
         <div class="param">

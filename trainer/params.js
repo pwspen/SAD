@@ -98,32 +98,37 @@ export function createInitParamsBuffer(device, numSites, gradThreshold, maxAttem
 
 // ---------------------------------------------------------------------------
 // GradParams (gradients_tiled.wgsl):
-//   u32 siteCount, u32 globalCand, u32 _pad0, u32 _pad1,
-//   f32 invScaleSq, f32 _pad2, f32 _pad3, f32 _pad4     (32 bytes)
+//   u32 siteCount, u32 globalCand, u32 emaSlot, u32 _pad0,
+//   f32 invScaleSq, f32 emaKeep, f32 emaAlpha, f32 emaCap,
+//   f32 emaInvCount, f32 _pad1, f32 _pad2, f32 _pad3      (48 bytes)
 // globalCand: the site every pixel blends besides its list (none by default).
+// ema: the persistent-error weighting, { slot, keep, alpha, cap, invCount }
+// (see gradients_tiled.wgsl); alpha 0 = off.
 // ---------------------------------------------------------------------------
 
-export function createGradParamsBuffer(device, siteCount, invScaleSq, globalCand = 0xffffffff) {
+export function createGradParamsBuffer(device, siteCount, invScaleSq, globalCand = 0xffffffff, ema = {}) {
   const buf = device.createBuffer({
-    size: 32,
+    size: 48,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
-  updateGradParamsBuffer(device.queue, buf, siteCount, invScaleSq, globalCand);
+  updateGradParamsBuffer(device.queue, buf, siteCount, invScaleSq, globalCand, ema);
   return buf;
 }
 
-export function updateGradParamsBuffer(queue, buffer, siteCount, invScaleSq, globalCand = 0xffffffff) {
-  const bytes = new ArrayBuffer(32);
+export function updateGradParamsBuffer(queue, buffer, siteCount, invScaleSq, globalCand = 0xffffffff,
+                                       { slot = 0, keep = 0, alpha = 0, cap = 1, invCount = 0 } = {}) {
+  const bytes = new ArrayBuffer(48);
   const u = new Uint32Array(bytes);
   const f = new Float32Array(bytes);
   u[0] = siteCount >>> 0;
   u[1] = globalCand >>> 0;
-  u[2] = 0;
+  u[2] = slot >>> 0;
   u[3] = 0;
   f[4] = invScaleSq;
-  f[5] = 0;
-  f[6] = 0;
-  f[7] = 0;
+  f[5] = keep;
+  f[6] = alpha;
+  f[7] = cap;
+  f[8] = invCount;
   queue.writeBuffer(buffer, 0, bytes);
 }
 

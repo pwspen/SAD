@@ -32,6 +32,20 @@ override GN_MODE : bool = false;
 // that is mostly one color takes that color instead of a blend.
 override LOSS : u32 = 0u;
 
+// Persistent-error weighting. Each pixel keeps an EWMA of its signed error
+// ē ← keep·ē + (1 − keep)·e in errEma.xyz (keep = emaKeep, the trainer's
+// β ramped in so the first steps average instead of decaying from 0). Its
+// bias b = |ē|² (|ē| under L1, so b is in the loss's units) is high where the
+// error stays the same sign step after step; error that flips sign averages
+// out. The pixel's loss is scaled by the stop-gradient weight
+//   w = (1 + α · min(b / mean b, cap)) / (1 + α)
+// with mean b over the masked pixels from the previous step (errEmaSum, two
+// slots ping-ponged by emaSlot; each workgroup adds its tile's Σb once). The
+// division by 1 + α keeps the mean weight near 1. α = 0 gives w = 1. errEma.w
+// holds w for site_stats.wgsl. GN_MODE neither reads nor updates any of it.
+@group(0) @binding(7) var<storage, read_write> errEma : array<vec4<f32>>;
+@group(0) @binding(8) var<storage, read_write> errEmaSum : array<atomic<u32>, 2>;
+
 @group(0) @binding(0) var<storage, read> sites : array<Site>;
 @group(0) @binding(1) var<uniform> params : GradParams;
 @group(0) @binding(2) var inCand0 : texture_2d<u32>;
@@ -61,6 +75,27 @@ const K_TILE_HASH_MASK : u32 = K_TILE_HASH_SIZE - 1u;
 const K_TILE_GRAD_SLOTS : u32 = K_TILE_HASH_SIZE * 10u;
 const K_TILE_MAX_PROBES : u32 = 8u;
 const K_TILE_EMPTY_KEY : u32 = 0xffffffffu;
+
+// Per-tile Σb in fixed point: b ≤ 4 (clamped), so 256 · 4e6 fits a u32.
+const K_EMA_QUANT : f32 = 1.0e6;
+var<workgroup> wg_bias : atomic<u32>;
+
+// The pixel's weight w for error e (see errEma), updating its EWMA.
+fn errWeight(p : u32, e : vec3<f32>) -> f32 {
+  var eb = mix(e, errEma[p].xyz, params.emaKeep);
+  if (is_bad3(eb)) { eb = vec3<f32>(0.0); }
+  var bias = dot(eb, eb);
+  if (LOSS == 1u) { bias = sqrt(bias); }
+  bias = min(bias, 4.0);
+  let mean = bitcast<f32>(atomicLoad(&errEmaSum[params.emaSlot])) * params.emaInvCount;
+  var w = 1.0;
+  if (params.emaAlpha > 0.0 && mean > 1.0e-12) {
+    w = (1.0 + params.emaAlpha * min(bias / mean, params.emaCap)) / (1.0 + params.emaAlpha);
+  }
+  errEma[p] = vec4<f32>(eb, w);
+  atomicAdd(&wg_bias, u32(bias * K_EMA_QUANT));
+  return w;
+}
 
 fn tile_hash(key : u32) -> u32 { return key * 2654435761u; }
 
@@ -103,6 +138,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>,
     atomicStore(&tg_grads[i], 0);
     atomicStore(&tg_grads_hi[i], 0);
   }
+  if (local_idx == 0u) { atomicStore(&wg_bias, 0u); }
   workgroupBarrier();
 
   // Per-pixel gradient contribution — every thread takes the same path to the
@@ -143,6 +179,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>,
       let tgt = textureLoad(targetTex, vec2<i32>(gid.xy), 0).rgb;
       var dL_dpred = 2.0 * (pred - tgt);
       if (LOSS == 1u) { dL_dpred = sign(pred - tgt); } // sign(0) = 0
+      if (!GN_MODE) { dL_dpred = dL_dpred * errWeight(gid.y * dims.x + gid.x, pred - tgt); }
       let dL_ok = !is_bad3(dL_dpred);
       if (dL_ok) {
         for (var i = 0u; i < NCAND; i = i + 1u) {
@@ -249,6 +286,20 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>,
     if (siteID != K_TILE_EMPTY_KEY) {
       for (var ch = 0u; ch < 10u; ch = ch + 1u) {
         atomicAddGrad(siteID * 10u + ch, wgLoadGrad(i * 10u + ch));
+      }
+    }
+  }
+
+  // The tile's Σb into this step's slot (the one emaSlot doesn't read).
+  if (local_idx == 0u && !GN_MODE) {
+    let val = f32(atomicLoad(&wg_bias)) / K_EMA_QUANT;
+    if (val > 0.0) {
+      let slot = 1u - params.emaSlot;
+      var old = atomicLoad(&errEmaSum[slot]);
+      loop {
+        let res = atomicCompareExchangeWeak(&errEmaSum[slot], old, bitcast<u32>(bitcast<f32>(old) + val));
+        if (res.exchanged) { break; }
+        old = res.old_value;
       }
     }
   }
