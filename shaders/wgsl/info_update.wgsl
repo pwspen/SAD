@@ -22,7 +22,7 @@ struct InfoParams {
   invScaleSq : f32,
   quant : f32,
   liveEps : f32,
-  _pad0 : f32,
+  globalCand : u32,
 }
 
 @group(0) @binding(0) var<storage, read> sites : array<Site>;
@@ -47,15 +47,15 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   let uv = vec2<f32>(f32(gid.x), f32(gid.y));
   let inv_scale = sqrt(params.invScaleSq);
   let cc = vec2<i32>(candidateCoord(vec2<u32>(gid.xy), dims, textureDimensions(inCand0)));
-  let ids = cand_ids(textureLoad(inCand0, cc, 0), textureLoad(inCand1, cc, 0));
-  var logits : array<f32, 8>;
-  for (var i = 0u; i < 8u; i = i + 1u) {
+  let ids = cand_ids(textureLoad(inCand0, cc, 0), textureLoad(inCand1, cc, 0), params.globalCand);
+  var logits : array<f32, NCAND>;
+  for (var i = 0u; i < NCAND; i = i + 1u) {
     logits[i] = NEG_INF;
     if (ids[i] < params.siteCount) { logits[i] = site_logit(sites[ids[i]], uv, params.invScaleSq, inv_scale); }
   }
-  let w = softmax8(logits);
+  let w = softmax_c(logits);
   var pred = vec3<f32>(0.0);
-  for (var i = 0u; i < 8u; i = i + 1u) {
+  for (var i = 0u; i < NCAND; i = i + 1u) {
     if (w[i] > 0.0) {
       let c = site_color(sites[ids[i]]);
       if (!is_bad3(c)) { pred = pred + w[i] * c; }
@@ -76,7 +76,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   }
   lossWeight[p] = weight;
   if (weight > 0.0) {
-    for (var i = 0u; i < 8u; i = i + 1u) {
+    for (var i = 0u; i < NCAND; i = i + 1u) {
       if (w[i] > params.liveEps) { atomicOr(&siteLive[ids[i]], 1u); }
     }
   }

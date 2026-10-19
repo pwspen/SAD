@@ -1,6 +1,15 @@
 @group(0) @binding(0) var<storage, read> sites : array<Site>;
 @group(0) @binding(1) var<storage, read_write> packed_sites : array<PackedCandidateSite>;
-@group(0) @binding(2) var<uniform> packParams : ClearParams;
+// The count buffer (ClearParams layout) with invScale = 1 / max(width, height)
+// in its second slot. The radius is packed normalized (r · invScale, as the
+// logit uses it): in pixels a wide flat site's radius overflows a half float.
+struct PackParams {
+  count : u32,
+  invScale : f32,
+  _pad0 : u32,
+  _pad1 : u32,
+}
+@group(0) @binding(2) var<uniform> packParams : PackParams;
 
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
@@ -19,7 +28,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   } else {
     out.data = vec4<u32>(
       pack2x16float(site.position),
-      pack2x16float(vec2<f32>(site.log_tau, site.radius_sq)),
+      pack2x16float(vec2<f32>(site.log_tau, site.radius_sq * packParams.invScale)),
       pack2x16float(site_aniso_dir(site)),
       pack2x16float(vec2<f32>(site.log_aniso, 0.0))
     );

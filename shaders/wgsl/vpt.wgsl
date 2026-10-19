@@ -9,7 +9,8 @@
 
 fn tryInsert8(bestIdx : ptr<function, array<u32, 8>>, bestD2 : ptr<function, array<f32, 8>>,
               candIdx : u32, uv : vec2<f32>, siteCount : u32, invScaleSq : f32, inv_scale : f32) {
-  if (candIdx >= siteCount) { return; }
+  // The global site is blended separately (cand_ids), never stored.
+  if (candIdx >= siteCount || candIdx == params.globalCand) { return; }
   for (var i = 0u; i < 8u; i = i + 1u) {
     if ((*bestIdx)[i] == candIdx) { return; }
   }
@@ -33,7 +34,7 @@ fn tryInsert8(bestIdx : ptr<function, array<u32, 8>>, bestD2 : ptr<function, arr
     let d2_aniso = l1 * proj2 + l2 * perp2;
     let d2_norm = d2_aniso * invScaleSq;
     let d2_safe = max(d2_norm, 1e-8);
-    let r_norm = tau_rad.y * inv_scale;
+    let r_norm = tau_rad.y; // packed normalized (candidate_pack.wgsl)
     let dmix2 = sqrt(d2_safe) - r_norm;
     if (is_bad(dmix2)) { return; }
     let tau = max(exp(tau_rad.x), 1e-4);
@@ -58,7 +59,7 @@ fn tryInsert8(bestIdx : ptr<function, array<u32, 8>>, bestD2 : ptr<function, arr
 fn tryInsertTexel(bestIdx : ptr<function, array<u32, 8>>, bestD2 : ptr<function, array<f32, 8>>,
                   c0 : vec4<u32>, c1 : vec4<u32>, uv : vec2<f32>, siteCount : u32,
                   invScaleSq : f32, inv_scale : f32) {
-  let ids = cand_ids(c0, c1);
+  let ids = cand_ids8(c0, c1);
   for (var i = 0u; i < 8u; i = i + 1u) {
     tryInsert8(bestIdx, bestD2, ids[i], uv, siteCount, invScaleSq, inv_scale);
   }
@@ -89,11 +90,8 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
     bestD2[i] = inf;
   }
 
-  // The current list, then the global candidate (params.globalCand, a site
-  // offered to every pixel; none when >= siteCount).
   tryInsertTexel(&bestIdx, &bestD2, textureLoad(inCand0, gi, 0), textureLoad(inCand1, gi, 0),
                  uv, params.siteCount, params.invScaleSq, inv_scale);
-  tryInsert8(&bestIdx, &bestD2, params.globalCand, uv, params.siteCount, params.invScaleSq, inv_scale);
 
   let offsets = array<vec2<i32>, 4>(
     vec2<i32>(-1, 0), vec2<i32>(1, 0), vec2<i32>(0, -1), vec2<i32>(0, 1)

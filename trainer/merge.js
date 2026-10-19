@@ -30,11 +30,13 @@ function siteLogit(sites, b, x, y, invScale) {
 }
 
 // Per-cell moments of the target and the adjacency of sites [0, n): for every
-// masked pixel, its owner and runner-up among the pixel's 8 candidates.
-// `sites` holds RGB colors; `cand` is 8 u32 site ids per candidate pixel.
+// masked pixel, its owner and runner-up among the pixel's 8 candidates and
+// `global` (the site every pixel blends, as cand_ids in sad_shared.wgsl; -1 =
+// none). Merging leaves `global` out: a layer behind everything would be the
+// runner-up almost everywhere and hide which sites are neighbours. `sites` holds RGB colors; `cand` is 8 u32 site ids per candidate pixel.
 // Returns { count, sum (RGB), sumSq (|t|², summed over RGB), pairs: Map of
 // "i,j" (i < j) → pixels where one owns and the other is runner-up }.
-export function cellMoments({ width, height, sites, n, cand, candWidth, candHeight, target, mask }) {
+export function cellMoments({ width, height, sites, n, cand, candWidth, candHeight, target, mask, global = -1 }) {
   const count = new Float64Array(n), sum = new Float64Array(n * 3), sumSq = new Float64Array(n);
   const pairs = new Map();
   const invScale = 1 / Math.max(width, height);
@@ -46,9 +48,9 @@ export function cellMoments({ width, height, sites, n, cand, candWidth, candHeig
       const cx = Math.min(Math.floor((x * candWidth) / width), candWidth - 1);
       const cb = (cy * candWidth + cx) * 8;
       let best = -1, second = -1, l0 = -Infinity, l1 = -Infinity;
-      for (let k = 0; k < 8; k += 1) {
-        const id = cand[cb + k];
-        if (id >= n || id === best || id === second) continue;
+      for (let k = 0; k < 9; k += 1) {
+        const id = k < 8 ? cand[cb + k] : global;
+        if (id < 0 || id >= n || id === best || id === second) continue;
         const b = id * SITE_FLOATS;
         if (!(sites[b] >= 0)) continue;
         const l = siteLogit(sites, b, x, y, invScale);
@@ -93,43 +95,31 @@ export function mergeCost({ count, sum }, i, j) {
   return (ni * nj) / (ni + nj) * d2;
 }
 
-// Cost of a pinned site p (fixed RGB color, e.g. the histogram layer)
-// absorbing cell j unchanged: j's pixels move from their mean to p's color.
-function absorbCost({ count, sum }, color, j) {
-  const nj = count[j];
-  if (!(nj > 0)) return 0;
-  let d2 = 0;
-  for (let c = 0; c < 3; c += 1) d2 += (sum[j * 3 + c] / nj - color[c]) ** 2;
-  return nj * d2;
-}
-
 // The merges that pay for themselves, cheapest first, each site at most once:
 // [{ keep, drop, cost }] with `keep` the larger cell. `samples` = masked
 // pixels × 3. With `count`, the `count` cheapest merges instead, paying or
-// not (a count schedule going down). `pinned`: Map(id → RGB) of sites that are
-// never dropped; one is always the `keep` of its merges and absorbs the other
-// cell at its own color (absorbCost). Two pinned sites never merge.
-export function pickMerges(moments, samples, bitsPerSite, { count = null, pinned = new Map() } = {}) {
+// not (a count schedule going down). Sites in `pinned` (a Set, e.g. the
+// histogram layer) never merge: what a layer would take over depends on its
+// depth, which Ward's criterion knows nothing about.
+export function pickMerges(moments, samples, bitsPerSite, { count = null, pinned = new Set() } = {}) {
   const frac = Math.pow(2, (2 * bitsPerSite) / Math.max(1, samples)) - 1;
   let err = cellSse(moments);
   const options = [];
   for (const key of moments.pairs.keys()) {
     const [i, j] = key.split(",").map(Number);
-    if (pinned.has(i) && pinned.has(j)) continue;
-    const pin = pinned.has(i) ? i : pinned.has(j) ? j : null;
-    const cost = pin === null ? mergeCost(moments, i, j) : absorbCost(moments, pinned.get(pin), pin === i ? j : i);
-    options.push({ i, j, cost, pin });
+    if (pinned.has(i) || pinned.has(j)) continue;
+    options.push({ i, j, cost: mergeCost(moments, i, j) });
   }
   options.sort((a, b) => a.cost - b.cost);
   const used = new Set();
   const merges = [];
-  for (const { i, j, cost, pin } of options) {
+  for (const { i, j, cost } of options) {
     if (count != null ? merges.length >= count : !(cost < err * frac)) break;
     if (used.has(i) || used.has(j)) continue;
     used.add(i);
     used.add(j);
     err += cost;
-    const keep = pin ?? (moments.count[i] >= moments.count[j] ? i : j);
+    const keep = moments.count[i] >= moments.count[j] ? i : j;
     merges.push({ keep, drop: keep === i ? j : i, cost });
   }
   return merges;

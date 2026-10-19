@@ -1,6 +1,7 @@
 // Adam step over the interleaved f32-bit `grads` buffer (layout in
 // gradients_tiled.wgsl); clears each site's gradients after use.
-// Sites with sitePin != 0 (e.g. the histogram layer) never move. With
+// Sites with sitePin == 1 (the histogram layer) never move; sitePin == 2 (the
+// learned-depth layer) only changes its depth. With
 // params.freeze_unlive, neither do sites the last info pass found serving no
 // pixel still in the loss (siteLive == 0, info_update.wgsl); their first
 // moments are dropped so they wake up without stale momentum.
@@ -39,6 +40,28 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   if (is_bad(g_log_aniso)) { g_log_aniso = 0.0; }
 
   if (sites[idx].position.x < 0.0) { return; }
+  if (sitePin[idx] == 2u) {
+    // The learned-depth layer (trainer.js, layer "learn"): only its depth
+    // β = τ · radius · inv_scale moves, at the log-τ LR (logit units), with
+    // dL/dβ = dL/dradius / (τ · inv_scale) and Adam moments in the radius slots.
+    let b = idx * 24u;
+    let tau = exp(sites[idx].log_tau);
+    let k = tau / f32(max(params.width, params.height));
+    let g = g_radius_sq / k;
+    if (!is_bad(g)) {
+      let tt = max(1.0, f32(params.t) - adam[b + 20u]);
+      let m = params.beta1 * adam[b + 6u] + (1.0 - params.beta1) * g;
+      let v = params.beta2 * adam[b + 7u] + (1.0 - params.beta2) * g * g;
+      adam[b + 6u] = m;
+      adam[b + 7u] = v;
+      let mh = m / (1.0 - pow(params.beta1, tt));
+      let vh = v / (1.0 - pow(params.beta2, tt));
+      let beta = clamp(sites[idx].radius_sq * k - params.lr_tau * mh / (sqrt(vh) + params.eps), -8.0, 8.0);
+      sites[idx].radius_sq = beta / k;
+    }
+    for (var c = 0u; c < 10u; c = c + 1u) { atomicStore(&grads[base_g + c], 0u); }
+    return;
+  }
   if (sitePin[idx] != 0u || (params.freeze_unlive != 0u && siteLive[idx] == 0u)) {
     // First moments (layout below): pos 0-1, log_tau 4, radius 6, color 8-10,
     // dir 14-15, log_aniso 18.

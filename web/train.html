@@ -768,7 +768,7 @@
 
         <div class="param">
           <div class="row"><label>layer</label><select id="p-layer" aria-label="Histogram layer"></select></div>
-          <div class="tip" role="tooltip">When one exact 8-bit color covers at least half the pixels (MNIST's black: ~80%), that color becomes a flat layer behind every site: a pinned site with a constant logit of 0, offered to every pixel. A site then wins wherever it reaches past the layer (inside its radius), and the layer's color shows everywhere else, so no sites are spent drawing it. It never moves or splits, counts as one of the sites, and is an ordinary site in the saved file. Images without a dominant color (Kodak) are left alone.</div>
+          <div class="tip" role="tooltip">When one exact 8-bit color covers at least half the pixels (MNIST's black: ~80%), that color becomes a flat layer behind every site: a pinned site with a constant logit of 0, offered to every pixel. A site then wins wherever it reaches past the layer (inside its radius), and the layer's color shows everywhere else, so no sites are spent drawing it. It never moves or splits, counts as one of the sites, and is an ordinary site in the saved file. Images without a dominant color (Kodak) are left alone. <b>learned depth</b>: the layer is always there, colored by the peak of the smoothed color histogram, and how far forward it sits (its constant logit β) is learned, starting from how common that color is: on MNIST it comes forward and takes the background, on Kodak it stays mostly behind.</div>
         </div>
         <div class="param">
           <div class="row"><label>remaining info</label><select id="p-info" aria-label="Remaining-information weighting"></select></div>

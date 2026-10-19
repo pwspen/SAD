@@ -229,14 +229,66 @@ export function countCapacity(args, start = args.startSites) {
 // color gets a flat layer: a pinned site whose logit is ~0 everywhere
 // (τ = e^LAYER_LOG_TAU, radius 0), so a site wins a pixel where -τ(d - r) > 0,
 // i.e. inside its radius, and the layer's color shows wherever no site
-// reaches. The layer is offered to every pixel's candidate list
-// (Params.globalCand), never moves (sitePin), never splits, and can absorb
-// sites in a merge. It's an ordinary site in the sites file.
+// reaches. Every pixel blends the layer besides its 8 listed candidates
+// (globalCand; it never takes a list slot), it never moves (sitePin), never
+// splits or merges, and it's an ordinary site in the sites file.
+// "learn": the continuous version. The layer is always there, colored by the
+// peak of the target's smoothed color histogram (colorPeak), and its depth β
+// (its constant logit) is learned like any other parameter, starting from
+// log(p / (1 - p)) of the peak's probability mass p. A common color starts in
+// front of the sites' boundaries and takes the background; a rare one starts
+// behind them, and the gradient decides how far forward it comes. (A per-site
+// bias b(c) on every site would not do this: logits are -τ(d - r), so a
+// constant b is exactly a radius change r + b/τ and the optimizer undoes it.
+// Only a flat site can sit behind everything.)
 export const LAYER_MODES = {
   off: "off",
   auto: "auto (dominant color)",
+  learn: "learned depth (always on)",
 };
 const LAYER_LOG_TAU = -9;
+// "learn": τ of the layer (flat to 0.03 logits across the image) and its depth
+// range. β is stored as radius β / (τ · inv_scale).
+const LEARN_LOG_TAU = -4;
+const LAYER_BETA_MAX = 8; // also in adam.wgsl
+// Color bins (8-bit levels per bin and channel) of colorPeak's histogram.
+const PEAK_BIN = 16;
+
+// The peak of the target's color histogram smoothed over ±1 bin of PEAK_BIN
+// levels (a box kernel ~±16 levels wide): { color (the most common exact color
+// within the peak's kernel, 0..1 RGB), mass (fraction of pixels in the kernel) }.
+export function colorPeak(target, n, mask = null) {
+  const B = 256 / PEAK_BIN;
+  const hist = new Float64Array(B * B * B);
+  const exact = new Map();
+  let total = 0;
+  const bin = (v) => Math.min(B - 1, Math.floor(Math.round(v * 255) / PEAK_BIN));
+  for (let p = 0; p < n; p += 1) {
+    if (mask && !(mask[p] > 0)) continue;
+    const r = target[p * 4], g = target[p * 4 + 1], b = target[p * 4 + 2];
+    hist[(bin(r) * B + bin(g)) * B + bin(b)] += 1;
+    total += 1;
+  }
+  let best = 0, bestMass = -1;
+  for (let i = 0; i < B; i += 1) for (let j = 0; j < B; j += 1) for (let k = 0; k < B; k += 1) {
+    let m = 0;
+    for (let a = Math.max(0, i - 1); a <= Math.min(B - 1, i + 1); a += 1)
+      for (let c = Math.max(0, j - 1); c <= Math.min(B - 1, j + 1); c += 1)
+        for (let d = Math.max(0, k - 1); d <= Math.min(B - 1, k + 1); d += 1) m += hist[(a * B + c) * B + d];
+    if (m > bestMass) { bestMass = m; best = (i * B + j) * B + k; }
+  }
+  for (let p = 0; p < n; p += 1) {
+    if (mask && !(mask[p] > 0)) continue;
+    const r = target[p * 4], g = target[p * 4 + 1], b = target[p * 4 + 2];
+    const bi = Math.floor(best / (B * B)), bj = Math.floor(best / B) % B, bk = best % B;
+    if (Math.abs(bin(r) - bi) > 1 || Math.abs(bin(g) - bj) > 1 || Math.abs(bin(b) - bk) > 1) continue;
+    const key = (Math.round(r * 255) << 16) | (Math.round(g * 255) << 8) | Math.round(b * 255);
+    exact.set(key, (exact.get(key) || 0) + 1);
+  }
+  let key = 0, cnt = -1;
+  for (const [k, c] of exact) if (c > cnt) { key = k; cnt = c; }
+  return { color: [(key >> 16) / 255, ((key >> 8) & 255) / 255, (key & 255) / 255], mass: total ? bestMass / total : 0 };
+}
 
 // Most common exact 8-bit RGB color over the masked pixels: { color (0..1
 // RGB), mass (fraction of pixels) }.
@@ -481,13 +533,18 @@ export class Trainer {
     // (position.x < 0), which every kernel skips.
     if (!initSites) initSiteCount = args.startSites;
     // Histogram layer: one more site after the initial ones (LAYER_MODES).
-    this.histMode = histogramMode(targetRgba32f, width * height, this.maskCpu);
-    const useLayer = args.layer === "auto" && this.histMode.mass >= args.layerModeMin;
+    this.histMode = args.layer === "learn"
+      ? colorPeak(targetRgba32f, width * height, this.maskCpu)
+      : histogramMode(targetRgba32f, width * height, this.maskCpu);
+    const useLayer = args.layer === "learn" || (args.layer === "auto" && this.histMode.mass >= args.layerModeMin);
     const baseSiteCount = initSiteCount;
     this.layerIndex = useLayer ? baseSiteCount : null;
     if (useLayer) initSiteCount += 1;
-    this.usesGrow = countVaries(args, initSiteCount);
-    this.bufferCapacity = this.usesGrow ? countCapacity(args, initSiteCount) : initSiteCount;
+    // The count schedule runs over the ordinary sites; the layer is one more
+    // and counts against endSites (countArgs).
+    this.countArgs = useLayer ? { ...args, endSites: Math.max(1, args.endSites - 1) } : args;
+    this.usesGrow = countVaries(this.countArgs, baseSiteCount);
+    this.bufferCapacity = (this.usesGrow ? countCapacity(this.countArgs, baseSiteCount) : baseSiteCount) + (useLayer ? 1 : 0);
     this.siteCount = initSiteCount;
 
     // Buffers
@@ -503,7 +560,8 @@ export class Trainer {
     // the info pass; all live until one runs). See adam.wgsl.
     const storage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC;
     this.sitePinned = new Uint32Array(this.bufferCapacity);
-    if (useLayer) this.sitePinned[this.layerIndex] = 1;
+    // 1 = fixed; 2 = the "learn" layer, whose depth Adam updates (adam.wgsl).
+    if (useLayer) this.sitePinned[this.layerIndex] = args.layer === "learn" ? 2 : 1;
     this.sitePinBuf = device.createBuffer({ size: this.bufferCapacity * 4, usage: storage });
     device.queue.writeBuffer(this.sitePinBuf, 0, this.sitePinned);
     this.siteLiveBuf = device.createBuffer({ size: this.bufferCapacity * 4, usage: storage });
@@ -538,12 +596,12 @@ export class Trainer {
 
     const invScaleSq = 1.0 / Math.pow(Math.max(width, height), 2);
     this.invScaleSq = invScaleSq;
-    this.gradParams = createGradParamsBuffer(device, initSiteCount, invScaleSq);
+    this.gradParams = createGradParamsBuffer(device, initSiteCount, invScaleSq, this._globalCand());
     this.adamParams = createAdamParamsBuffer(device,
       args.lrPosBase, args.lrTauBase, args.lrRadiusBase, args.lrColorBase,
       args.lrDirBase, args.lrAnisoBase, args.beta1, args.beta2, args.eps,
       1, width, height);
-    this.countParams = createClearParamsBuffer(device, initSiteCount);
+    this.countParams = createClearParamsBuffer(device, initSiteCount, Math.sqrt(invScaleSq));
     this.gradCountParams = createClearParamsBuffer(device, this.bufferCapacity * 10);
     this.tauParams = createTauParamsBuffer(device, initSiteCount, TAU_DIFFUSE_LAMBDA, this.candDownscale);
 
@@ -628,7 +686,8 @@ export class Trainer {
     }
     if (useLayer) {
       const c = this.histMode.color.map((v) => Math.round(v * 255)).join(", ");
-      this._log(`Histogram layer: rgb(${c}) covers ${(100 * this.histMode.mass).toFixed(1)}% of pixels → pinned site ${this.layerIndex}`);
+      this._log(`Histogram layer: rgb(${c}) covers ${(100 * this.histMode.mass).toFixed(1)}% of pixels → pinned site ${this.layerIndex}` +
+        (args.layer === "learn" ? `, depth β starts at ${this._layerBeta0().toFixed(2)}` : ""));
     }
 
     // Prime candidate state (init + seed) — mirrors the one-time setup in Python.
@@ -660,7 +719,7 @@ export class Trainer {
     // Growth state: the iteration it ended (null while growing) and why.
     this.growDoneIter = this.usesGrow ? null : 0;
     this.growGen = 0; // growth steps that added sites (see growLrDecay)
-    this.growStartCount = initSiteCount; // where the count schedule starts
+    this.growStartCount = baseSiteCount; // where the count schedule starts (ordinary sites)
     // CPU copy of each site's birth growth step (adam[21]), for per-site LRs.
     this.siteBirthGen = new Uint32Array(this.bufferCapacity);
     this.growSteps = 0; // growth steps taken (growPatience)
@@ -725,8 +784,8 @@ export class Trainer {
     this.layerIndex = b.layerIndex;
     this._setPinned(b.sitePinned.slice());
     this._markAllLive();
-    updateClearParamsBuffer(queue, this.countParams, b.siteCount);
-    updateGradParamsBuffer(queue, this.gradParams, b.siteCount, this.invScaleSq);
+    updateClearParamsBuffer(queue, this.countParams, b.siteCount, Math.sqrt(this.invScaleSq));
+    updateGradParamsBuffer(queue, this.gradParams, b.siteCount, this.invScaleSq, this._globalCand());
     this._rebuildCandidates(b.siteCount);
     this.restoredBest = { ...b, reason };
     this._log(`Restored best state from iter ${b.it} (${reason}): ${b.sites} sites, ` +
@@ -783,26 +842,40 @@ export class Trainer {
       candDownscale: this.candDownscale,
       candWidth: this.candWidth,
       candHeight: this.candHeight,
-      globalCand: this.layerIndex ?? 0xffffffff,
+      globalCand: this._globalCand(),
     };
   }
+
+  // The site every pixel blends besides its candidate list (cand_ids in
+  // sad_shared.wgsl): the histogram layer, or none.
+  _globalCand() { return this.layerIndex ?? 0xffffffff; }
 
   _log(msg) { if (this.onLog) this.onLog({ type: "msg", message: msg }); }
 
   // The histogram layer as a site at layerIndex: the mode color, logit
   // -e^LAYER_LOG_TAU · d ≈ 0 everywhere (radius 0, isotropic, image center).
   _writeLayerSite() {
+    const learn = this.args.layer === "learn";
     const site = new Float32Array(SITE_FLOATS);
     site[0] = (this.width - 1) / 2;
     site[1] = (this.height - 1) / 2;
-    site[2] = LAYER_LOG_TAU;
-    site[3] = 0;
+    site[2] = learn ? LEARN_LOG_TAU : LAYER_LOG_TAU;
+    // Logit -τ(d - r·inv_scale) at d = 0 is the depth β.
+    site[3] = learn ? this._layerBeta0() * Math.max(this.width, this.height) / Math.exp(LEARN_LOG_TAU) : 0;
     site.set(this.histMode.color, 4);
     site[7] = 1;
     site[8] = 0;
     site[9] = 0;
     this.device.queue.writeBuffer(this.sitesBuf, this.layerIndex * SITE_FLOATS * 4,
       encodeSiteColors(site, 1, this.colorSpace));
+  }
+
+  // "learn" layer's starting depth: the log-odds of its color's peak mass.
+  // The start carries the prior: on MNIST, starting at β = -6 instead of
+  // from p cost 1.4 dB at 32 sites (β only climbed back to -4, vs +3.4).
+  _layerBeta0() {
+    const p = Math.min(1 - 1e-3, Math.max(1e-3, this.histMode.mass));
+    return Math.max(-LAYER_BETA_MAX, Math.min(LAYER_BETA_MAX, Math.log(p / (1 - p))));
   }
 
   // Every site counts as serving a pixel in the loss until the next info pass
@@ -879,6 +952,7 @@ export class Trainer {
         updateInfoParamsBuffer(queue, this.infoParams, {
           siteCount, mode: args.info === "commit" ? 2 : 1, commitAfter: args.commitAfter,
           recheck: args.commitRecheck, invScaleSq: this.invScaleSq, quant: INFO_QUANT, liveEps: INFO_LIVE_EPS,
+          globalCand: this._globalCand(),
         });
       }
 
@@ -1064,6 +1138,7 @@ export class Trainer {
     const n = this.siteCount;
     const u = new Uint32Array(8);
     u[0] = n;
+    u[1] = this._globalCand();
     new Float32Array(u.buffer)[4] = this.invScaleSq;
     device.queue.writeBuffer(this.siteStatsParams, 0, u);
     const bytes = n * SITE_STAT_CH * 4;
@@ -1225,7 +1300,7 @@ export class Trainer {
       this.best = null; // keepBest restarts from the pruned state
     }
     if (it > args.iters - every) { await this._endPrune(it, "too close to the end of the run"); return; }
-    const merges = pickMerges(moments, this.samples, BITS_PER_SITE, { pinned: this._pinnedColors(sites, n) });
+    const merges = pickMerges(moments, this.samples, BITS_PER_SITE, { pinned: this._pinnedIds(n) });
     if (!merges.length) { await this._endPrune(it, "no merge would pay for its bits"); return; }
 
     const device = this.device;
@@ -1261,27 +1336,22 @@ export class Trainer {
     inactive[0] = -1;
     inactive[1] = -1;
     for (const { keep, drop } of merges) {
-      // A pinned site absorbs its partner unchanged.
-      if (!this.sitePinned[keep]) {
-        const merged = mergedSite(sites, keep, drop, moments.count[keep], moments.count[drop]);
-        queue.writeBuffer(this.sitesBuf, keep * SITE_FLOATS * 4, encodeSiteColors(merged, 1, this.colorSpace));
-        queue.writeBuffer(this.adamBuf, keep * ADAM_FLOATS * 4, adam);
-        this.siteBirthGen[keep] = this.growGen;
-      }
+      const merged = mergedSite(sites, keep, drop, moments.count[keep], moments.count[drop]);
+      queue.writeBuffer(this.sitesBuf, keep * SITE_FLOATS * 4, encodeSiteColors(merged, 1, this.colorSpace));
       queue.writeBuffer(this.sitesBuf, drop * SITE_FLOATS * 4, inactive);
+      queue.writeBuffer(this.adamBuf, keep * ADAM_FLOATS * 4, adam);
       queue.writeBuffer(this.adamBuf, drop * ADAM_FLOATS * 4, adam);
+      this.siteBirthGen[keep] = this.growGen;
     }
     this.activeEstimate -= merges.length;
     this._markAllLive();
     this._rebuildCandidates(this.siteCount);
   }
 
-  // Pinned sites among [0, n) as Map(id → RGB color), for pickMerges.
-  _pinnedColors(sites, n) {
-    const out = new Map();
-    for (let i = 0; i < n; i += 1) {
-      if (this.sitePinned[i]) out.set(i, Array.from(sites.subarray(i * SITE_FLOATS + 4, i * SITE_FLOATS + 7)));
-    }
+  // Ids of the pinned sites among [0, n), which never merge (pickMerges).
+  _pinnedIds(n) {
+    const out = new Set();
+    for (let i = 0; i < n; i += 1) if (this.sitePinned[i]) out.add(i);
     return out;
   }
 
@@ -1305,7 +1375,7 @@ export class Trainer {
       candWidth: this.candWidth, candHeight: this.candHeight, target: this.target, mask: this.maskCpu,
     });
     const merges = pickMerges(moments, this.samples, BITS_PER_SITE,
-      { count: this.activeEstimate - target, pinned: this._pinnedColors(sites, n) });
+      { count: this.activeEstimate - target, pinned: this._pinnedIds(n) });
     if (!merges.length) return 0;
     this._applyMerges(it, sites, moments, merges);
     this.best = null; // keepBest restarts, so it can't go back to more sites
@@ -1374,8 +1444,8 @@ export class Trainer {
     device.queue.writeBuffer(this.sitesBuf, 0, outSites);
     device.queue.writeBuffer(this.adamBuf, 0, outAdam);
     this.siteCount = this.actualSites = this.activeEstimate = m;
-    updateClearParamsBuffer(device.queue, this.countParams, m);
-    updateGradParamsBuffer(device.queue, this.gradParams, m, this.invScaleSq);
+    updateClearParamsBuffer(device.queue, this.countParams, m, Math.sqrt(this.invScaleSq));
+    updateGradParamsBuffer(device.queue, this.gradParams, m, this.invScaleSq, this._globalCand());
     this.growPending = null; // site ids changed
     this._rebuildCandidates(m);
   }
@@ -1392,7 +1462,7 @@ export class Trainer {
     const cand = await this._readCandidates();
     const field = insertionField({
       width: this.width, height: this.height, sites: sitesRgb, siteCount: n0,
-      cand, candWidth: this.candWidth, candHeight: this.candHeight,
+      cand, candWidth: this.candWidth, candHeight: this.candHeight, global: this.layerIndex ?? -1,
     });
     const picks = pickInsertions({
       width: this.width, height: this.height, target: this.target, mask: this.maskCpu,
@@ -1430,7 +1500,9 @@ export class Trainer {
       return;
     }
     if (it === 0 || it % args.growEvery !== 0) return;
-    const target = Math.max(1, Math.round(countTarget(args, it, this.growStartCount)));
+    // In active sites, the layer included.
+    const layers = this.layerIndex === null ? 0 : 1;
+    const target = layers + Math.max(1, Math.round(countTarget(this.countArgs, it, this.growStartCount)));
     let merged = 0;
     if (target < this.activeEstimate) merged = await this._mergeTo(it, target);
     else if (target > this.activeEstimate) await this._growTo(it, target);
@@ -1497,8 +1569,8 @@ export class Trainer {
     this.siteCount = n1;
     this.actualSites = n1;
     this.activeEstimate += k;
-    updateClearParamsBuffer(queue, this.countParams, n1);
-    updateGradParamsBuffer(queue, this.gradParams, n1, this.invScaleSq);
+    updateClearParamsBuffer(queue, this.countParams, n1, Math.sqrt(this.invScaleSq));
+    updateGradParamsBuffer(queue, this.gradParams, n1, this.invScaleSq, this._globalCand());
 
     // Seed the new sites into their home candidate pixels, then run a full
     // jump-flood sequence of candidate passes (long jumps down to 1 px) so they
@@ -1874,7 +1946,19 @@ export class Trainer {
     for (let i = 0; i < this.actualSites; i += 1) {
       if (sitesRgb[i * SITE_FLOATS] >= 0 && !this.sitePinned[i] && !live[i]) frozen += 1;
     }
+    let layerBeta = 0, layerArea = 0;
+    if (this.layerIndex !== null) {
+      const b = this.layerIndex * SITE_FLOATS;
+      layerBeta = Math.exp(sitesRgb[b + 2]) * sitesRgb[b + 3] / Math.max(this.width, this.height);
+      const moments = cellMoments({
+        width: this.width, height: this.height, sites: sitesRgb, n: this.actualSites, cand: await this._readCandidates(),
+        candWidth: this.candWidth, candHeight: this.candHeight, target: this.target, mask: this.maskCpu,
+        global: this.layerIndex ?? -1,
+      });
+      layerArea = moments.count[this.layerIndex] / Math.max(1, counted);
+    }
     return {
+      layerBeta, layerArea,
       modeMass: this.histMode.mass, layer: this.layerIndex === null ? 0 : 1,
       meanWeight: counted ? wsum / counted : 0, committedFrac: counted ? committed / counted : 0,
       frozenSites: this.args.info === "commit" && this.args.commitFreeze ? frozen : 0,

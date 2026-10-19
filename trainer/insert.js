@@ -33,22 +33,23 @@ const DISC_LOG_TAU = 1;
 const DISC_RADII = [];
 
 // Per-pixel softmax state of the current sites: m (max logit), s (Σ exp(logit
-// − m)), pred (RGB), owner (top candidate). `sites` holds RGB colors.
-export function insertionField({ width, height, sites, siteCount, cand, candWidth, candHeight }) {
+// − m)), pred (RGB), owner (top candidate). `sites` holds RGB colors; `global`
+// is the site every pixel also blends (cand_ids in sad_shared.wgsl; -1 = none).
+export function insertionField({ width, height, sites, siteCount, cand, candWidth, candHeight, global = -1 }) {
   const n = width * height;
   const m = new Float32Array(n), s = new Float32Array(n), pred = new Float32Array(n * 3);
   const owner = new Int32Array(n).fill(-1);
   const invScale = 1 / Math.max(width, height);
-  const logits = new Float64Array(8), ids = new Int32Array(8);
+  const logits = new Float64Array(9), ids = new Int32Array(9);
   for (let y = 0; y < height; y += 1) {
     const cy = Math.min(Math.floor((y * candHeight) / height), candHeight - 1);
     for (let x = 0; x < width; x += 1) {
       const cx = Math.min(Math.floor((x * candWidth) / width), candWidth - 1);
       const cb = (cy * candWidth + cx) * 8;
       let count = 0, mx = -Infinity, best = -1;
-      for (let k = 0; k < 8; k += 1) {
-        const id = cand[cb + k];
-        if (id >= siteCount) continue;
+      for (let k = 0; k < 9; k += 1) {
+        const id = k < 8 ? cand[cb + k] : global;
+        if (id < 0 || id >= siteCount || (k < 8 && id === global)) continue;
         const b = id * SITE_FLOATS;
         if (!(sites[b] >= 0)) continue;
         const l = siteLogit(sites, b, x, y, invScale);

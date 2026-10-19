@@ -87,7 +87,7 @@ struct Params {
   candDownscale : u32,
   candWidth : u32,
   candHeight : u32,
-  globalCand : u32, // vpt: a site id offered to every pixel (none if >= siteCount)
+  globalCand : u32, // the global site (cand_ids); none if >= siteCount
   _pad1 : u32,
 }
 
@@ -121,7 +121,7 @@ struct InitParams {
 
 struct GradParams {
   siteCount : u32,
-  computeRemoval : u32,
+  globalCand : u32,
   _pad0 : u32,
   _pad1 : u32,
   invScaleSq : f32,
@@ -317,8 +317,19 @@ fn voronoi_dmix2_fast(site : Site, uv : vec2<f32>, invScaleSq : f32, inv_scale :
 const NEG_INF : f32 = -1e30;
 
 // The 8 candidate site ids stored in a candidate texel pair (cand0, cand1).
-fn cand_ids(c0 : vec4<u32>, c1 : vec4<u32>) -> array<u32, 8> {
+fn cand_ids8(c0 : vec4<u32>, c1 : vec4<u32>) -> array<u32, 8> {
   return array<u32, 8>(c0.x, c0.y, c0.z, c0.w, c1.x, c1.y, c1.z, c1.w);
+}
+
+// Sites a pixel blends: its 8 stored candidates plus the global site (the
+// histogram layer, offered to every pixel without taking a list slot; none
+// when >= siteCount). A stored copy of the global site is dropped.
+const NCAND : u32 = 9u;
+const NO_SITE : u32 = 0xffffffffu;
+fn cand_ids(c0 : vec4<u32>, c1 : vec4<u32>, global : u32) -> array<u32, NCAND> {
+  var ids = array<u32, NCAND>(c0.x, c0.y, c0.z, c0.w, c1.x, c1.y, c1.z, c1.w, global);
+  for (var i = 0u; i < 8u; i = i + 1u) { if (ids[i] == global) { ids[i] = NO_SITE; } }
+  return ids;
 }
 
 // A site's blend logit at pixel uv, -tau * (d - r) (voronoi_dmix2_fast), or
@@ -337,23 +348,23 @@ fn site_logit(site : Site, uv : vec2<f32>, invScaleSq : f32, inv_scale : f32) ->
   return l;
 }
 
-// Normalized softmax weights of 8 logits (NEG_INF = no site). All zero when
-// no logit is finite.
-fn softmax8(logits : array<f32, 8>) -> array<f32, 8> {
-  var w : array<f32, 8>;
+// Normalized softmax weights of the NCAND logits (NEG_INF = no site). All
+// zero when no logit is finite.
+fn softmax_c(logits : array<f32, NCAND>) -> array<f32, NCAND> {
+  var w : array<f32, NCAND>;
   var m = NEG_INF;
-  for (var i = 0u; i < 8u; i = i + 1u) { m = max(m, logits[i]); }
+  for (var i = 0u; i < NCAND; i = i + 1u) { m = max(m, logits[i]); }
   if (m <= -1e29 || is_bad(m)) { return w; }
   var s = 0.0;
-  for (var i = 0u; i < 8u; i = i + 1u) {
+  for (var i = 0u; i < NCAND; i = i + 1u) {
     var e = exp(logits[i] - m);
     if (is_bad(e)) { e = 0.0; }
     w[i] = e;
     s = s + e;
   }
-  if (is_bad(s) || !(s > 0.0)) { return array<f32, 8>(); }
+  if (is_bad(s) || !(s > 0.0)) { return array<f32, NCAND>(); }
   let inv = 1.0 / max(s, 1e-8);
-  for (var i = 0u; i < 8u; i = i + 1u) { w[i] = w[i] * inv; }
+  for (var i = 0u; i < NCAND; i = i + 1u) { w[i] = w[i] * inv; }
   return w;
 }
 

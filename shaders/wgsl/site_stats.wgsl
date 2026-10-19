@@ -19,7 +19,7 @@
 
 struct SiteStatsParams {
   siteCount : u32,
-  _pad0 : u32,
+  globalCand : u32,
   _pad1 : u32,
   _pad2 : u32,
   invScaleSq : f32,
@@ -101,11 +101,11 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>,
     let cc = candidateCoord(vec2<u32>(gid.xy), dims, textureDimensions(inCand0));
     let c0 = textureLoad(inCand0, vec2<i32>(cc), 0);
     let c1 = textureLoad(inCand1, vec2<i32>(cc), 0);
-    let ids = cand_ids(c0, c1);
+    let ids = cand_ids(c0, c1, params.globalCand);
 
-    var logits : array<f32, 8>;
-    var cols : array<vec3<f32>, 8>;
-    for (var i = 0u; i < 8u; i = i + 1u) {
+    var logits : array<f32, NCAND>;
+    var cols : array<vec3<f32>, NCAND>;
+    for (var i = 0u; i < NCAND; i = i + 1u) {
       logits[i] = NEG_INF;
       cols[i] = vec3<f32>(0.0);
       if (ids[i] < params.siteCount) {
@@ -113,11 +113,11 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>,
         if (logits[i] > -1e29) { cols[i] = site_color(sites[ids[i]]); }
       }
     }
-    let w = softmax8(logits);
-    if (w[0] + w[1] + w[2] + w[3] + w[4] + w[5] + w[6] + w[7] > 0.0) {
+    let w = softmax_c(logits);
+    if (w[0] + w[1] + w[2] + w[3] + w[4] + w[5] + w[6] + w[7] + w[8] > 0.0) {
       var pred = vec3<f32>(0.0);
       var owner = 0u;
-      for (var i = 0u; i < 8u; i = i + 1u) {
+      for (var i = 0u; i < NCAND; i = i + 1u) {
         pred = pred + w[i] * cols[i];
         if (w[i] > w[owner]) { owner = i; }
       }
@@ -129,13 +129,13 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>,
       // candidate, weighted by the render's error in bins beyond half a bin).
       var oid = ids[owner];
       if (sitePin[oid] != 0u) {
-        var alt = 8u;
-        for (var i = 0u; i < 8u; i = i + 1u) {
-          if (w[i] > 0.0 && sitePin[ids[i]] == 0u && (alt == 8u || w[i] > w[alt])) { alt = i; }
+        var alt = NCAND;
+        for (var i = 0u; i < NCAND; i = i + 1u) {
+          if (w[i] > 0.0 && sitePin[ids[i]] == 0u && (alt == NCAND || w[i] > w[alt])) { alt = i; }
         }
         let ed = abs(clamp(pred, vec3<f32>(0.0), vec3<f32>(1.0)) - t) * 255.0;
         m = m * clamp((max(ed.x, max(ed.y, ed.z)) - 0.25) * 4.0, 0.0, 1.0);
-        if (alt == 8u) { m = 0.0; } else { oid = ids[alt]; }
+        if (alt == NCAND) { m = 0.0; } else { oid = ids[alt]; }
       }
       let d = uv - sites[oid].position;
       let os = slotFor(oid);
@@ -154,23 +154,23 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>,
       addStat(os, oid, 16u, m * err);
 
       // Removal deltas: blend of the others, renormalized.
-      for (var k = 0u; k < 8u; k = k + 1u) {
+      for (var k = 0u; k < NCAND; k = k + 1u) {
         if (w[k] > 1.0e-6) {
           var rest = vec3<f32>(0.0);
           var rw = 0.0;
-          var next = 8u; // best other candidate, for when the others' weights underflow
-          for (var j = 0u; j < 8u; j = j + 1u) {
+          var next = NCAND; // best other candidate, for when the others' weights underflow
+          for (var j = 0u; j < NCAND; j = j + 1u) {
             if (j != k) {
               rest = rest + w[j] * cols[j];
               rw = rw + w[j];
-              if (logits[j] > -1e29 && (next == 8u || logits[j] > logits[next])) { next = j; }
+              if (logits[j] > -1e29 && (next == NCAND || logits[j] > logits[next])) { next = j; }
             }
           }
           var delta = 0.0;
           if (rw > 1.0e-12) {
             let e2 = t - rest / rw;
             delta = dot(e2, e2) - err;
-          } else if (next < 8u) {
+          } else if (next < NCAND) {
             let e2 = t - cols[next];
             delta = dot(e2, e2) - err;
           }

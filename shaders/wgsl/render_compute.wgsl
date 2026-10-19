@@ -14,18 +14,18 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   let inv_scale = sqrt(params.invScaleSq);
   let candCoord = candidateCoord(vec2<u32>(gid.xy), vec2<u32>(w, h), vec2<u32>(params.candWidth, params.candHeight));
   let candXY = vec2<i32>(i32(candCoord.x), i32(candCoord.y));
-  let candIds = cand_ids(textureLoad(inCand0, candXY, 0), textureLoad(inCand1, candXY, 0));
+  let candIds = cand_ids(textureLoad(inCand0, candXY, 0), textureLoad(inCand1, candXY, 0), params.globalCand);
 
-  var logits : array<f32, 8>;
-  for (var i = 0u; i < 8u; i = i + 1u) {
+  var logits : array<f32, NCAND>;
+  for (var i = 0u; i < NCAND; i = i + 1u) {
     let idx = candIds[i];
     logits[i] = NEG_INF;
     if (idx < params.siteCount) { logits[i] = site_logit(sites[idx], uv, params.invScaleSq, inv_scale); }
   }
-  let weights = softmax8(logits);
+  let weights = softmax_c(logits);
 
   var color = vec3<f32>(0.0);
-  for (var i = 0u; i < 8u; i = i + 1u) {
+  for (var i = 0u; i < NCAND; i = i + 1u) {
     if (weights[i] > 0.0) {
       let c = site_color(sites[candIds[i]]);
       if (!is_bad3(c)) { color = color + weights[i] * c; }

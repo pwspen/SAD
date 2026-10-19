@@ -123,18 +123,18 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>,
     let candCoord = candidateCoord(vec2<u32>(gid.xy), dims, candSize);
     let c0 = textureLoad(inCand0, vec2<i32>(candCoord), 0);
     let c1 = textureLoad(inCand1, vec2<i32>(candCoord), 0);
-    let candIds = cand_ids(c0, c1);
+    let candIds = cand_ids(c0, c1, params.globalCand);
 
-    var logits : array<f32, 8>;
-    for (var i = 0u; i < 8u; i = i + 1u) {
+    var logits : array<f32, NCAND>;
+    for (var i = 0u; i < NCAND; i = i + 1u) {
       let idx = candIds[i];
       logits[i] = NEG_INF;
       if (idx < params.siteCount) { logits[i] = site_logit(sites[idx], uv, params.invScaleSq, inv_scale); }
     }
-    let weights = softmax8(logits);
+    let weights = softmax_c(logits);
     var pred = vec3<f32>(0.0, 0.0, 0.0);
     var sum_w = 0.0;
-    for (var i = 0u; i < 8u; i = i + 1u) {
+    for (var i = 0u; i < NCAND; i = i + 1u) {
       sum_w = sum_w + weights[i];
       if (weights[i] > 0.0 && !is_bad3(site_color(sites[candIds[i]]))) {
         pred = pred + weights[i] * site_color(sites[candIds[i]]);
@@ -147,7 +147,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>,
       dL_dpred = mask_val * dL_dpred;
       let dL_ok = !is_bad3(dL_dpred);
       if (dL_ok) {
-        for (var i = 0u; i < 8u; i = i + 1u) {
+        for (var i = 0u; i < NCAND; i = i + 1u) {
           let idx = candIds[i];
           if (idx < params.siteCount) {
             let site = sites[idx];

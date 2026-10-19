@@ -103,26 +103,26 @@ export function createInitParamsBuffer(device, numSites, gradThreshold, maxAttem
 
 // ---------------------------------------------------------------------------
 // GradParams (gradients_tiled.wgsl):
-//   u32 siteCount, u32 computeRemoval, u32 _pad0, u32 _pad1,
+//   u32 siteCount, u32 globalCand, u32 _pad0, u32 _pad1,
 //   f32 invScaleSq, f32 _pad2, f32 _pad3, f32 _pad4     (32 bytes)
-// computeRemoval (prune scoring) is always 0 here — the JS trainer has no prune.
+// globalCand: the site every pixel blends besides its list (none by default).
 // ---------------------------------------------------------------------------
 
-export function createGradParamsBuffer(device, siteCount, invScaleSq) {
+export function createGradParamsBuffer(device, siteCount, invScaleSq, globalCand = 0xffffffff) {
   const buf = device.createBuffer({
     size: 32,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
-  updateGradParamsBuffer(device.queue, buf, siteCount, invScaleSq);
+  updateGradParamsBuffer(device.queue, buf, siteCount, invScaleSq, globalCand);
   return buf;
 }
 
-export function updateGradParamsBuffer(queue, buffer, siteCount, invScaleSq) {
+export function updateGradParamsBuffer(queue, buffer, siteCount, invScaleSq, globalCand = 0xffffffff) {
   const bytes = new ArrayBuffer(32);
   const u = new Uint32Array(bytes);
   const f = new Float32Array(bytes);
   u[0] = siteCount >>> 0;
-  u[1] = 0;
+  u[1] = globalCand >>> 0;
   u[2] = 0;
   u[3] = 0;
   f[4] = invScaleSq;
@@ -178,22 +178,23 @@ export function updateAdamParamsBuffer(queue, buffer, lrPos, lrTau, lrRadius, lr
 // ---------------------------------------------------------------------------
 // ClearParams: single u32 count + pad
 // (used by clear_buffer_*.wgsl, candidate_pack.wgsl, tau_extract.wgsl, tau_writeback.wgsl).
+// Slot 1 is f32 invScale (1 / max(width, height)), read only by candidate_pack.
 // ---------------------------------------------------------------------------
 
-export function createCountParamsBuffer(device, count) {
+export function createCountParamsBuffer(device, count, invScale = 0) {
   const buf = device.createBuffer({
     size: 16,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
-  updateCountParamsBuffer(device.queue, buf, count);
+  updateCountParamsBuffer(device.queue, buf, count, invScale);
   return buf;
 }
 
-export function updateCountParamsBuffer(queue, buffer, count) {
+export function updateCountParamsBuffer(queue, buffer, count, invScale = 0) {
   const bytes = new ArrayBuffer(16);
   const u = new Uint32Array(bytes);
   u[0] = count >>> 0;
-  u[1] = 0;
+  new Float32Array(bytes)[1] = invScale;
   u[2] = 0;
   u[3] = 0;
   queue.writeBuffer(buffer, 0, bytes);
@@ -316,9 +317,9 @@ export function hilbertBitsForSize(width, height) {
 // ---------------------------------------------------------------------------
 // InfoParams (info_update.wgsl):
 //   u32 siteCount, u32 mode (1 deadzone, 2 commit), u32 commitAfter, u32 recheck,
-//   f32 invScaleSq, f32 quant, f32 liveEps, f32 _pad   (32 bytes)
+//   f32 invScaleSq, f32 quant, f32 liveEps, u32 globalCand   (32 bytes)
 // ---------------------------------------------------------------------------
-export function updateInfoParamsBuffer(queue, buffer, { siteCount, mode, commitAfter, recheck, invScaleSq, quant, liveEps }) {
+export function updateInfoParamsBuffer(queue, buffer, { siteCount, mode, commitAfter, recheck, invScaleSq, quant, liveEps, globalCand = 0xffffffff }) {
   const bytes = new ArrayBuffer(32);
   const u = new Uint32Array(bytes);
   const f = new Float32Array(bytes);
@@ -329,5 +330,6 @@ export function updateInfoParamsBuffer(queue, buffer, { siteCount, mode, commitA
   f[4] = invScaleSq;
   f[5] = quant;
   f[6] = liveEps;
+  u[7] = globalCand >>> 0;
   queue.writeBuffer(buffer, 0, bytes);
 }
