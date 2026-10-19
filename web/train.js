@@ -96,6 +96,7 @@ const state = {
   gradHistory: [],       // [{ it, stats }] per-param |grad| mean/max from log ticks
   lrHistory: [],         // [{ it, lr }] LR multiplier (schedule × LR mult) from log ticks
   growthGain: [],        // [{ step, addedAt, measuredAt, points: [{ site, predicted, realized }] }] per growth batch
+  mergeEdges: null,      // { it, groups, scales, edgeWeights, mergedWeights } from the last "neighbor" merge step
   lrPlan: null,          // { iters, lrMult, kind, growDoneIter } of the current run
   lastGrowth: null,      // { mode, doneIter, stop, sites, it, iters } at the latest log tick (Schedule summary)
   runSiteMode: null,     // siteMode of the current/last run
@@ -417,6 +418,14 @@ const VIEWS = {
                       "(8-bit levels², summed over RGB and pixels). Diagnostic only; growth never uses it. The " +
                       "realized side is biased high: by then the site and its neighbours have adapted to each other. " +
                       "Sites at the bottom edge are worth nothing or harm the fit. Dashed: realized = predicted." },
+  mergeEdges: { label: "Merge edge weights", kind: "plot", source: "train", on: ["merge", "run"],
+                draw: drawMergeEdgesPlot, hit: hitMergeEdges,
+                note: "Edge weights of the last merge step (mergeCriterion \"neighbor\"). An edge joins two sites " +
+                      "that are owner and runner-up in some candidate list. Its weight is the RMS over color, log τ, " +
+                      "radius and shape (log anisotropy tensor) of the pair's difference, each divided by that " +
+                      "group's median over the step's edges, so 1 (dashed) is a typical neighbour; position is left " +
+                      "out. Bars: every edge before merging. Orange: the edges merged along, weighed when merged " +
+                      "(chained merges reweigh the kept site's edges, so these can sit past the initial bars)." },
   bandSnr:    { label: "Band SNR vs iteration", kind: "plot", source: "derived", on: ["render", "run"],
                 draw: drawBandSnrPlot, hit: hitBandSnr,
                 note: "Per luma Laplacian band: 10·log₁₀(Σ L_k(target)² / Σ L_k(recon − target)²), mask-weighted. " +
@@ -496,8 +505,8 @@ const LAYOUTS = {
   },
   plots: {
     label: "Plots",
-    areas: `"psnr bpp  lr"
-            "grad grad growGain"`,
+    areas: `"psnr bpp      lr"
+            "grad growGain mergeEdges"`,
   },
   siteStats: {
     label: "Site stats",
@@ -1563,6 +1572,83 @@ function hitGrowGain(g, mx, my) {
 
 function hitLr(g, mx) {
   return nearestX(g, state.lrHistory, (d) => d.it, mx);
+}
+
+// ---- Merge edge weights (histogram, log x) ----
+
+const MERGE_BINS = 40;
+
+// Log-spaced bins over the step's weights: { r (x range), edges, all, merged
+// (counts), zeros } with weights at or below `lo` in the first bin.
+function mergeEdgeBins(d) {
+  const pos = d.edgeWeights.filter((w) => w > 0).sort();
+  const q = (f) => pos[Math.min(pos.length - 1, Math.floor(f * pos.length))];
+  let max = pos.length ? pos.at(-1) : 1;
+  for (const w of d.mergedWeights) if (w > max) max = w;
+  const r = decadeRange(pos.length ? Math.max(q(0.005), max * 1e-4) : 1e-2, max, [1e-2, 10]);
+  const l0 = Math.log10(r.min), step = (Math.log10(r.max) - l0) / MERGE_BINS;
+  const edges = Array.from({ length: MERGE_BINS + 1 }, (_, i) => 10 ** (l0 + i * step));
+  const bin = (w) => Math.min(MERGE_BINS - 1, Math.max(0, Math.floor((Math.log10(Math.max(w, r.min)) - l0) / step)));
+  const all = new Array(MERGE_BINS).fill(0), merged = new Array(MERGE_BINS).fill(0);
+  for (const w of d.edgeWeights) all[bin(w)] += 1;
+  for (const w of d.mergedWeights) merged[bin(w)] += 1;
+  return { r, edges, all, merged, zeros: d.edgeWeights.length - pos.length };
+}
+
+function drawMergeEdgesPlot(view) {
+  const p = beginPlot(view);
+  if (!p) return;
+  const d = state.mergeEdges;
+  const items = [{ label: "all edges", color: SERIES_COLORS[0] }, { label: "merged", color: PSNR_LINE_COLOR }];
+  const top = drawLegend(p, items) + 10;
+  const bins = d && d.edgeWeights.length ? mergeEdgeBins(d) : null;
+  const hi = bins ? Math.max(...bins.all, ...bins.merged) : 1;
+  // Headroom for the two caption lines.
+  const yr = { min: 0, max: niceTicks(0, hi * 1.4, 4).at(-1) || hi };
+  const g = view.geom = plotAxes(plotBox(p, top, LEGEND_PAD), bins ? bins.r : { min: 1e-2, max: 10, log: true }, yr);
+  g.bins = bins;
+  drawAxes(p, g, { xTitle: "edge weight (1 = typical neighbour)", yTitle: "edges", xFmt: fmtLogTick, xSpacing: 44 });
+  if (!bins) {
+    drawEmpty(p, g, state.running ? "Waiting for a merge step…" : "Train with a count schedule that merges");
+    return;
+  }
+  const { ctx } = p;
+  const bar = (counts, color, alpha) => {
+    ctx.fillStyle = color;
+    ctx.globalAlpha = alpha;
+    counts.forEach((c, i) => {
+      if (!c) return;
+      const x0 = g.x(bins.edges[i]), x1 = g.x(bins.edges[i + 1]);
+      ctx.fillRect(x0 + 0.5, g.y(c), Math.max(1, x1 - x0 - 1), g.bottom - g.y(c));
+    });
+    ctx.globalAlpha = 1;
+  };
+  bar(bins.all, SERIES_COLORS[0], 0.55);
+  bar(bins.merged, PSNR_LINE_COLOR, 0.9);
+  if (1 > g.xr.min && 1 < g.xr.max) drawLine(p, g, [[1, 0], [1, yr.max]], p.col.soft, { dash: [4, 4], width: 1 });
+  ctx.font = PLOT_FONT;
+  ctx.fillStyle = p.col.dim;
+  ctx.textAlign = "right";
+  ctx.textBaseline = "top";
+  const fmtScale = (v) => (Number.isFinite(v) ? Number(v.toPrecision(2)) : "–");
+  ctx.fillText(`iter ${d.it} · ${d.edgeWeights.length} edges · ${d.mergedWeights.length} merged`, g.right, g.top + 2);
+  ctx.fillText(`scales: ${d.groups.map((n, k) => `${n} ${fmtScale(d.scales[k])}`).join(" · ")}`, g.right, g.top + 16);
+  if (view.hoverKey == null) return;
+  const i = view.hoverKey;
+  const xm = Math.sqrt(bins.edges[i] * bins.edges[i + 1]);
+  drawTooltip(p, g, g.x(xm), g.y(Math.max(bins.all[i], bins.merged[i])), {
+    header: [`weight ${bins.edges[i].toPrecision(2)} – ${bins.edges[i + 1].toPrecision(2)}`, ""],
+    rows: [
+      { cells: ["edges", String(bins.all[i]) + (i === 0 && bins.zeros ? ` (${bins.zeros} at 0)` : "")] },
+      { cells: ["merged", String(bins.merged[i])] },
+    ],
+  });
+}
+
+function hitMergeEdges(g, mx) {
+  if (!g.bins || mx < g.left || mx > g.right) return null;
+  const i = g.bins.edges.findIndex((e, k) => k < MERGE_BINS && mx >= g.x(e) && mx < g.x(g.bins.edges[k + 1]));
+  return i < 0 ? null : i;
 }
 
 // ---- Band SNR vs iteration ----
@@ -2812,6 +2898,7 @@ async function startTraining() {
   state.gradHistory = [];
   state.bandHistory = [];
   state.growthGain = [];
+  state.mergeEdges = null;
   state.lrHistory = [];
   state.snapAnalysis = null;
   // The count schedule ends at countHorizon (where "decay after growth"
@@ -2889,6 +2976,9 @@ async function startTraining() {
           `image iter ${info.it + 1}/${info.iters} · ${info.itsPerSec.toFixed(1)} it/s · ${info.elapsedSec.toFixed(1)}s`);
         renderMetrics(info);
         await refreshViews("render");
+      } else if (info.type === "mergeEdges") {
+        state.mergeEdges = info;
+        await refreshViews("merge");
       } else if (info.type === "growthGain") {
         state.growthGain.push({ step: info.step, addedAt: info.addedAt, measuredAt: info.measuredAt, points: info.points });
         await refreshViews("growth");

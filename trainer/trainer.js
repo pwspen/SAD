@@ -44,7 +44,9 @@ import {
 } from "./encoders.js?v=20261019";
 
 import { BITS_PER_SITE } from "./io.js?v=20261019";
-import { cellMoments, pickMerges, mergedSite, mergePrecision } from "./merge.js?v=20261019";
+import {
+  cellMoments, pickMerges, mergedSite, mergePrecision, sitePrecision, candidateEdges, neighborMerge, EDGE_GROUPS,
+} from "./merge.js?v=20261019";
 import { CandidateLists } from "./candidates.js?v=20261019";
 import {
   colorSpaceFor,
@@ -280,6 +282,11 @@ export function buildArgs(config, overrides = {}) {
     // each parameter by the site's Adam second moment (how much the loss cares
     // about it), "area" by the cells' pixel counts.
     mergeWeights: String(pick("mergeWeights", "MERGE_WEIGHTS", "area")),
+    // Which sites a merge step joins (merge.js): "neighbor" by parameter
+    // similarity to the site's mergeTopK nearest neighbours (position left
+    // out), "ward" by the rise in error with each cell at its mean color.
+    mergeCriterion: String(pick("mergeCriterion", "MERGE_CRITERION", "neighbor")),
+    mergeTopK: Math.max(1, Math.round(Number(pick("mergeTopK", "MERGE_TOP_K", 3)))),
     // Histogram layer (LAYER_MODES): a flat site behind all others, colored by
     // the peak of the target's color histogram, with a learned depth.
     layer: String(pick("layer", "LAYER", "off")),
@@ -765,44 +772,75 @@ export class Trainer {
   // The candidate lists as 8 u32 site ids per candidate pixel.
   _readCandidates() { return this.cands.read(); }
 
-  // Count step down: merge the cheapest neighbouring pairs (Ward's criterion,
-  // merge.js) until `target` sites are left, each site in at most one merge,
-  // so a step removes at most half of them. Each `keep` site becomes the
-  // weighted average of the pair (mergedSite; per-parameter precision or
-  // pixel counts, args.mergeWeights), each `drop` site is
-  // deactivated, both get fresh Adam moments, and the candidate lists are
-  // rebuilt. Returns the number merged.
+  // Count step down: merge neighbouring sites (merge.js, args.mergeCriterion)
+  // until `target` sites are left. "neighbor" merges by parameter similarity
+  // along the candidate lists' edges, chaining merges, so one step can reach
+  // any target; "ward" takes the cheapest pairs by Ward's criterion, each site
+  // in at most one merge, so a step removes at most half of them. Each kept
+  // site becomes the weighted average of what merged into it (mergedSite;
+  // per-parameter precision or pixel counts, args.mergeWeights), each dropped
+  // site is deactivated, both get fresh Adam moments, and the candidate lists
+  // are rebuilt. Returns the number merged.
   async _mergeTo(it, target) {
     const n = this.siteCount;
+    const args = this.args;
     const sites = await this._readSitesRgb(n);
-    const moments = cellMoments({
-      width: this.width, height: this.height, sites, n, cand: await this._readCandidates(),
-      candWidth: this.candWidth, candHeight: this.candHeight, target: this.target, mask: this.maskCpu,
-    });
+    const cand = await this._readCandidates();
     const pinned = new Set(this.layerIndex === null ? [] : [this.layerIndex]);
-    const merges = pickMerges(moments, this.activeEstimate - target, pinned);
-    if (!merges.length) return 0;
+    const budget = this.activeEstimate - target;
+    const adamState = args.mergeWeights === "precision" ? await this._readAdam(n) : null;
+    // [site, RGB params or null to deactivate]
+    const writes = [];
+    let merged = 0;
+    if (args.mergeCriterion === "ward") {
+      const moments = cellMoments({
+        width: this.width, height: this.height, sites, n, cand,
+        candWidth: this.candWidth, candHeight: this.candHeight, target: this.target, mask: this.maskCpu,
+      });
+      const merges = pickMerges(moments, budget, pinned);
+      for (const { keep, drop } of merges) {
+        const [wk, wd] = adamState
+          ? mergePrecision(adamState, keep, drop, it, args.beta2, moments.count[keep], moments.count[drop])
+          : [moments.count[keep], moments.count[drop]];
+        writes.push([keep, mergedSite(sites, keep, drop, wk, wd)], [drop, null]);
+      }
+      merged = merges.length;
+    } else {
+      const graph = candidateEdges({
+        sites, n, cand, candWidth: this.candWidth, candHeight: this.candHeight,
+        width: this.width, height: this.height, mask: this.maskCpu, pinned,
+      });
+      let weights = null;
+      if (adamState) {
+        weights = new Float64Array(n * SITE_FLOATS);
+        for (let i = 0; i < n; i += 1) weights.set(sitePrecision(adamState, i, it, args.beta2), i * SITE_FLOATS);
+      }
+      const res = neighborMerge({ sites, n, graph, budget, topK: args.mergeTopK, weights });
+      for (const i of res.changed) writes.push([i, res.sites.subarray(i * SITE_FLOATS, (i + 1) * SITE_FLOATS)]);
+      for (const i of res.dropped) writes.push([i, null]);
+      merged = res.merges.length;
+      if (this.onLog) {
+        this.onLog({
+          type: "mergeEdges", it, groups: EDGE_GROUPS, scales: res.scales, edgeWeights: res.edgeWeights,
+          mergedWeights: Float32Array.from(res.merges, (m) => m.weight),
+        });
+      }
+    }
+    if (!merged) return 0;
     const queue = this.device.queue;
-    const adamState = this.args.mergeWeights === "precision" ? await this._readAdam(n) : null;
     const adam = new Float32Array(ADAM_FLOATS);
     adam[20] = it;
     const inactive = new Float32Array(SITE_FLOATS);
     inactive[0] = -1;
     inactive[1] = -1;
-    for (const { keep, drop } of merges) {
-      const [wk, wd] = adamState
-        ? mergePrecision(adamState, keep, drop, it, this.args.beta2, moments.count[keep], moments.count[drop])
-        : [moments.count[keep], moments.count[drop]];
-      const merged = mergedSite(sites, keep, drop, wk, wd);
-      queue.writeBuffer(this.sitesBuf, keep * SITE_FLOATS * 4, encodeSiteColors(merged, 1, this.colorSpace));
-      queue.writeBuffer(this.sitesBuf, drop * SITE_FLOATS * 4, inactive);
-      queue.writeBuffer(this.adamBuf, keep * ADAM_FLOATS * 4, adam);
-      queue.writeBuffer(this.adamBuf, drop * ADAM_FLOATS * 4, adam);
+    for (const [i, params] of writes) {
+      queue.writeBuffer(this.sitesBuf, i * SITE_FLOATS * 4, params ? encodeSiteColors(params, 1, this.colorSpace) : inactive);
+      queue.writeBuffer(this.adamBuf, i * ADAM_FLOATS * 4, adam);
     }
-    this.activeEstimate -= merges.length;
+    this.activeEstimate -= merged;
     this._rebuildCandidates(this.siteCount);
-    this._log(`Merge @${it}: ${merges.length} pair(s) → ${this.activeEstimate} sites (schedule wants ${target})`);
-    return merges.length;
+    this._log(`Merge @${it}: ${merged} site(s) merged (${args.mergeCriterion}) → ${this.activeEstimate} sites (schedule wants ${target})`);
+    return merged;
   }
 
   // Adam state of sites [0, count): ADAM_FLOATS floats per site (adam.wgsl).
@@ -852,7 +890,7 @@ export class Trainer {
   // grow or merge to the schedule's count (countTarget), then end the
   // schedule once the horizon is reached. Merging goes on past the horizon
   // until the count is down to endSites: a sawtooth with a big amplitude and
-  // a short merge phase can't get back down in time (a step merges at most
+  // a short merge phase can't get back down in time (a "ward" step merges at most
   // half the sites), and stopping there kept up to 60% more sites than asked.
   async _countStep(it) {
     const args = this.args;

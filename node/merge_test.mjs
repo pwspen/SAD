@@ -3,9 +3,13 @@
 //   2. precision weights pull each parameter toward the site that cares
 //   3. no precision on either site: falls back to the pixel counts
 //   4. bias correction: a site whose moments are younger isn't underweighted
+//   5. candidateEdges: owner/runner-up from the lists' first two usable sites
+//   6. neighborMerge: the most alike neighbours merge, position ignored
+//   7. shape distance: dir ≡ −dir, and the axis doesn't count when isotropic
+//   8. chained merges reach the budget past half the sites
 // Usage: node merge_test.mjs
 
-import { mergedSite, mergePrecision, sitePrecision } from "../trainer/merge.js?v=20261019";
+import { mergedSite, mergePrecision, sitePrecision, candidateEdges, neighborMerge } from "../trainer/merge.js?v=20261019";
 import { SITE_FLOATS, ADAM_FLOATS } from "../trainer/params.js?v=20261019";
 
 let failures = 0;
@@ -76,6 +80,67 @@ const all = (x) => ({ pos: x, tau: x, radius: x, color: x, dir: x, aniso: x });
   const adam = adamFor(all(raw(t)), all(raw(10)), 0, t - 10);
   const pa = sitePrecision(adam, 0, t, beta2), pb = sitePrecision(adam, 1, t, beta2);
   check("bias correction", pa.every((v, k) => near(v / pb[k], 1, 1e-3)), `${pa} vs ${pb}`);
+}
+
+// Sites in a row, x = 10·i: [log τ, radius, RGB, dir, log aniso] per site.
+function row(specs) {
+  const out = new Float32Array(specs.length * SITE_FLOATS);
+  specs.forEach(([tau, r, rgb, dir, aniso], i) => out.set([10 * i, 0, tau, r, ...rgb, ...dir, aniso], i * SITE_FLOATS));
+  return out;
+}
+// A chain graph 0–1–2–… with equal counts.
+function chain(n, count = 1) {
+  const edges = new Map();
+  for (let i = 0; i + 1 < n; i += 1) edges.set(i * n + i + 1, 1);
+  return { count: new Float64Array(n).fill(count), edges };
+}
+
+// 5. Two candidate pixels: [0, 1, …] and [none, 2 (inactive), 1, 3, …];
+// site 4 pinned. Edges 0–1 and 1–3; site 2 is skipped as inactive.
+{
+  const NONE = 0xffffffff;
+  const cs = row([[0, 0, [0, 0, 0], [1, 0], 0], [0, 0, [0, 0, 0], [1, 0], 0], [0, 0, [0, 0, 0], [1, 0], 0],
+    [0, 0, [0, 0, 0], [1, 0], 0], [0, 0, [0, 0, 0], [1, 0], 0]]);
+  cs[2 * SITE_FLOATS] = -1;
+  const cand = new Uint32Array([0, 1, 3, NONE, NONE, NONE, NONE, NONE, NONE, 2, 4, 1, 3, NONE, NONE, NONE]);
+  const g = candidateEdges({ sites: cs, n: 5, cand, candWidth: 2, candHeight: 1, width: 4, height: 2, pinned: new Set([4]) });
+  check("edges", g.edges.size === 2 && g.edges.get(0 * 5 + 1) === 1 && g.edges.get(1 * 5 + 3) === 1,
+    `${[...g.edges]}`);
+  check("owner counts", g.count[0] === 4 && g.count[1] === 4 && g.count[3] === 0, `${g.count}`);
+}
+
+// 6. Sites 0, 1 alike in all but position, 2, 3 different from them and each
+// other: one merge joins 0 and 1, at their mean position.
+{
+  const s = row([[1, 2, [0.2, 0.2, 0.2], [1, 0], 0.5], [1, 2, [0.21, 0.2, 0.2], [1, 0], 0.5],
+    [2, 4, [0.9, 0.1, 0.1], [0, 1], -0.5], [0, 1, [0.1, 0.9, 0.5], [1, 0], 1.0]]);
+  const res = neighborMerge({ sites: s, n: 4, graph: chain(4), budget: 1 });
+  const [m] = res.merges;
+  check("alike pair merges", res.merges.length === 1 && Math.min(m.keep, m.drop) === 0 && Math.max(m.keep, m.drop) === 1,
+    JSON.stringify(res.merges));
+  check("merged position", near(res.sites[m.keep * SITE_FLOATS], 5, 1e-4), `x ${res.sites[m.keep * SITE_FLOATS]}`);
+  check("input untouched", s[0] === 0 && s[SITE_FLOATS] === 10, "sites modified");
+}
+
+// 7. 0, 1: same anisotropic shape, axes d and −d. 2, 3: isotropic, axes 90°
+// apart. 1–2 differ in shape. The two zero-shape-distance pairs merge first.
+{
+  const s = row([[1, 2, [0.5, 0.5, 0.5], [1, 0], 0.8], [1, 2, [0.5, 0.5, 0.5], [-1, 0], 0.8],
+    [1, 2, [0.5, 0.5, 0.5], [1, 0], 0], [1, 2, [0.5, 0.5, 0.5], [0, 1], 0]]);
+  const res = neighborMerge({ sites: s, n: 4, graph: chain(4), budget: 2 });
+  const pairs = res.merges.map((m) => [m.keep, m.drop].sort().join("-")).sort();
+  check("shape invariances", pairs.join(",") === "0-1,2-3" && res.merges.every((m) => m.weight < 1e-6),
+    JSON.stringify(res.merges));
+}
+
+// 8. Ten alike sites in a chain, budget 9: chaining leaves one.
+{
+  const s = row(Array.from({ length: 10 }, (_, i) => [1, 2, [0.5 + 0.01 * i, 0.5, 0.5], [1, 0], 0]));
+  const res = neighborMerge({ sites: s, n: 10, graph: chain(10), budget: 9 });
+  check("chained merges", res.merges.length === 9 && res.changed.length === 1 && res.dropped.length === 9,
+    `${res.merges.length} merges, changed ${res.changed}`);
+  check("chained mean", near(res.sites[res.changed[0] * SITE_FLOATS], 45, 1e-3),
+    `x ${res.sites[res.changed[0] * SITE_FLOATS]}`);
 }
 
 if (failures) {
