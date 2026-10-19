@@ -44,7 +44,7 @@ import {
 } from "./encoders.js?v=20261019";
 
 import { BITS_PER_SITE } from "./io.js?v=20261019";
-import { cellMoments, pickMerges, mergedSite } from "./merge.js?v=20261019";
+import { cellMoments, pickMerges, mergedSite, mergePrecision } from "./merge.js?v=20261019";
 import { CandidateLists } from "./candidates.js?v=20261019";
 import {
   colorSpaceFor,
@@ -276,6 +276,10 @@ export function buildArgs(config, overrides = {}) {
     // site must remove per bit it costs (BITS_PER_SITE bits). 0 = no early
     // stop (any positive gain still qualifies).
     growLambda: Math.max(0, Number(pick("growLambda", "GROW_LAMBDA", 400))),
+    // How a merge averages the pair's parameters (merge.js): "precision" weighs
+    // each parameter by the site's Adam second moment (how much the loss cares
+    // about it), "area" by the cells' pixel counts.
+    mergeWeights: String(pick("mergeWeights", "MERGE_WEIGHTS", "area")),
     // Histogram layer (LAYER_MODES): a flat site behind all others, colored by
     // the peak of the target's color histogram, with a learned depth.
     layer: String(pick("layer", "LAYER", "off")),
@@ -764,7 +768,8 @@ export class Trainer {
   // Count step down: merge the cheapest neighbouring pairs (Ward's criterion,
   // merge.js) until `target` sites are left, each site in at most one merge,
   // so a step removes at most half of them. Each `keep` site becomes the
-  // pixel-weighted average of the pair (mergedSite), each `drop` site is
+  // weighted average of the pair (mergedSite; per-parameter precision or
+  // pixel counts, args.mergeWeights), each `drop` site is
   // deactivated, both get fresh Adam moments, and the candidate lists are
   // rebuilt. Returns the number merged.
   async _mergeTo(it, target) {
@@ -778,13 +783,17 @@ export class Trainer {
     const merges = pickMerges(moments, this.activeEstimate - target, pinned);
     if (!merges.length) return 0;
     const queue = this.device.queue;
+    const adamState = this.args.mergeWeights === "precision" ? await this._readAdam(n) : null;
     const adam = new Float32Array(ADAM_FLOATS);
     adam[20] = it;
     const inactive = new Float32Array(SITE_FLOATS);
     inactive[0] = -1;
     inactive[1] = -1;
     for (const { keep, drop } of merges) {
-      const merged = mergedSite(sites, keep, drop, moments.count[keep], moments.count[drop]);
+      const [wk, wd] = adamState
+        ? mergePrecision(adamState, keep, drop, it, this.args.beta2, moments.count[keep], moments.count[drop])
+        : [moments.count[keep], moments.count[drop]];
+      const merged = mergedSite(sites, keep, drop, wk, wd);
       queue.writeBuffer(this.sitesBuf, keep * SITE_FLOATS * 4, encodeSiteColors(merged, 1, this.colorSpace));
       queue.writeBuffer(this.sitesBuf, drop * SITE_FLOATS * 4, inactive);
       queue.writeBuffer(this.adamBuf, keep * ADAM_FLOATS * 4, adam);
@@ -796,21 +805,28 @@ export class Trainer {
     return merges.length;
   }
 
+  // Adam state of sites [0, count): ADAM_FLOATS floats per site (adam.wgsl).
+  async _readAdam(count) {
+    const device = this.device;
+    const bytes = count * ADAM_FLOATS * 4;
+    const staging = device.createBuffer({ size: bytes, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    const encoder = device.createCommandEncoder();
+    encoder.copyBufferToBuffer(this.adamBuf, 0, staging, 0, bytes);
+    device.queue.submit([encoder.finish()]);
+    await staging.mapAsync(GPUMapMode.READ);
+    const adam = new Float32Array(staging.getMappedRange()).slice();
+    staging.unmap();
+    staging.destroy();
+    return adam;
+  }
+
   // Moves the active sites (and their Adam moments) to the front, in order,
   // marks the rest inactive, and rebuilds the candidate lists.
   async _compactSites() {
     const device = this.device;
     const n = this.siteCount;
     const sites = await readSites(device, this.sitesBuf, n);
-    const adamBytes = n * ADAM_FLOATS * 4;
-    const staging = device.createBuffer({ size: adamBytes, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
-    const encoder = device.createCommandEncoder();
-    encoder.copyBufferToBuffer(this.adamBuf, 0, staging, 0, adamBytes);
-    device.queue.submit([encoder.finish()]);
-    await staging.mapAsync(GPUMapMode.READ);
-    const adam = new Float32Array(staging.getMappedRange()).slice();
-    staging.unmap();
-    staging.destroy();
+    const adam = await this._readAdam(n);
     const outSites = new Float32Array(n * SITE_FLOATS);
     const outAdam = new Float32Array(n * ADAM_FLOATS);
     let m = 0;

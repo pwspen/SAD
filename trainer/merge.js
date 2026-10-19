@@ -8,12 +8,15 @@
 // squared error by Ward's criterion nᵢnⱼ/(nᵢ + nⱼ)·‖μᵢ − μⱼ‖². Merges are
 // taken cheapest first, each site in at most one per step.
 //
-// The merged site is the pixel-count-weighted average of the pair's
-// parameters (position, log τ, radius, RGB color, log anisotropy), and of
-// their anisotropy axes as orientations: dir and −dir render the same, so
-// the axes are averaged as doubled angles.
+// The merged site is a weighted average of the pair's parameters (position,
+// log τ, radius, RGB color, log anisotropy), and of their anisotropy axes as
+// orientations: dir and −dir render the same, so the axes are averaged as
+// doubled angles. The weights are either the cells' pixel counts or, per
+// parameter, each site's precision (mergePrecision): pixel counts assume every
+// pixel carries the same information, precision weighs a parameter by how
+// much the loss cares about it.
 
-import { SITE_FLOATS } from "./params.js?v=20261019";
+import { SITE_FLOATS, ADAM_FLOATS } from "./params.js?v=20261019";
 
 // Logit of the site at sites[b..b+SITE_FLOATS) at pixel (x, y): the CPU copy
 // of site_logit in sad_shared.wgsl.
@@ -104,14 +107,49 @@ export function pickMerges(moments, count, pinned = new Set()) {
   return merges;
 }
 
-// Pixel-count-weighted average of sites a and b (RGB colors), as a new
-// SITE_FLOATS array. Anisotropy axes average as doubled angles, keeping the
+// Adam second-moment slot (adam.wgsl) holding each site float's v; position
+// and the axis share one v per pair, and the color slots are the run's
+// color-space params, so every RGB channel takes their mean.
+const V_SLOT = [2, 2, 5, 7, null, null, null, 16, 16, 19];
+const V_COLOR = [11, 12, 13];
+
+// Bias-corrected Adam second moment v̂ of each of site i's floats at step t:
+// the mean squared gradient, a diagonal estimate of the Fisher information.
+// adam[20] is the step the site's moments were reset at.
+export function sitePrecision(adam, i, t, beta2) {
+  const b = i * ADAM_FLOATS;
+  const tt = Math.max(1, t - adam[b + 20]);
+  const corr = 1 / (1 - beta2 ** tt);
+  const color = V_COLOR.reduce((acc, s) => acc + adam[b + s], 0) / 3;
+  return V_SLOT.map((s) => (s === null ? color : adam[b + s]) * corr);
+}
+
+// Per-float merge weights for sites a and b: their precisions, or their
+// pixel counts na, nb where neither has any (fresh moments, or a NaN).
+export function mergePrecision(adam, a, b, t, beta2, na, nb) {
+  const pa = sitePrecision(adam, a, t, beta2), pb = sitePrecision(adam, b, t, beta2);
+  for (let k = 0; k < SITE_FLOATS; k += 1) {
+    if (!(pa[k] + pb[k] > 0) || !Number.isFinite(pa[k] + pb[k])) { pa[k] = na; pb[k] = nb; }
+  }
+  return [pa, pb];
+}
+
+// Weighted average of sites a and b (RGB colors), as a new SITE_FLOATS array.
+// wa, wb are numbers (pixel counts) or SITE_FLOATS per-float weights
+// (mergePrecision). Anisotropy axes average as doubled angles, keeping the
 // pair's weighted mean axis length.
 export function mergedSite(sites, a, b, wa, wb) {
   const A = a * SITE_FLOATS, B = b * SITE_FLOATS;
-  const w = wa + wb > 0 ? wa / (wa + wb) : 0.5;
+  const frac = (k) => {
+    const x = typeof wa === "number" ? wa : wa[k], y = typeof wb === "number" ? wb : wb[k];
+    return x + y > 0 ? x / (x + y) : 0.5;
+  };
   const out = new Float32Array(SITE_FLOATS);
-  for (let k = 0; k < SITE_FLOATS; k += 1) out[k] = w * sites[A + k] + (1 - w) * sites[B + k];
+  for (let k = 0; k < SITE_FLOATS; k += 1) {
+    const w = frac(k);
+    out[k] = w * sites[A + k] + (1 - w) * sites[B + k];
+  }
+  const w = frac(7);
   const len = (o) => Math.hypot(sites[o + 7], sites[o + 8]);
   const ang = (o) => Math.atan2(sites[o + 8], sites[o + 7]);
   const cx = w * Math.cos(2 * ang(A)) + (1 - w) * Math.cos(2 * ang(B));
