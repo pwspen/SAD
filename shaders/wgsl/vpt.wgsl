@@ -54,6 +54,16 @@ fn tryInsert8(bestIdx : ptr<function, array<u32, 8>>, bestD2 : ptr<function, arr
   (*bestIdx)[insertPos] = candIdx;
 }
 
+// Offers all 8 ids of a candidate texel pair to the list.
+fn tryInsertTexel(bestIdx : ptr<function, array<u32, 8>>, bestD2 : ptr<function, array<f32, 8>>,
+                  c0 : vec4<u32>, c1 : vec4<u32>, uv : vec2<f32>, siteCount : u32,
+                  invScaleSq : f32, inv_scale : f32) {
+  let ids = cand_ids(c0, c1);
+  for (var i = 0u; i < 8u; i = i + 1u) {
+    tryInsert8(bestIdx, bestD2, ids[i], uv, siteCount, invScaleSq, inv_scale);
+  }
+}
+
 @compute @workgroup_size(16, 16)
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   let candW = max(params.candWidth, 1u);
@@ -79,16 +89,11 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
     bestD2[i] = inf;
   }
 
-  let self0 = textureLoad(inCand0, gi, 0);
-  let self1 = textureLoad(inCand1, gi, 0);
-  tryInsert8(&bestIdx, &bestD2, self0.x, uv, params.siteCount, params.invScaleSq, inv_scale);
-  tryInsert8(&bestIdx, &bestD2, self0.y, uv, params.siteCount, params.invScaleSq, inv_scale);
-  tryInsert8(&bestIdx, &bestD2, self0.z, uv, params.siteCount, params.invScaleSq, inv_scale);
-  tryInsert8(&bestIdx, &bestD2, self0.w, uv, params.siteCount, params.invScaleSq, inv_scale);
-  tryInsert8(&bestIdx, &bestD2, self1.x, uv, params.siteCount, params.invScaleSq, inv_scale);
-  tryInsert8(&bestIdx, &bestD2, self1.y, uv, params.siteCount, params.invScaleSq, inv_scale);
-  tryInsert8(&bestIdx, &bestD2, self1.z, uv, params.siteCount, params.invScaleSq, inv_scale);
-  tryInsert8(&bestIdx, &bestD2, self1.w, uv, params.siteCount, params.invScaleSq, inv_scale);
+  // The current list, then the global candidate (params.globalCand, a site
+  // offered to every pixel; none when >= siteCount).
+  tryInsertTexel(&bestIdx, &bestD2, textureLoad(inCand0, gi, 0), textureLoad(inCand1, gi, 0),
+                 uv, params.siteCount, params.invScaleSq, inv_scale);
+  tryInsert8(&bestIdx, &bestD2, params.globalCand, uv, params.siteCount, params.invScaleSq, inv_scale);
 
   let offsets = array<vec2<i32>, 4>(
     vec2<i32>(-1, 0), vec2<i32>(1, 0), vec2<i32>(0, -1), vec2<i32>(0, 1)
@@ -96,16 +101,8 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
 
   for (var i = 0u; i < 4u; i = i + 1u) {
     let p = clamp(gi + offsets[i] * i32(jumpStep), vec2<i32>(0), vec2<i32>(w - 1, h - 1));
-    let n0 = textureLoad(inCand0, p, 0);
-    let n1 = textureLoad(inCand1, p, 0);
-    tryInsert8(&bestIdx, &bestD2, n0.x, uv, params.siteCount, params.invScaleSq, inv_scale);
-    tryInsert8(&bestIdx, &bestD2, n0.y, uv, params.siteCount, params.invScaleSq, inv_scale);
-    tryInsert8(&bestIdx, &bestD2, n0.z, uv, params.siteCount, params.invScaleSq, inv_scale);
-    tryInsert8(&bestIdx, &bestD2, n0.w, uv, params.siteCount, params.invScaleSq, inv_scale);
-    tryInsert8(&bestIdx, &bestD2, n1.x, uv, params.siteCount, params.invScaleSq, inv_scale);
-    tryInsert8(&bestIdx, &bestD2, n1.y, uv, params.siteCount, params.invScaleSq, inv_scale);
-    tryInsert8(&bestIdx, &bestD2, n1.z, uv, params.siteCount, params.invScaleSq, inv_scale);
-    tryInsert8(&bestIdx, &bestD2, n1.w, uv, params.siteCount, params.invScaleSq, inv_scale);
+    tryInsertTexel(&bestIdx, &bestD2, textureLoad(inCand0, p, 0), textureLoad(inCand1, p, 0),
+                   uv, params.siteCount, params.invScaleSq, inv_scale);
   }
 
   let rad = params.radiusScale * (f32(candW) / 1024.0);
@@ -116,16 +113,8 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
     let dy = i32(sin(a) * rad);
     let p = clamp(gi + vec2<i32>(dx, dy), vec2<i32>(0), vec2<i32>(w - 1, h - 1));
     if (gid.x == u32(p.x) && gid.y == u32(p.y)) { continue; }
-    let n0 = textureLoad(inCand0, p, 0);
-    let n1 = textureLoad(inCand1, p, 0);
-    tryInsert8(&bestIdx, &bestD2, n0.x, uv, params.siteCount, params.invScaleSq, inv_scale);
-    tryInsert8(&bestIdx, &bestD2, n0.y, uv, params.siteCount, params.invScaleSq, inv_scale);
-    tryInsert8(&bestIdx, &bestD2, n0.z, uv, params.siteCount, params.invScaleSq, inv_scale);
-    tryInsert8(&bestIdx, &bestD2, n0.w, uv, params.siteCount, params.invScaleSq, inv_scale);
-    tryInsert8(&bestIdx, &bestD2, n1.x, uv, params.siteCount, params.invScaleSq, inv_scale);
-    tryInsert8(&bestIdx, &bestD2, n1.y, uv, params.siteCount, params.invScaleSq, inv_scale);
-    tryInsert8(&bestIdx, &bestD2, n1.z, uv, params.siteCount, params.invScaleSq, inv_scale);
-    tryInsert8(&bestIdx, &bestD2, n1.w, uv, params.siteCount, params.invScaleSq, inv_scale);
+    tryInsertTexel(&bestIdx, &bestD2, textureLoad(inCand0, p, 0), textureLoad(inCand1, p, 0),
+                   uv, params.siteCount, params.invScaleSq, inv_scale);
   }
 
   if (params.hilbertProbes > 0u && params.hilbertWindow > 0u) {

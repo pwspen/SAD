@@ -5,7 +5,7 @@
 
 import { loadShaders, tileSlotsForLimit } from "../trainer/shader_loader.js?v=shared-wgsl-20261017";
 import { requestTrainingDevice } from "../trainer/device.js?v=shared-wgsl-20261017";
-import { Trainer, buildArgs, GRAD_GROUPS, lrSchedule, LR_SCHEDULES, LOSSES, GROW_MODES, GROW_CRITERIA, KEEP_BEST, COUNT_SCHEDULES, countPlan, countVaries, countHorizon } from "../trainer/trainer.js?v=count-20261018";
+import { Trainer, buildArgs, GRAD_GROUPS, lrSchedule, LR_SCHEDULES, LOSSES, GROW_MODES, GROW_CRITERIA, KEEP_BEST, COUNT_SCHEDULES, LAYER_MODES, INFO_MODES, countPlan, countVaries, countHorizon } from "../trainer/trainer.js?v=info-20261019";
 import { loadImageToFloat32, loadMaskRgba32Float, whiteMaskRgba32Float } from "../trainer/textures.js?v=shared-wgsl-20261017";
 import { loadSitesFromFile, serializeSitesTxt, triggerDownload, floatImageToRgba8, computeBpp, BITS_PER_SITE } from "../trainer/io.js?v=shared-wgsl-20261017";
 import { SITE_FLOATS } from "../trainer/params.js?v=shared-wgsl-20261017";
@@ -72,6 +72,8 @@ const UI_FIELDS = [
   ["growCriterion", "p-growCriterion"],
   ["pruneEvery", "p-pruneEvery"],
   ["growPatience", "p-growPatience"],
+  ["layer", "p-layer"],
+  ["info", "p-info"],
 ];
 
 const state = {
@@ -181,6 +183,10 @@ function applyConfigToForm(config, overrides = {}) {
     .replaceChildren(...Object.entries(GROW_CRITERIA).map(([key, label]) => new Option(label, key)));
   document.getElementById("p-keepBest")
     .replaceChildren(...Object.entries(KEEP_BEST).map(([key, label]) => new Option(label, key)));
+  document.getElementById("p-layer")
+    .replaceChildren(...Object.entries(LAYER_MODES).map(([key, label]) => new Option(label, key)));
+  document.getElementById("p-info")
+    .replaceChildren(...Object.entries(INFO_MODES).map(([key, label]) => new Option(label, key)));
   const defaults = buildArgs(config, overrides);
   for (const [key, elId, opts] of UI_FIELDS) {
     const el = document.getElementById(elId);

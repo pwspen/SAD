@@ -55,6 +55,23 @@ growth also ends, and the run returns to the best state, after that many growth 
 better score. Mid-growth states are far from converged, so `"mdl"` and patience pick early
 half-fitted states with the current presets; see the comment on `KEEP_BEST` in `trainer.js`.
 
+`layer` and `info` let the run stop spending sites and loss on what's already exact.
+`layer: "auto"` reads the target's 8-bit histogram: if one exact color covers at least
+`layerModeMin` (0.5) of the pixels, that color becomes a pinned flat site (constant logit ≈ 0,
+offered to every pixel through `Params.globalCand`). It never moves or splits, absorbs sites
+in merges, counts as one of the sites, and is an ordinary site in the saved file. `info` runs a
+remaining-information pass (`info_update.wgsl`) every `infoEvery` iterations (default
+`candFreq`) that measures each pixel's error in 8-bit levels and replaces the mask in the
+gradients and growth statistics: `"deadzone"` weights a pixel 0 below 1/4 level, ramping to 1 by
+1/2 level; `"commit"` drops a pixel once it's been exact `commitAfter` (4) passes in a row,
+re-checks it every pass (`commitRecheck`) and freezes sites that touch no uncommitted pixel
+(`commitFreeze`). On 40 held-out MNIST digits (5 repeats, paired against the preset, ± standard
+error over digits): the layer alone +0.58 ± 0.32 dB at 8 sites, +1.14 ± 0.33 at 32; layer +
+commit +1.09 ± 0.29 and +1.16 ± 0.29 (the MNIST preset); layer + dead zone +1.33 at 8 but +0.89
+at 32. Without the layer, dead zone and commit are within noise (−0.30 to +0.14), and commit
+without re-checking loses 2.6–5.1 dB: moving sites bleed into pixels nobody looks at any more.
+On Kodak nothing triggers (the dominant color covers 0.4%, almost no pixel is exact).
+
 There is no LR warmup. `lrSchedule` is `"cosine"` (1 to 0 over `iters`), `"fixed"` (default, constant) or
 `"decay-after-growth"` (constant until growth ends, then cosine to 0 by the end of the run).
 

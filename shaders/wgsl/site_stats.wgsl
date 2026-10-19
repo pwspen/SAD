@@ -3,7 +3,11 @@
 // does, then
 //   - credit the pixel to its owner (largest weight) with moments of the fit
 //     target over the owner's pixels, in offsets d = pixel - owner position
-//     (so sums stay small): channels 0..16;
+//     (so sums stay small): channels 0..16. A pinned owner (sitePin, e.g. the
+//     histogram layer) can't split, so its pixels go to the best unpinned
+//     candidate instead, weighted by how far the render is from exact there
+//     (info_update's u: 0 within 1/4 bin, 1 from 1/2), so only what the layer
+//     doesn't explain counts;
 //   - credit every candidate with the error increase if it were removed and
 //     the others renormalized (the "removal delta"): channel 17.
 // Output `stats[site * 18 + ch]` (f32 bits, summed with a CAS loop):
@@ -29,8 +33,9 @@ struct SiteStatsParams {
 @group(0) @binding(2) var inCand0 : texture_2d<u32>;
 @group(0) @binding(3) var inCand1 : texture_2d<u32>;
 @group(0) @binding(4) var fitTex : texture_2d<f32>;
-@group(0) @binding(5) var maskTex : texture_2d<f32>;
+@group(0) @binding(5) var<storage, read> lossWeight : array<f32>; // mask or info weights (W*H)
 @group(0) @binding(6) var<storage, read_write> stats : array<atomic<u32>>;
+@group(0) @binding(7) var<storage, read> sitePin : array<u32>;
 
 const STATS_CH : u32 = 18u;
 const ST_SLOTS : u32 = 128u;
@@ -88,7 +93,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>,
   let dims = textureDimensions(fitTex);
   let in_bounds = gid.x < dims.x && gid.y < dims.y;
   var m = 0.0;
-  if (in_bounds) { m = textureLoad(maskTex, vec2<i32>(gid.xy), 0).r; }
+  if (in_bounds) { m = lossWeight[gid.y * dims.x + gid.x]; }
 
   if (in_bounds && m > 0.0) {
     let uv = vec2<f32>(f32(gid.x), f32(gid.y));
@@ -96,36 +101,23 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>,
     let cc = candidateCoord(vec2<u32>(gid.xy), dims, textureDimensions(inCand0));
     let c0 = textureLoad(inCand0, vec2<i32>(cc), 0);
     let c1 = textureLoad(inCand1, vec2<i32>(cc), 0);
-    let ids = array<u32, 8>(c0.x, c0.y, c0.z, c0.w, c1.x, c1.y, c1.z, c1.w);
+    let ids = cand_ids(c0, c1);
 
     var logits : array<f32, 8>;
     var cols : array<vec3<f32>, 8>;
-    var maxl = -1e30;
     for (var i = 0u; i < 8u; i = i + 1u) {
-      var lv = -1e30;
+      logits[i] = NEG_INF;
       cols[i] = vec3<f32>(0.0);
-      let idx = ids[i];
-      if (idx < params.siteCount) {
-        let s = sites[idx];
-        if (s.position.x >= 0.0 && !is_bad(s.log_tau)) {
-          let l = -exp(s.log_tau) * voronoi_dmix2_fast(s, uv, params.invScaleSq, inv_scale);
-          if (!is_bad(l)) { lv = l; cols[i] = site_color(s); }
-        }
+      if (ids[i] < params.siteCount) {
+        logits[i] = site_logit(sites[ids[i]], uv, params.invScaleSq, inv_scale);
+        if (logits[i] > -1e29) { cols[i] = site_color(sites[ids[i]]); }
       }
-      logits[i] = lv;
-      maxl = max(maxl, lv);
     }
-    if (maxl > -1e29) {
-      var w : array<f32, 8>;
-      var sw = 0.0;
-      for (var i = 0u; i < 8u; i = i + 1u) {
-        w[i] = select(0.0, exp(logits[i] - maxl), logits[i] > -1e29);
-        sw = sw + w[i];
-      }
+    let w = softmax8(logits);
+    if (w[0] + w[1] + w[2] + w[3] + w[4] + w[5] + w[6] + w[7] > 0.0) {
       var pred = vec3<f32>(0.0);
       var owner = 0u;
       for (var i = 0u; i < 8u; i = i + 1u) {
-        w[i] = w[i] / sw;
         pred = pred + w[i] * cols[i];
         if (w[i] > w[owner]) { owner = i; }
       }
@@ -133,8 +125,18 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>,
       let et = t - pred;
       let err = dot(et, et);
 
-      // Owner moments.
-      let oid = ids[owner];
+      // Owner moments (a pinned owner hands the pixel to the best unpinned
+      // candidate, weighted by the render's error in bins beyond half a bin).
+      var oid = ids[owner];
+      if (sitePin[oid] != 0u) {
+        var alt = 8u;
+        for (var i = 0u; i < 8u; i = i + 1u) {
+          if (w[i] > 0.0 && sitePin[ids[i]] == 0u && (alt == 8u || w[i] > w[alt])) { alt = i; }
+        }
+        let ed = abs(clamp(pred, vec3<f32>(0.0), vec3<f32>(1.0)) - t) * 255.0;
+        m = m * clamp((max(ed.x, max(ed.y, ed.z)) - 0.25) * 4.0, 0.0, 1.0);
+        if (alt == 8u) { m = 0.0; } else { oid = ids[alt]; }
+      }
       let d = uv - sites[oid].position;
       let os = slotFor(oid);
       addStat(os, oid, 0u, m);

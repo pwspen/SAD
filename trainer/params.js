@@ -16,13 +16,14 @@ function f32View(buffer, offsetBytes, nF32) {
 }
 
 // ---------------------------------------------------------------------------
-// Params (used by seed_cand, jfa_flood, vpt, candidate_pack (as ClearParams),
+// Params (used by seed_cand, vpt, candidate_pack (as ClearParams),
 // render_compute, etc.)
 // Layout (matches sad_shared.py create_params_buffer, struct "<IIIIfIfIIIIIIIII"):
 //   u32 width, u32 height, u32 siteCount, u32 step,
 //   f32 invScaleSq, u32 seed, f32 radiusScale, u32 radiusProbes,
 //   u32 injectCount, u32 hilbertProbes, u32 hilbertWindow, u32 candDownscale,
-//   u32 candWidth, u32 candHeight, u32 _pad0, u32 _pad1   (total 16*4 = 64 bytes)
+//   u32 candWidth, u32 candHeight, u32 globalCand, u32 _pad1   (total 16*4 = 64 bytes)
+// globalCand: a site id vpt offers to every pixel each pass (default none).
 // ---------------------------------------------------------------------------
 
 export const PARAMS_SIZE = 64;
@@ -32,7 +33,7 @@ export function writeParams(
   { width, height, siteCount, step = 0, seed = 0,
     radiusScale, radiusProbes, injectCount,
     hilbertProbes, hilbertWindow, candDownscale,
-    candWidth, candHeight },
+    candWidth, candHeight, globalCand = 0xffffffff },
 ) {
   const scale = Math.max(width, height);
   const invScaleSq = 1.0 / (scale * scale);
@@ -53,7 +54,7 @@ export function writeParams(
   u[11] = cd >>> 0;
   u[12] = candWidth >>> 0;
   u[13] = candHeight >>> 0;
-  u[14] = 0;
+  u[14] = globalCand >>> 0;
   u[15] = 0;
 }
 
@@ -134,25 +135,25 @@ export function updateGradParamsBuffer(queue, buffer, siteCount, invScaleSq) {
 // ---------------------------------------------------------------------------
 // AdamParams (adam.wgsl):
 //   f32 lrPos, lrTau, lrRadius, lrColor, lrDir, lrAniso, beta1, beta2, eps,
-//   u32 t, u32 width, u32 height, u32 growGen, f32 growLrDecay, u32 _pad × 2
-//   (16 slots, 64 bytes).
+//   u32 t, u32 width, u32 height, u32 growGen, f32 growLrDecay,
+//   u32 freezeUnlive, u32 _pad (16 slots, 64 bytes).
 // ---------------------------------------------------------------------------
 
 export function createAdamParamsBuffer(device, lrPos, lrTau, lrRadius, lrColor,
                                        lrDir, lrAniso, beta1, beta2, eps,
-                                       t, width, height, growGen = 0, growLrDecay = 1) {
+                                       t, width, height, growGen = 0, growLrDecay = 1, freezeUnlive = false) {
   const buf = device.createBuffer({
     size: 64,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
   updateAdamParamsBuffer(device.queue, buf, lrPos, lrTau, lrRadius, lrColor,
-                          lrDir, lrAniso, beta1, beta2, eps, t, width, height, growGen, growLrDecay);
+                          lrDir, lrAniso, beta1, beta2, eps, t, width, height, growGen, growLrDecay, freezeUnlive);
   return buf;
 }
 
 export function updateAdamParamsBuffer(queue, buffer, lrPos, lrTau, lrRadius, lrColor,
                                         lrDir, lrAniso, beta1, beta2, eps,
-                                        t, width, height, growGen = 0, growLrDecay = 1) {
+                                        t, width, height, growGen = 0, growLrDecay = 1, freezeUnlive = false) {
   const bytes = new ArrayBuffer(64);
   const f = new Float32Array(bytes);
   const u = new Uint32Array(bytes);
@@ -170,6 +171,7 @@ export function updateAdamParamsBuffer(queue, buffer, lrPos, lrTau, lrRadius, lr
   u[11] = height >>> 0;
   u[12] = growGen >>> 0;
   f[13] = growLrDecay;
+  u[14] = freezeUnlive ? 1 : 0;
   queue.writeBuffer(buffer, 0, bytes);
 }
 
@@ -309,4 +311,23 @@ export function hilbertBitsForSize(width, height) {
     bits += 1;
   }
   return Math.max(bits, 1);
+}
+
+// ---------------------------------------------------------------------------
+// InfoParams (info_update.wgsl):
+//   u32 siteCount, u32 mode (1 deadzone, 2 commit), u32 commitAfter, u32 recheck,
+//   f32 invScaleSq, f32 quant, f32 liveEps, f32 _pad   (32 bytes)
+// ---------------------------------------------------------------------------
+export function updateInfoParamsBuffer(queue, buffer, { siteCount, mode, commitAfter, recheck, invScaleSq, quant, liveEps }) {
+  const bytes = new ArrayBuffer(32);
+  const u = new Uint32Array(bytes);
+  const f = new Float32Array(bytes);
+  u[0] = siteCount >>> 0;
+  u[1] = mode >>> 0;
+  u[2] = commitAfter >>> 0;
+  u[3] = recheck ? 1 : 0;
+  f[4] = invScaleSq;
+  f[5] = quant;
+  f[6] = liveEps;
+  queue.writeBuffer(buffer, 0, bytes);
 }

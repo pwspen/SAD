@@ -25,9 +25,10 @@ import {
   updateClearParamsBuffer,
   createUniform32,
   updateGrowBlurParamsBuffer,
+  updateInfoParamsBuffer,
   packJumpStep,
   hilbertBitsForSize,
-} from "./params.js?v=lr-decay-20261018";
+} from "./params.js?v=info-20261019";
 
 import {
   createSitesBuffer,
@@ -53,8 +54,6 @@ import {
   InitGradientEncoder,
   CandidatesEncoder,
   SeedCandidatesEncoder,
-  JFAClearEncoder,
-  JFAFloodEncoder,
   CandidatePackEncoder,
   RenderEncoder,
   RenderHashedEncoder,
@@ -66,12 +65,13 @@ import {
   HilbertEncoder,
   GrowEncoder,
   SiteStatsEncoder,
-} from "./encoders.js?v=loss-20261018";
+  InfoEncoder,
+} from "./encoders.js?v=info-20261019";
 
 import { RadixSortUInt2 } from "./radix_sort.js?v=shared-wgsl-20261017";
 import { BITS_PER_SITE } from "./io.js";
 import { insertionField, pickInsertions } from "./insert.js?v=insert-20261018";
-import { cellMoments, pickMerges, mergedSite } from "./merge.js?v=merge-20261018";
+import { cellMoments, pickMerges, mergedSite } from "./merge.js?v=info-20261019";
 import {
   colorSpaceFor,
   specializeShaders,
@@ -224,6 +224,56 @@ export function countCapacity(args, start = args.startSites) {
   return countPlan(args, start).reduce((m, p) => Math.max(m, p.count), Math.max(start, args.endSites));
 }
 
+// Histogram layer (args.layer). "auto": if the target's most common exact
+// 8-bit color (histogramMode) covers at least layerModeMin of the pixels, that
+// color gets a flat layer: a pinned site whose logit is ~0 everywhere
+// (τ = e^LAYER_LOG_TAU, radius 0), so a site wins a pixel where -τ(d - r) > 0,
+// i.e. inside its radius, and the layer's color shows wherever no site
+// reaches. The layer is offered to every pixel's candidate list
+// (Params.globalCand), never moves (sitePin), never splits, and can absorb
+// sites in a merge. It's an ordinary site in the sites file.
+export const LAYER_MODES = {
+  off: "off",
+  auto: "auto (dominant color)",
+};
+const LAYER_LOG_TAU = -9;
+
+// Most common exact 8-bit RGB color over the masked pixels: { color (0..1
+// RGB), mass (fraction of pixels) }.
+export function histogramMode(target, n, mask = null) {
+  const counts = new Map();
+  let total = 0;
+  for (let p = 0; p < n; p += 1) {
+    if (mask && !(mask[p] > 0)) continue;
+    const key = (Math.round(target[p * 4] * 255) << 16) | (Math.round(target[p * 4 + 1] * 255) << 8) |
+      Math.round(target[p * 4 + 2] * 255);
+    counts.set(key, (counts.get(key) || 0) + 1);
+    total += 1;
+  }
+  let best = 0, bestCount = 0;
+  for (const [k, c] of counts) if (c > bestCount) { best = k; bestCount = c; }
+  return { color: [(best >> 16) / 255, ((best >> 8) & 255) / 255, (best & 255) / 255], mass: total ? bestCount / total : 0 };
+}
+
+// Remaining-information pass (args.info, info_update.wgsl), every infoEvery
+// iterations. Pixels are measured in quantization bins of the target (1/255):
+// within half a bin the decoded pixel is exact and has nothing left to explain.
+// "deadzone": loss weight = 0 below 1/4 bin of error, ramping to 1 at 1/2
+// bin (where rounding would go wrong), per pixel, each pass.
+// "commit": full weight until a pixel has been exact for commitAfter passes
+// in a row, then 0 (committed); with commitRecheck it's still checked and comes
+// back if it drifts, without it it's never looked at again. With commitFreeze,
+// sites with no weight above INFO_LIVE_EPS on an uncommitted pixel don't move.
+// The weights replace the mask in the gradients and the growth statistics;
+// PSNR, keepBest and pruning still score every masked pixel.
+export const INFO_MODES = {
+  off: "off",
+  deadzone: "dead zone (exact pixels)",
+  commit: "commit settled pixels",
+};
+const INFO_QUANT = 1 / 255;
+const INFO_LIVE_EPS = 1e-3;
+
 // Collect default args from a training_config.json-style object + user
 // overrides. Overrides use the argument name (e.g. "iters") and take precedence
 // over the matching config-style key (e.g. "DEFAULT_ITERS").
@@ -311,6 +361,24 @@ export function buildArgs(config, overrides = {}) {
     // this many iterations once the count schedule is over (0 = never); see
     // _pruneStep.
     pruneEvery: Math.max(0, Math.floor(Number(pick("pruneEvery", "PRUNE_EVERY", 0)))),
+    // Histogram layer (LAYER_MODES): when one exact 8-bit color holds at least
+    // layerModeMin of the (masked) pixels, add a pinned flat site of that
+    // color offered to every pixel. It counts as one of the sites.
+    layer: String(pick("layer", "LAYER", "off")),
+    layerModeMin: Number(pick("layerModeMin", "LAYER_MODE_MIN", 0.5)),
+    // Remaining-information pass (INFO_MODES), every infoEvery iterations
+    // (0 = candFreq): per-pixel loss weights from the error in 8-bit bins.
+    info: String(pick("info", "INFO", "off")),
+    infoEvery: Math.max(0, Math.floor(Number(pick("infoEvery", "INFO_EVERY", 0)))),
+    // Whether the info weights also weight the training gradients (else only
+    // growth's site statistics use them).
+    infoGrad: Boolean(pick("infoGrad", "INFO_GRAD", true)),
+    // "commit": passes in a row a pixel must be exact to leave the loss;
+    // whether committed pixels are still checked (and come back if they
+    // drift); whether sites serving no uncommitted pixel freeze.
+    commitAfter: Math.max(1, Math.floor(Number(pick("commitAfter", "COMMIT_AFTER", 4)))),
+    commitRecheck: Boolean(pick("commitRecheck", "COMMIT_RECHECK", true)),
+    commitFreeze: Boolean(pick("commitFreeze", "COMMIT_FREEZE", true)),
   };
   if (!COUNT_SCHEDULES[args.countSchedule]) {
     throw new Error(`countSchedule must be one of ${Object.keys(COUNT_SCHEDULES).join(", ")} (got "${args.countSchedule}")`);
@@ -330,6 +398,12 @@ export function buildArgs(config, overrides = {}) {
   }
   if (!LOSSES[args.loss]) {
     throw new Error(`loss must be one of ${Object.keys(LOSSES).join(", ")} (got "${args.loss}")`);
+  }
+  if (!LAYER_MODES[args.layer]) {
+    throw new Error(`layer must be one of ${Object.keys(LAYER_MODES).join(", ")} (got "${args.layer}")`);
+  }
+  if (!INFO_MODES[args.info]) {
+    throw new Error(`info must be one of ${Object.keys(INFO_MODES).join(", ")} (got "${args.info}")`);
   }
   if (!Number.isFinite(args.initLogTau) || !Number.isFinite(args.initRadius)) {
     throw new Error("training_config.json missing INIT_LOG_TAU / INIT_RADIUS (required).");
@@ -361,8 +435,6 @@ export class Trainer {
     this.initEnc = new InitGradientEncoder(device, shaders);
     this.candsEnc = new CandidatesEncoder(device, shaders);
     this.seedEnc = new SeedCandidatesEncoder(device, shaders);
-    this.jfaClearEnc = new JFAClearEncoder(device, shaders);
-    this.jfaFloodEnc = new JFAFloodEncoder(device, shaders);
     this.packEnc = new CandidatePackEncoder(device, shaders);
     this.renderEnc = new RenderEncoder(device, shaders);
     this.renderHashedEnc = new RenderHashedEncoder(device, shaders);
@@ -376,6 +448,7 @@ export class Trainer {
     // sets the start), so the growth kernels are always built.
     this.growEnc = new GrowEncoder(device, shaders);
     this.statsEnc = new SiteStatsEncoder(device, shaders);
+    this.infoEnc = new InfoEncoder(device, shaders);
   }
 
   async prepare({ width, height, targetRgba32f, maskRgba32f, maskSum, initSites, initSiteCount }) {
@@ -407,6 +480,12 @@ export class Trainer {
     // the most the count schedule ever wants. Unused slots are inactive
     // (position.x < 0), which every kernel skips.
     if (!initSites) initSiteCount = args.startSites;
+    // Histogram layer: one more site after the initial ones (LAYER_MODES).
+    this.histMode = histogramMode(targetRgba32f, width * height, this.maskCpu);
+    const useLayer = args.layer === "auto" && this.histMode.mass >= args.layerModeMin;
+    const baseSiteCount = initSiteCount;
+    this.layerIndex = useLayer ? baseSiteCount : null;
+    if (useLayer) initSiteCount += 1;
     this.usesGrow = countVaries(args, initSiteCount);
     this.bufferCapacity = this.usesGrow ? countCapacity(args, initSiteCount) : initSiteCount;
     this.siteCount = initSiteCount;
@@ -420,6 +499,25 @@ export class Trainer {
     this.tauGradRaw = createAtomicU32Buffer(device, this.bufferCapacity);
     this.tauGradTmp = createAtomicU32Buffer(device, this.bufferCapacity);
     this.tauGradTmp2 = createAtomicU32Buffer(device, this.bufferCapacity);
+    // Per-site flags: sitePin (CPU-set, never optimized) and siteLive (set by
+    // the info pass; all live until one runs). See adam.wgsl.
+    const storage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC;
+    this.sitePinned = new Uint32Array(this.bufferCapacity);
+    if (useLayer) this.sitePinned[this.layerIndex] = 1;
+    this.sitePinBuf = device.createBuffer({ size: this.bufferCapacity * 4, usage: storage });
+    device.queue.writeBuffer(this.sitePinBuf, 0, this.sitePinned);
+    this.siteLiveBuf = device.createBuffer({ size: this.bufferCapacity * 4, usage: storage });
+    this._markAllLive();
+    // Per-pixel loss weights (the mask unless an info pass rewrites them),
+    // the mask itself, and the info pass's commit counts.
+    const maskF = new Float32Array(width * height);
+    for (let i = 0; i < width * height; i += 1) maskF[i] = this.maskCpu ? (this.maskCpu[i] > 0 ? 1 : 0) : 1;
+    this.maskBuf = device.createBuffer({ size: maskF.byteLength, usage: storage });
+    device.queue.writeBuffer(this.maskBuf, 0, maskF);
+    this.lossWeightBuf = device.createBuffer({ size: maskF.byteLength, usage: storage });
+    device.queue.writeBuffer(this.lossWeightBuf, 0, maskF);
+    this.settledBuf = device.createBuffer({ size: width * height * 4, usage: storage });
+    this.infoParams = createUniform32(device);
 
     // Candidate textures
     this.cand0A = createCandidateTexture(device, this.candWidth, this.candHeight);
@@ -501,21 +599,24 @@ export class Trainer {
         ? initSites
         : new Float32Array(initSites.buffer, initSites.byteOffset, maxBytes / 4);
       device.queue.writeBuffer(this.sitesBuf, 0,
-        encodeSiteColors(src.slice(), initSiteCount, this.colorSpace));
+        encodeSiteColors(src.slice(0, baseSiteCount * SITE_FLOATS), baseSiteCount, this.colorSpace));
+      if (useLayer) this._writeLayerSite();
       this.actualSites = initSiteCount;
       this.activeEstimate = 0;
-      for (let i = 0; i < initSiteCount; i += 1) {
+      for (let i = 0; i < baseSiteCount; i += 1) {
         if (initSites[i * SITE_FLOATS] >= 0) this.activeEstimate += 1;
       }
-      this._log(`Loaded init sites: ${initSiteCount} (active ${this.activeEstimate})`);
+      if (useLayer) this.activeEstimate += 1;
+      this._log(`Loaded init sites: ${baseSiteCount} (active ${this.activeEstimate})`);
     } else {
       const gradThreshold = 0.01;
-      const initParamsBuf = createInitParamsBuffer(device, initSiteCount, gradThreshold, 256,
+      const initParamsBuf = createInitParamsBuffer(device, baseSiteCount, gradThreshold, 256,
                                                     args.initLogTau, args.initRadius);
       const encoder = device.createCommandEncoder();
       this.initEnc.encode(encoder, this.sitesBuf, this.seedCounter, initParamsBuf,
-                           this.targetTex, this.maskTex, initSiteCount);
+                           this.targetTex, this.maskTex, baseSiteCount);
       device.queue.submit([encoder.finish()]);
+      if (useLayer) this._writeLayerSite();
       const sitesData = await readSites(device, this.sitesBuf, initSiteCount);
       initParamsBuf.destroy();
       this.actualSites = initSiteCount;
@@ -524,6 +625,10 @@ export class Trainer {
         if (sitesData[i * SITE_FLOATS] >= 0) this.activeEstimate += 1;
       }
       this._log(`Initialized sites: ${initSiteCount} (active ${this.activeEstimate})`);
+    }
+    if (useLayer) {
+      const c = this.histMode.color.map((v) => Math.round(v * 255)).join(", ");
+      this._log(`Histogram layer: rgb(${c}) covers ${(100 * this.histMode.mass).toFixed(1)}% of pixels → pinned site ${this.layerIndex}`);
     }
 
     // Prime candidate state (init + seed) — mirrors the one-time setup in Python.
@@ -599,6 +704,7 @@ export class Trainer {
     this.best = {
       it, score, err, psnr, sites, siteCount: this.siteCount, growGen: this.growGen,
       growStep: this.growSteps, siteBirthGen: this.siteBirthGen.slice(),
+      sitePinned: this.sitePinned.slice(), layerIndex: this.layerIndex,
     };
   }
 
@@ -616,6 +722,9 @@ export class Trainer {
     this.activeEstimate = b.sites;
     this.growGen = b.growGen;
     this.siteBirthGen.set(b.siteBirthGen);
+    this.layerIndex = b.layerIndex;
+    this._setPinned(b.sitePinned.slice());
+    this._markAllLive();
     updateClearParamsBuffer(queue, this.countParams, b.siteCount);
     updateGradParamsBuffer(queue, this.gradParams, b.siteCount, this.invScaleSq);
     this._rebuildCandidates(b.siteCount);
@@ -674,10 +783,33 @@ export class Trainer {
       candDownscale: this.candDownscale,
       candWidth: this.candWidth,
       candHeight: this.candHeight,
+      globalCand: this.layerIndex ?? 0xffffffff,
     };
   }
 
   _log(msg) { if (this.onLog) this.onLog({ type: "msg", message: msg }); }
+
+  // The histogram layer as a site at layerIndex: the mode color, logit
+  // -e^LAYER_LOG_TAU · d ≈ 0 everywhere (radius 0, isotropic, image center).
+  _writeLayerSite() {
+    const site = new Float32Array(SITE_FLOATS);
+    site[0] = (this.width - 1) / 2;
+    site[1] = (this.height - 1) / 2;
+    site[2] = LAYER_LOG_TAU;
+    site[3] = 0;
+    site.set(this.histMode.color, 4);
+    site[7] = 1;
+    site[8] = 0;
+    site[9] = 0;
+    this.device.queue.writeBuffer(this.sitesBuf, this.layerIndex * SITE_FLOATS * 4,
+      encodeSiteColors(site, 1, this.colorSpace));
+  }
+
+  // Every site counts as serving a pixel in the loss until the next info pass
+  // (after anything that adds, removes or moves sites wholesale).
+  _markAllLive() {
+    this.device.queue.writeBuffer(this.siteLiveBuf, 0, new Uint32Array(this.bufferCapacity).fill(1));
+  }
 
   _hilbertOrderBuf() {
     return this.usesHilbert && this.hilbertRes ? this.hilbertRes.order : this.dummyHilbertBuf;
@@ -740,7 +872,15 @@ export class Trainer {
       updateAdamParamsBuffer(queue, this.adamParams,
         args.lrPosBase * lrScale, args.lrTauBase * lrScale, args.lrRadiusBase * lrScale,
         args.lrColorBase * lrScale, lrDir, lrAniso, args.beta1, args.beta2, args.eps, it + 1, this.width, this.height,
-        this.growGen, args.growLrDecay);
+        this.growGen, args.growLrDecay, args.info === "commit" && args.commitFreeze);
+      const infoEvery = args.infoEvery || candUpdateFreq;
+      const runInfo = args.info !== "off" && it % infoEvery === 0;
+      if (runInfo) {
+        updateInfoParamsBuffer(queue, this.infoParams, {
+          siteCount, mode: args.info === "commit" ? 2 : 1, commitAfter: args.commitAfter,
+          recheck: args.commitRecheck, invScaleSq: this.invScaleSq, quant: INFO_QUANT, liveEps: INFO_LIVE_EPS,
+        });
+      }
 
       const blend = it / Math.max(1, iters);
       const lambda = TAU_DIFFUSE_LAMBDA * (0.1 + 0.9 * blend);
@@ -770,9 +910,12 @@ export class Trainer {
         }
       }
 
+      // Remaining information: per-pixel loss weights from the current lists.
+      if (runInfo) this._encodeInfo(encoder);
+
       // Gradients
       this.gradsEnc.encode(encoder, this.sitesBuf, this.gradParams,
-        this.cand0A, this.cand1A, this.fitTex, this.maskTex,
+        this.cand0A, this.cand1A, this.fitTex, args.infoGrad ? this.lossWeightBuf : this.maskBuf,
         this.grads, this.width, this.height);
 
       // Tau diffusion
@@ -807,7 +950,7 @@ export class Trainer {
 
       // Adam
       this.adamEnc.encode(encoder, this.sitesBuf, this.adamBuf, this.grads,
-        this.adamParams, siteCount);
+        this.adamParams, siteCount, this.sitePinBuf, this.siteLiveBuf);
 
       // Preview/log renders. The log path does a blocking readback for PSNR.
       // Viewer ticks wait only for the small site readback so centroid overlays
@@ -927,7 +1070,7 @@ export class Trainer {
     const staging = device.createBuffer({ size: bytes, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
     const encoder = device.createCommandEncoder();
     this.statsEnc.encode(encoder, this.sitesBuf, this.siteStatsParams, this.cand0A, this.cand1A,
-      this.fitTex, this.maskTex, this.siteStatsBuf, this.width, this.height);
+      this.fitTex, this.lossWeightBuf, this.siteStatsBuf, this.width, this.height, this.sitePinBuf);
     encoder.copyBufferToBuffer(this.siteStatsBuf, 0, staging, 0, bytes);
     device.queue.submit([encoder.finish()]);
     await staging.mapAsync(GPUMapMode.READ);
@@ -982,7 +1125,7 @@ export class Trainer {
     const sitesRaw = await readSites(device, this.sitesBuf, n0);
     const splits = [];
     for (let i = 0; i < n0; i += 1) {
-      if (sitesRaw[i * SITE_FLOATS] < 0) continue;
+      if (sitesRaw[i * SITE_FLOATS] < 0 || this.sitePinned[i]) continue;
       const sp = siteSplit(stats, i);
       if (sp && sp.gain > threshold) splits.push(sp);
     }
@@ -1082,7 +1225,7 @@ export class Trainer {
       this.best = null; // keepBest restarts from the pruned state
     }
     if (it > args.iters - every) { await this._endPrune(it, "too close to the end of the run"); return; }
-    const merges = pickMerges(moments, this.samples, BITS_PER_SITE);
+    const merges = pickMerges(moments, this.samples, BITS_PER_SITE, { pinned: this._pinnedColors(sites, n) });
     if (!merges.length) { await this._endPrune(it, "no merge would pay for its bits"); return; }
 
     const device = this.device;
@@ -1118,15 +1261,37 @@ export class Trainer {
     inactive[0] = -1;
     inactive[1] = -1;
     for (const { keep, drop } of merges) {
-      const merged = mergedSite(sites, keep, drop, moments.count[keep], moments.count[drop]);
-      queue.writeBuffer(this.sitesBuf, keep * SITE_FLOATS * 4, encodeSiteColors(merged, 1, this.colorSpace));
+      // A pinned site absorbs its partner unchanged.
+      if (!this.sitePinned[keep]) {
+        const merged = mergedSite(sites, keep, drop, moments.count[keep], moments.count[drop]);
+        queue.writeBuffer(this.sitesBuf, keep * SITE_FLOATS * 4, encodeSiteColors(merged, 1, this.colorSpace));
+        queue.writeBuffer(this.adamBuf, keep * ADAM_FLOATS * 4, adam);
+        this.siteBirthGen[keep] = this.growGen;
+      }
       queue.writeBuffer(this.sitesBuf, drop * SITE_FLOATS * 4, inactive);
-      queue.writeBuffer(this.adamBuf, keep * ADAM_FLOATS * 4, adam);
       queue.writeBuffer(this.adamBuf, drop * ADAM_FLOATS * 4, adam);
-      this.siteBirthGen[keep] = this.growGen;
     }
     this.activeEstimate -= merges.length;
+    this._markAllLive();
     this._rebuildCandidates(this.siteCount);
+  }
+
+  // Pinned sites among [0, n) as Map(id → RGB color), for pickMerges.
+  _pinnedColors(sites, n) {
+    const out = new Map();
+    for (let i = 0; i < n; i += 1) {
+      if (this.sitePinned[i]) out.set(i, Array.from(sites.subarray(i * SITE_FLOATS + 4, i * SITE_FLOATS + 7)));
+    }
+    return out;
+  }
+
+  // The remaining-information pass (info_update.wgsl) into `encoder`.
+  _encodeInfo(encoder) {
+    this.infoEnc.encode(encoder, {
+      sites: this.sitesBuf, params: this.infoParams, cand0: this.cand0A, cand1: this.cand1A,
+      targetTex: this.targetTex, mask: this.maskBuf, weight: this.lossWeightBuf,
+      settled: this.settledBuf, siteLive: this.siteLiveBuf, width: this.width, height: this.height,
+    });
   }
 
   // Count step down: merge the cheapest neighbouring pairs (Ward's criterion,
@@ -1139,7 +1304,8 @@ export class Trainer {
       width: this.width, height: this.height, sites, n, cand: await this._readCandidates(),
       candWidth: this.candWidth, candHeight: this.candHeight, target: this.target, mask: this.maskCpu,
     });
-    const merges = pickMerges(moments, this.samples, BITS_PER_SITE, { count: this.activeEstimate - target });
+    const merges = pickMerges(moments, this.samples, BITS_PER_SITE,
+      { count: this.activeEstimate - target, pinned: this._pinnedColors(sites, n) });
     if (!merges.length) return 0;
     this._applyMerges(it, sites, moments, merges);
     this.best = null; // keepBest restarts, so it can't go back to more sites
@@ -1192,13 +1358,18 @@ export class Trainer {
     const outSites = new Float32Array(n * SITE_FLOATS);
     const outAdam = new Float32Array(n * ADAM_FLOATS);
     let m = 0;
+    const pinned = new Uint32Array(this.bufferCapacity);
     for (let i = 0; i < n; i += 1) {
       if (!(sites[i * SITE_FLOATS] >= 0)) continue;
       outSites.set(sites.subarray(i * SITE_FLOATS, (i + 1) * SITE_FLOATS), m * SITE_FLOATS);
       outAdam.set(adam.subarray(i * ADAM_FLOATS, (i + 1) * ADAM_FLOATS), m * ADAM_FLOATS);
       this.siteBirthGen[m] = this.siteBirthGen[i];
+      pinned[m] = this.sitePinned[i];
+      if (i === this.layerIndex) this.layerIndex = m;
       m += 1;
     }
+    this._setPinned(pinned);
+    this._markAllLive();
     for (let i = m; i < n; i += 1) { outSites[i * SITE_FLOATS] = -1; outSites[i * SITE_FLOATS + 1] = -1; }
     device.queue.writeBuffer(this.sitesBuf, 0, outSites);
     device.queue.writeBuffer(this.adamBuf, 0, outAdam);
@@ -1207,6 +1378,11 @@ export class Trainer {
     updateGradParamsBuffer(device.queue, this.gradParams, m, this.invScaleSq);
     this.growPending = null; // site ids changed
     this._rebuildCandidates(m);
+  }
+
+  _setPinned(pinned) {
+    this.sitePinned = pinned;
+    this.device.queue.writeBuffer(this.sitePinBuf, 0, pinned);
   }
 
   // Insertion growth (insert.js): up to `count` new sites picked greedily by
@@ -1314,6 +1490,7 @@ export class Trainer {
     }
     queue.writeBuffer(this.adamBuf, n0 * ADAM_FLOATS * 4, adamNew);
     this.siteBirthGen.fill(this.growGen, n0, n0 + k);
+    this._markAllLive();
     this.growPending = { it, sites: batch.predicted.map((predicted, j) => ({ id: n0 + j, predicted })) };
 
     const n1 = n0 + k;
@@ -1618,7 +1795,7 @@ export class Trainer {
     const encoder = device.createCommandEncoder();
     encoder.clearBuffer(this._gnBuf);
     this.gnEnc.encode(encoder, this.sitesBuf, this.gradParams,
-      this.cand0A, this.cand1A, this.fitTex, this.maskTex,
+      this.cand0A, this.cand1A, this.fitTex, this.maskBuf,
       this._gnBuf, this.width, this.height);
     encoder.copyBufferToBuffer(this._gnBuf, 0, staging, 0, bytes);
     device.queue.submit([encoder.finish()]);
@@ -1672,6 +1849,35 @@ export class Trainer {
       pruneMerged: this.pruneMerged,
       activeSites: this.activeEstimate,
       trainSeconds: (performance.now() - this.trainStartMs) / 1000,
+      diag: await this._infoDiag(sitesArray),
+    };
+  }
+
+  // Layer / info-pass state at the end of a run: the histogram mode, whether
+  // a layer was added, the mean loss weight over masked pixels, the committed
+  // fraction ("commit") and how many active unpinned sites were frozen.
+  async _infoDiag(sitesRgb) {
+    const n = this.width * this.height;
+    const [weight, settled, live] = await Promise.all([
+      readBufferF32(this.device, this.lossWeightBuf, n),
+      readBufferU32(this.device, this.settledBuf, n),
+      readBufferU32(this.device, this.siteLiveBuf, this.actualSites),
+    ]);
+    let wsum = 0, counted = 0, committed = 0;
+    for (let p = 0; p < n; p += 1) {
+      if (this.maskCpu && !(this.maskCpu[p] > 0)) continue;
+      counted += 1;
+      wsum += weight[p];
+      if (this.args.info === "commit" && settled[p] >= this.args.commitAfter) committed += 1;
+    }
+    let frozen = 0;
+    for (let i = 0; i < this.actualSites; i += 1) {
+      if (sitesRgb[i * SITE_FLOATS] >= 0 && !this.sitePinned[i] && !live[i]) frozen += 1;
+    }
+    return {
+      modeMass: this.histMode.mass, layer: this.layerIndex === null ? 0 : 1,
+      meanWeight: counted ? wsum / counted : 0, committedFrac: counted ? committed / counted : 0,
+      frozenSites: this.args.info === "commit" && this.args.commitFreeze ? frozen : 0,
     };
   }
 
@@ -1694,6 +1900,7 @@ export class Trainer {
       ...(this.growJfaParams || []), this.siteStatsParams, this.siteStatsBuf,
       this.bestSitesBuf, this.bestAdamBuf, this.rebuildParams, this.editSeedParams,
       this.pruneSitesBuf, this.pruneAdamBuf,
+      this.sitePinBuf, this.siteLiveBuf, this.maskBuf, this.lossWeightBuf, this.settledBuf, this.infoParams,
     ];
     if (this.hilbertRes) {
       owned.push(this.hilbertRes.pairs, this.hilbertRes.order, this.hilbertRes.pos);
@@ -1828,6 +2035,20 @@ function computeGradStats(raw, siteCount, numPixels) {
   });
   return { groups, sites: counted };
 }
+
+async function readBufferBytes(device, buffer, bytes) {
+  const staging = device.createBuffer({ size: Math.max(4, bytes), usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+  const encoder = device.createCommandEncoder();
+  encoder.copyBufferToBuffer(buffer, 0, staging, 0, Math.max(4, bytes));
+  device.queue.submit([encoder.finish()]);
+  await staging.mapAsync(GPUMapMode.READ);
+  const out = staging.getMappedRange().slice(0);
+  staging.unmap();
+  staging.destroy();
+  return out;
+}
+const readBufferF32 = async (device, buffer, count) => new Float32Array(await readBufferBytes(device, buffer, count * 4));
+const readBufferU32 = async (device, buffer, count) => new Uint32Array(await readBufferBytes(device, buffer, count * 4));
 
 // Mean training loss per sample over the masked pixels: |r| for "l1", r² for
 // "l2" (NaN → 0, +Inf → 1, as in computePsnrSafe).

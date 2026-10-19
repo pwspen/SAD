@@ -1,10 +1,16 @@
 // Adam step over the interleaved f32-bit `grads` buffer (layout in
 // gradients_tiled.wgsl); clears each site's gradients after use.
+// Sites with sitePin != 0 (e.g. the histogram layer) never move. With
+// params.freeze_unlive, neither do sites the last info pass found serving no
+// pixel still in the loss (siteLive == 0, info_update.wgsl); their first
+// moments are dropped so they wake up without stale momentum.
 
 @group(0) @binding(0) var<storage, read_write> sites : array<Site>;
 @group(0) @binding(1) var<storage, read_write> adam : array<f32>;
 @group(0) @binding(2) var<storage, read_write> grads : array<atomic<u32>>;
 @group(0) @binding(3) var<uniform> params : AdamParams;
+@group(0) @binding(4) var<storage, read> sitePin : array<u32>;
+@group(0) @binding(5) var<storage, read> siteLive : array<u32>;
 
 fn loadGrad(i : u32) -> f32 { return bitcast<f32>(atomicLoad(&grads[i])); }
 
@@ -33,6 +39,16 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   if (is_bad(g_log_aniso)) { g_log_aniso = 0.0; }
 
   if (sites[idx].position.x < 0.0) { return; }
+  if (sitePin[idx] != 0u || (params.freeze_unlive != 0u && siteLive[idx] == 0u)) {
+    // First moments (layout below): pos 0-1, log_tau 4, radius 6, color 8-10,
+    // dir 14-15, log_aniso 18.
+    let b = idx * 24u;
+    adam[b + 0u] = 0.0; adam[b + 1u] = 0.0; adam[b + 4u] = 0.0; adam[b + 6u] = 0.0;
+    adam[b + 8u] = 0.0; adam[b + 9u] = 0.0; adam[b + 10u] = 0.0;
+    adam[b + 14u] = 0.0; adam[b + 15u] = 0.0; adam[b + 18u] = 0.0;
+    for (var c = 0u; c < 10u; c = c + 1u) { atomicStore(&grads[base_g + c], 0u); }
+    return;
+  }
   if (is_bad(sites[idx].position.x) || is_bad(sites[idx].position.y) || is_bad(sites[idx].log_tau) ||
       is_bad(sites[idx].radius_sq) || is_bad3(site_color(sites[idx])) || is_bad(sites[idx].log_aniso) ||
       is_bad(g_pos.x) || is_bad(g_pos.y) || is_bad(g_log_tau) || is_bad(g_radius_sq) ||

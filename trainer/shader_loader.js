@@ -33,8 +33,6 @@ const SHADER_FILES = [
   "seed_cand",
   "vpt",
   "candidate_pack",
-  "jfa_clear",
-  "jfa_flood",
   "render_compute",
   "gradients_tiled",
   "adam",
@@ -49,6 +47,7 @@ const SHADER_FILES = [
   "render_tau_heatmap",
   "grow_blur",
   "site_stats",
+  "info_update",
 ];
 
 let _cache = null;
@@ -102,8 +101,6 @@ export async function loadShaders({ tileSlots = 128, readText = fetchText } = {}
     SEED_CAND: out.seed_cand,
     VPT: out.vpt,
     CANDIDATE_PACK: out.candidate_pack,
-    JFA_CLEAR: out.jfa_clear,
-    JFA_FLOOD: out.jfa_flood,
     RENDER: out.render_compute,
     GRADIENTS_TILED: withTileSlots(out.gradients_tiled, tileSlots),
     ADAM: out.adam,
@@ -118,6 +115,7 @@ export async function loadShaders({ tileSlots = 128, readText = fetchText } = {}
     RENDER_TAU_HEATMAP: out.render_tau_heatmap,
     GROW_BLUR: out.grow_blur,
     SITE_STATS: out.site_stats,
+    INFO_UPDATE: out.info_update,
     tileSlots,
   };
   return _cache;

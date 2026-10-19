@@ -87,7 +87,7 @@ struct Params {
   candDownscale : u32,
   candWidth : u32,
   candHeight : u32,
-  _pad0 : u32,
+  globalCand : u32, // vpt: a site id offered to every pixel (none if >= siteCount)
   _pad1 : u32,
 }
 
@@ -145,7 +145,7 @@ struct AdamParams {
   height : u32,
   grow_gen : u32,      // growth steps so far
   grow_lr_decay : f32, // per-site LR × this per growth step since the site's birth step
-  _pad0 : u32,
+  freeze_unlive : u32, // 1 = skip sites that serve no pixel still in the loss (siteLive == 0)
   _pad1 : u32,
 }
 
@@ -314,6 +314,49 @@ fn voronoi_dmix2_fast(site : Site, uv : vec2<f32>, invScaleSq : f32, inv_scale :
   return (sqrt(d2_safe) - r_norm);
 }
 
+const NEG_INF : f32 = -1e30;
+
+// The 8 candidate site ids stored in a candidate texel pair (cand0, cand1).
+fn cand_ids(c0 : vec4<u32>, c1 : vec4<u32>) -> array<u32, 8> {
+  return array<u32, 8>(c0.x, c0.y, c0.z, c0.w, c1.x, c1.y, c1.z, c1.w);
+}
+
+// A site's blend logit at pixel uv, -tau * (d - r) (voronoi_dmix2_fast), or
+// NEG_INF for an inactive site or non-finite parameters. Every kernel that
+// blends sites (render, gradients, site stats, info) goes through this and
+// softmax8, so they agree on the weights.
+fn site_logit(site : Site, uv : vec2<f32>, invScaleSq : f32, inv_scale : f32) -> f32 {
+  if (site.position.x < 0.0 || is_bad(site.position.x) || is_bad(site.position.y) ||
+      is_bad(site.log_tau) || is_bad(site.log_aniso)) { return NEG_INF; }
+  let tau = exp(site.log_tau);
+  if (is_bad(tau)) { return NEG_INF; }
+  let dmix2 = voronoi_dmix2_fast(site, uv, invScaleSq, inv_scale);
+  if (is_bad(dmix2)) { return NEG_INF; }
+  let l = -tau * dmix2;
+  if (is_bad(l)) { return NEG_INF; }
+  return l;
+}
+
+// Normalized softmax weights of 8 logits (NEG_INF = no site). All zero when
+// no logit is finite.
+fn softmax8(logits : array<f32, 8>) -> array<f32, 8> {
+  var w : array<f32, 8>;
+  var m = NEG_INF;
+  for (var i = 0u; i < 8u; i = i + 1u) { m = max(m, logits[i]); }
+  if (m <= -1e29 || is_bad(m)) { return w; }
+  var s = 0.0;
+  for (var i = 0u; i < 8u; i = i + 1u) {
+    var e = exp(logits[i] - m);
+    if (is_bad(e)) { e = 0.0; }
+    w[i] = e;
+    s = s + e;
+  }
+  if (is_bad(s) || !(s > 0.0)) { return array<f32, 8>(); }
+  let inv = 1.0 / max(s, 1e-8);
+  for (var i = 0u; i < 8u; i = i + 1u) { w[i] = w[i] * inv; }
+  return w;
+}
+
 // Insert candidate into sorted list of 4 (for JFA flood - same as Metal insertClosest4)
 fn insertClosest4(
   bestIdx : ptr<function, array<u32, 4>>,
@@ -409,12 +452,12 @@ fn insertClosest8(
   (*bestIdx)[insertPos] = candIdx;
 }
 
+// END COMMON
+
 // ==================== CLEAR CANDIDATES ====================
 @group(0) @binding(0) var<uniform> clearParams : Params;
 @group(0) @binding(1) var clearCand0 : texture_storage_2d<rgba32uint, write>;
 
-
-// END COMMON
 @compute @workgroup_size(8, 8)
 fn clearCandidates(@builtin(global_invocation_id) gid : vec3<u32>) {
   if (gid.x >= clearParams.candWidth || gid.y >= clearParams.candHeight) { return; }

@@ -766,6 +766,15 @@
           <div class="tip" role="tooltip">Once growth is over (any time with a fixed count), merge neighbouring sites that don't pay for their 128 bits. Each step scores every pair of neighbouring cells by how much squared error merging them would add with the merged cell at its mean color (Ward's criterion), and merges the cheapest pairs whose cost is below what a site's bits are worth. The merged site is the pixel-count-weighted average of both sites' parameters (anisotropy axes averaged as orientations). The next step keeps the batch only if the render's description length (as <b>keep best → description length</b>) went down; otherwise it's undone and pruning ends. In tests on MNIST, growing to 64 and pruning ended at ~18 sites, better in both sites and error than a fixed 16; on Kodak at 256 px it kept all 800.</div>
         </div>
 
+        <div class="param">
+          <div class="row"><label>layer</label><select id="p-layer" aria-label="Histogram layer"></select></div>
+          <div class="tip" role="tooltip">When one exact 8-bit color covers at least half the pixels (MNIST's black: ~80%), that color becomes a flat layer behind every site: a pinned site with a constant logit of 0, offered to every pixel. A site then wins wherever it reaches past the layer (inside its radius), and the layer's color shows everywhere else, so no sites are spent drawing it. It never moves or splits, counts as one of the sites, and is an ordinary site in the saved file. Images without a dominant color (Kodak) are left alone.</div>
+        </div>
+        <div class="param">
+          <div class="row"><label>remaining info</label><select id="p-info" aria-label="Remaining-information weighting"></select></div>
+          <div class="tip" role="tooltip">Every candidate update, each pixel's error is measured in 8-bit levels; under half a level the decoded pixel is already exact. <b>dead zone</b>: pixels under 1/4 level drop out of the loss and the growth statistics, ramping back in by 1/2 level. <b>commit settled pixels</b>: pixels exact for 4 checks in a row leave the loss (re-checked each pass, and back if they drift); sites that only touch committed pixels stop moving. PSNR, keep best and pruning still score every pixel.</div>
+        </div>
+
         <h3>Logging</h3>
         <div class="param">
           <div class="row"><label>refresh every</label><input id="p-logFreq" type="number" /></div>

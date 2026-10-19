@@ -93,28 +93,43 @@ export function mergeCost({ count, sum }, i, j) {
   return (ni * nj) / (ni + nj) * d2;
 }
 
+// Cost of a pinned site p (fixed RGB color, e.g. the histogram layer)
+// absorbing cell j unchanged: j's pixels move from their mean to p's color.
+function absorbCost({ count, sum }, color, j) {
+  const nj = count[j];
+  if (!(nj > 0)) return 0;
+  let d2 = 0;
+  for (let c = 0; c < 3; c += 1) d2 += (sum[j * 3 + c] / nj - color[c]) ** 2;
+  return nj * d2;
+}
+
 // The merges that pay for themselves, cheapest first, each site at most once:
 // [{ keep, drop, cost }] with `keep` the larger cell. `samples` = masked
 // pixels × 3. With `count`, the `count` cheapest merges instead, paying or
-// not (a count schedule going down).
-export function pickMerges(moments, samples, bitsPerSite, { count = null } = {}) {
+// not (a count schedule going down). `pinned`: Map(id → RGB) of sites that are
+// never dropped; one is always the `keep` of its merges and absorbs the other
+// cell at its own color (absorbCost). Two pinned sites never merge.
+export function pickMerges(moments, samples, bitsPerSite, { count = null, pinned = new Map() } = {}) {
   const frac = Math.pow(2, (2 * bitsPerSite) / Math.max(1, samples)) - 1;
   let err = cellSse(moments);
   const options = [];
   for (const key of moments.pairs.keys()) {
     const [i, j] = key.split(",").map(Number);
-    options.push({ i, j, cost: mergeCost(moments, i, j) });
+    if (pinned.has(i) && pinned.has(j)) continue;
+    const pin = pinned.has(i) ? i : pinned.has(j) ? j : null;
+    const cost = pin === null ? mergeCost(moments, i, j) : absorbCost(moments, pinned.get(pin), pin === i ? j : i);
+    options.push({ i, j, cost, pin });
   }
   options.sort((a, b) => a.cost - b.cost);
   const used = new Set();
   const merges = [];
-  for (const { i, j, cost } of options) {
+  for (const { i, j, cost, pin } of options) {
     if (count != null ? merges.length >= count : !(cost < err * frac)) break;
     if (used.has(i) || used.has(j)) continue;
     used.add(i);
     used.add(j);
     err += cost;
-    const keep = moments.count[i] >= moments.count[j] ? i : j;
+    const keep = pin ?? (moments.count[i] >= moments.count[j] ? i : j);
     merges.push({ keep, drop: keep === i ? j : i, cost });
   }
   return merges;

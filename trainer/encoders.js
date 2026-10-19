@@ -145,47 +145,6 @@ export class SeedCandidatesEncoder {
   }
 }
 
-export class JFAClearEncoder {
-  constructor(device, shaders) {
-    this.device = device;
-    this.pipeline = makePipeline(device, shaders.JFA_CLEAR);
-    this._views = new Map();
-    this._bgs = new Map();
-  }
-  encode(encoder, paramsBuf, cand0, cand1, candWidth, candHeight) {
-    const entries = [
-      { binding: 0, resource: { buffer: paramsBuf } },
-      { binding: 1, resource: getTextureView(this._views, cand0) },
-      { binding: 2, resource: getTextureView(this._views, cand1) },
-    ];
-    const layout = this.pipeline.getBindGroupLayout(0);
-    const bg = getBindGroup(this.device, this._bgs, layout, entries);
-    dispatch2D(encoder, this.pipeline, bg,
-      Math.ceil(candWidth / 16), Math.ceil(candHeight / 16));
-  }
-}
-
-export class JFAFloodEncoder {
-  constructor(device, shaders) {
-    this.device = device;
-    this.pipeline = makePipeline(device, shaders.JFA_FLOOD);
-    this._views = new Map();
-    this._bgs = new Map();
-  }
-  encode(encoder, sitesBuffer, paramsBuf, candIn, candOut, candWidth, candHeight) {
-    const entries = [
-      { binding: 0, resource: { buffer: sitesBuffer } },
-      { binding: 1, resource: { buffer: paramsBuf } },
-      { binding: 2, resource: getTextureView(this._views, candIn) },
-      { binding: 3, resource: getTextureView(this._views, candOut) },
-    ];
-    const layout = this.pipeline.getBindGroupLayout(0);
-    const bg = getBindGroup(this.device, this._bgs, layout, entries);
-    dispatch2D(encoder, this.pipeline, bg,
-      Math.ceil(candWidth / 16), Math.ceil(candHeight / 16));
-  }
-}
-
 export class CandidatePackEncoder {
   constructor(device, shaders) {
     this.device = device;
@@ -238,8 +197,9 @@ export class GradientsEncoder {
     this._bgs = new Map();
   }
   // gradsBuffer is the consolidated interleaved atomic<i32> buffer of size
-  // capacity * 10; index with `idx * 10 + channel`.
-  encode(encoder, sitesBuffer, gradParams, cand0, cand1, targetTex, maskTex,
+  // capacity * 10; index with `idx * 10 + channel`. weightBuffer: per-pixel
+  // loss weight, f32 W*H (the mask, or info_update's weights).
+  encode(encoder, sitesBuffer, gradParams, cand0, cand1, targetTex, weightBuffer,
          gradsBuffer, width, height) {
     const entries = [
       { binding: 0, resource: { buffer: sitesBuffer } },
@@ -248,7 +208,7 @@ export class GradientsEncoder {
       { binding: 3, resource: getTextureView(this._views, cand1) },
       { binding: 4, resource: getTextureView(this._views, targetTex) },
       { binding: 5, resource: { buffer: gradsBuffer } },
-      { binding: 6, resource: getTextureView(this._views, maskTex) },
+      { binding: 6, resource: { buffer: weightBuffer } },
     ];
     const layout = this.pipeline.getBindGroupLayout(0);
     const bg = getBindGroup(this.device, this._bgs, layout, entries);
@@ -263,12 +223,15 @@ export class AdamEncoder {
     this.pipeline = makePipeline(device, shaders.ADAM);
     this._bgs = new Map();
   }
-  encode(encoder, sitesBuffer, adamBuffer, gradsBuffer, adamParams, siteCount) {
+  // sitePin / siteLive: u32 per site (see adam.wgsl).
+  encode(encoder, sitesBuffer, adamBuffer, gradsBuffer, adamParams, siteCount, sitePin, siteLive) {
     const entries = [
       { binding: 0, resource: { buffer: sitesBuffer } },
       { binding: 1, resource: { buffer: adamBuffer } },
       { binding: 2, resource: { buffer: gradsBuffer } },
       { binding: 3, resource: { buffer: adamParams } },
+      { binding: 4, resource: { buffer: sitePin } },
+      { binding: 5, resource: { buffer: siteLive } },
     ];
     const layout = this.pipeline.getBindGroupLayout(0);
     const bg = getBindGroup(this.device, this._bgs, layout, entries);
@@ -457,7 +420,7 @@ export class SiteStatsEncoder {
     this.pipeline = makePipeline(device, shaders.SITE_STATS);
     this._views = new Map();
   }
-  encode(encoder, sitesBuffer, statsParams, cand0, cand1, fitTex, maskTex, statsBuffer, width, height) {
+  encode(encoder, sitesBuffer, statsParams, cand0, cand1, fitTex, weightBuffer, statsBuffer, width, height, sitePin) {
     const view = (t) => getTextureView(this._views, t);
     const bg = this.device.createBindGroup({ layout: this.pipeline.getBindGroupLayout(0), entries: [
       { binding: 0, resource: { buffer: sitesBuffer } },
@@ -465,10 +428,37 @@ export class SiteStatsEncoder {
       { binding: 2, resource: view(cand0) },
       { binding: 3, resource: view(cand1) },
       { binding: 4, resource: view(fitTex) },
-      { binding: 5, resource: view(maskTex) },
+      { binding: 5, resource: { buffer: weightBuffer } },
       { binding: 6, resource: { buffer: statsBuffer } },
+      { binding: 7, resource: { buffer: sitePin } },
     ] });
     encoder.clearBuffer(statsBuffer);
+    dispatch2D(encoder, this.pipeline, bg, Math.ceil(width / 16), Math.ceil(height / 16));
+  }
+}
+
+// Remaining-information pass (info_update.wgsl): per-pixel loss weights and
+// commit counts, plus which sites still serve a pixel in the loss.
+export class InfoEncoder {
+  constructor(device, shaders) {
+    this.device = device;
+    this.pipeline = makePipeline(device, shaders.INFO_UPDATE);
+    this._views = new Map();
+  }
+  encode(encoder, { sites, params, cand0, cand1, targetTex, mask, weight, settled, siteLive, width, height }) {
+    const view = (t) => getTextureView(this._views, t);
+    const bg = this.device.createBindGroup({ layout: this.pipeline.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: { buffer: sites } },
+      { binding: 1, resource: { buffer: params } },
+      { binding: 2, resource: view(cand0) },
+      { binding: 3, resource: view(cand1) },
+      { binding: 4, resource: view(targetTex) },
+      { binding: 5, resource: { buffer: mask } },
+      { binding: 6, resource: { buffer: weight } },
+      { binding: 7, resource: { buffer: settled } },
+      { binding: 8, resource: { buffer: siteLive } },
+    ] });
+    encoder.clearBuffer(siteLive);
     dispatch2D(encoder, this.pipeline, bg, Math.ceil(width / 16), Math.ceil(height / 16));
   }
 }
