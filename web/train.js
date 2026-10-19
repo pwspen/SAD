@@ -621,8 +621,7 @@ function buildCards(name) {
     }
     if (view.hit) attachPlotHover(view, card, canvas);
     if (state.editing) {
-      const r = viewRect(grid, id);
-      attachEditControls(view, id, card, label, r.r0, r.c0);
+      attachEditControls(view, id, card, label, grid);
     }
     root.append(card);
     view.card = card;
@@ -724,6 +723,36 @@ async function editLayout(mutate) {
   const base = LAYOUTS[state.layoutName];
   const grid = activeGrid();
   const rowCount = grid.length;
+// Grows (d = +1) or shrinks (d = -1) view `id` by one cell along `axis`
+// ("w" or "h"), at its right / bottom edge. Growing past the grid's edge adds
+// an empty column / row; it needs the cells it takes to be empty. Returns
+// false if not allowed.
+function resizeView(grid, id, axis, d) {
+  const s = viewRect(grid, id);
+  if (axis === "w") {
+    if (d < 0) {
+      if (s.c1 === s.c0) return false;
+      for (let r = s.r0; r <= s.r1; r += 1) grid[r][s.c1] = ".";
+      return true;
+    }
+    const c = s.c1 + 1;
+    if (c === grid[0].length) for (const row of grid) row.push(".");
+    for (let r = s.r0; r <= s.r1; r += 1) if (grid[r][c] !== ".") return false;
+    for (let r = s.r0; r <= s.r1; r += 1) grid[r][c] = id;
+    return true;
+  }
+  if (d < 0) {
+    if (s.r1 === s.r0) return false;
+    for (let c = s.c0; c <= s.c1; c += 1) grid[s.r1][c] = ".";
+    return true;
+  }
+  const r = s.r1 + 1;
+  if (r === grid.length) grid.push(grid[0].map(() => "."));
+  for (let c = s.c0; c <= s.c1; c += 1) if (grid[r][c] !== ".") return false;
+  for (let c = s.c0; c <= s.c1; c += 1) grid[r][c] = id;
+  return true;
+}
+
   if (mutate(grid) === false) return;
   const areas = gridToAreas(grid);
   try {
@@ -770,7 +799,8 @@ function attachDropTarget(el, r, c) {
   });
 }
 
-function attachEditControls(view, id, card, label, r, c) {
+function attachEditControls(view, id, card, label, grid) {
+  const rect = viewRect(grid, id);
   label.draggable = true;
   label.addEventListener("dragstart", (ev) => {
     state.dragId = id;
@@ -784,7 +814,8 @@ function attachEditControls(view, id, card, label, r, c) {
     card.classList.remove("dragging");
     ui.canvases.classList.remove("drag-active");
   });
-  attachDropTarget(card, r, c);
+  attachDropTarget(card, rect.r0, rect.c0);
+  card.append(sizeControls(view, id, grid, rect));
   const remove = document.createElement("button");
   remove.className = "card-remove";
   remove.textContent = "×";
@@ -805,6 +836,34 @@ function emptyCell(placed, r, c) {
   const free = Object.keys(VIEWS).filter((id) => !placed.includes(id));
   if (!free.length) {
     cell.textContent = "All views placed";
+// Width and height of a card in grid cells, each with − / + buttons
+// (resizeView); a button is disabled when its resize would be refused.
+function sizeControls(view, id, grid, rect) {
+  const bar = document.createElement("div");
+  bar.className = "card-size";
+  for (const [axis, name, n] of [["w", "width", rect.c1 - rect.c0 + 1], ["h", "height", rect.r1 - rect.r0 + 1]]) {
+    const group = document.createElement("span");
+    group.className = "card-size-group";
+    const button = (d, text) => {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.textContent = text;
+      const what = `${d > 0 ? "Grow" : "Shrink"} ${view.label} to ${name} ${n + d}`;
+      b.title = what;
+      b.setAttribute("aria-label", what);
+      b.disabled = resizeView(grid.map((row) => [...row]), id, axis, d) === false;
+      b.addEventListener("click", () => editLayout((g) => resizeView(g, id, axis, d)));
+      return b;
+    };
+    const value = document.createElement("span");
+    value.className = "card-size-value";
+    value.textContent = `${axis.toUpperCase()} ${n}`;
+    group.append(button(-1, "−"), value, button(1, "+"));
+    bar.append(group);
+  }
+  return bar;
+}
+
     return cell;
   }
   const select = document.createElement("select");
