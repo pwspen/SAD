@@ -3,18 +3,18 @@
 // (mask, init-sites, candidates/lr…) in the collapsible left panel, and a
 // side-by-side target vs reconstruction view, both aspect-fit.
 
-import { loadShaders, tileSlotsForLimit } from "../trainer/shader_loader.js?v=shared-wgsl-20261017";
-import { requestTrainingDevice } from "../trainer/device.js?v=shared-wgsl-20261017";
-import { Trainer, buildArgs, GRAD_GROUPS, lrSchedule, LR_SCHEDULES, LOSSES, GROW_MODES, GROW_CRITERIA, KEEP_BEST, COUNT_SCHEDULES, LAYER_MODES, INFO_MODES, countPlan, countVaries, countHorizon } from "../trainer/trainer.js?v=info-20261019";
-import { loadImageToFloat32, loadMaskRgba32Float, whiteMaskRgba32Float } from "../trainer/textures.js?v=shared-wgsl-20261017";
-import { loadSitesFromFile, serializeSitesTxt, triggerDownload, floatImageToRgba8, computeBpp, BITS_PER_SITE } from "../trainer/io.js?v=shared-wgsl-20261017";
-import { SITE_FLOATS } from "../trainer/params.js?v=shared-wgsl-20261017";
-import { COLOR_SPACES } from "../trainer/color_spaces.js?v=color-space-20261017";
+import { loadShaders, tileSlotsForLimit } from "../trainer/shader_loader.js?v=20261019";
+import { requestTrainingDevice } from "../trainer/device.js?v=20261019";
+import { Trainer, buildArgs, GRAD_GROUPS, lrSchedule, LR_SCHEDULES, LOSSES, GROW_MODES, GROW_CRITERIA, KEEP_BEST, COUNT_SCHEDULES, LAYER_MODES, INFO_MODES, countPlan, countVaries, countHorizon } from "../trainer/trainer.js?v=20261019";
+import { loadImageToFloat32, loadMaskRgba32Float, whiteMaskRgba32Float } from "../trainer/textures.js?v=20261019";
+import { loadSitesFromFile, serializeSitesTxt, triggerDownload, floatImageToRgba8, computeBpp, BITS_PER_SITE } from "../trainer/io.js?v=20261019";
+import { SITE_FLOATS } from "../trainer/params.js?v=20261019";
+import { COLOR_SPACES } from "../trainer/color_spaces.js?v=20261019";
 import {
   luma, maskWeights, laplacianBands, maskLevels, bandEnergies, IMPORTANCE, importanceMap,
   spectralPlan, windowedSpectrum, spectrumDiff, radialStats, frcCrossing, logPowerImage,
   mutualInfoMatrix, MI_BINS, neighborFeatures, NEIGHBOR_K, kMeans,
-} from "./analysis.js?v=site-clusters-20261018";
+} from "./analysis.js?v=20261019";
 
 const CONFIG_URL = "../training_config.json";
 // Saved settings (presets/<key>.json: { _note, args }, keys as in
@@ -3392,7 +3392,7 @@ function exportPng() {
 function exportSites() {
   if (!state.lastSites) return;
   const text = serializeSitesTxt(state.lastSites, state.lastSiteCount,
-    state.lastRender.width, state.lastRender.height);
+    state.lastRender.width, state.lastRender.height, { globalSite: state.trainer?.layerIndex ?? -1 });
   triggerDownload(new Blob([text], { type: "text/plain" }), `sad_${Date.now()}_sites.txt`);
   ui.savePopover.classList.add("hidden");
 }

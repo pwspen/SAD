@@ -1,3 +1,7 @@
+// Blends the candidates' colors, or with HASH_IDS each site's hashColor(id)
+// (the cell-id view).
+override HASH_IDS : bool = false;
+
 @group(0) @binding(0) var<storage, read> sites : array<Site>;
 @group(0) @binding(1) var<uniform> params : Params;
 @group(0) @binding(2) var inCand0 : texture_2d<u32>;
@@ -27,7 +31,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   var color = vec3<f32>(0.0);
   for (var i = 0u; i < NCAND; i = i + 1u) {
     if (weights[i] > 0.0) {
-      let c = site_color(sites[candIds[i]]);
+      let c = select(site_color(sites[candIds[i]]), hashColor(candIds[i]), HASH_IDS);
       if (!is_bad3(c)) { color = color + weights[i] * c; }
     }
   }

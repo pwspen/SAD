@@ -6,7 +6,7 @@
 
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
-import { COLOR_SPACES, specializeShaders } from "../trainer/color_spaces.js";
+import { COLOR_SPACES, specializeShaders } from "../trainer/color_spaces.js?v=20261019";
 
 const SHARED_URL = new URL("../shaders/sad_shared.wgsl", import.meta.url);
 
@@ -132,7 +132,7 @@ for (const [name, space] of Object.entries(COLOR_SPACES)) testJs(name, space, da
 
 if (!process.argv.includes("--no-gpu")) {
   const shared = await readFile(fileURLToPath(SHARED_URL), "utf8");
-  const common = shared.slice(shared.indexOf("// BEGIN COMMON") + 15, shared.indexOf("// END COMMON"));
+  const common = shared;
   globalThis.__keepGpu = await testGpu(common, data); // dawn.node segfaults if the GPU object is collected
 }
 

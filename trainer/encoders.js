@@ -2,7 +2,17 @@
 // One class per WGSL kernel entry point; bindings match the WGSL @group(0)
 // declarations one-for-one.
 
+// Pipelines per device, keyed by source, entry point and override constants:
+// every Trainer builds the same ~20, and compiling them again for each run of
+// a sweep cost twice the training time on MNIST.
+const pipelineCache = new WeakMap();
+
 function makePipeline(device, code, entryPoint = "main", constants = undefined) {
+  let cache = pipelineCache.get(device);
+  if (!cache) pipelineCache.set(device, (cache = new Map()));
+  const key = `${entryPoint}\n${JSON.stringify(constants ?? null)}\n${code}`;
+  const cached = cache.get(key);
+  if (cached) return cached;
   const module = device.createShaderModule({ code });
   if (module.getCompilationInfo) {
     module.getCompilationInfo().then((info) => {
@@ -13,10 +23,12 @@ function makePipeline(device, code, entryPoint = "main", constants = undefined) 
       }
     });
   }
-  return device.createComputePipeline({
+  const pipeline = device.createComputePipeline({
     layout: "auto",
     compute: { module, entryPoint, ...(constants ? { constants } : {}) },
   });
+  cache.set(key, pipeline);
+  return pipeline;
 }
 
 function getTextureView(viewCache, texture) {
@@ -28,22 +40,8 @@ function getTextureView(viewCache, texture) {
   return view;
 }
 
-function _unusedBindGroupKey(layout, entries) {
-  const parts = [layout];
-  for (const entry of entries) {
-    const binding = entry.binding;
-    const res = entry.resource;
-    if (res && typeof res === "object" && "buffer" in res) {
-      parts.push("b", binding, res.buffer);
-    } else {
-      parts.push("t", binding, res);
-    }
-  }
-  return parts.join("");
-}
-
-// Naive stringified cache keys (what the Python encoders do via id()) collide
-// in JS because all objects stringify the same. Fresh bind groups per dispatch.
+// Fresh bind groups per dispatch (cheap; caching them keyed on resources
+// isn't worth the bookkeeping).
 function getBindGroup(device, _cache, layout, entries) {
   return device.createBindGroup({ layout, entries });
 }
@@ -163,10 +161,12 @@ export class CandidatePackEncoder {
   }
 }
 
+// hashIds: color each site by hashColor(id) instead of its color (the
+// cell-id view).
 export class RenderEncoder {
-  constructor(device, shaders) {
+  constructor(device, shaders, { hashIds = false } = {}) {
     this.device = device;
-    this.pipeline = makePipeline(device, shaders.RENDER);
+    this.pipeline = makePipeline(device, shaders.RENDER, "main", { HASH_IDS: hashIds ? 1 : 0 });
     this._views = new Map();
     this._bgs = new Map();
   }
@@ -308,28 +308,6 @@ export class ClearBufferEncoder {
 
 // Softmax-blended hashColor rendering — same bindings as the normal render
 // kernel (sites, params, cand0, cand1, outTex).
-export class RenderHashedEncoder {
-  constructor(device, shaders) {
-    this.device = device;
-    this.pipeline = makePipeline(device, shaders.RENDER_HASHED);
-    this._views = new Map();
-    this._bgs = new Map();
-  }
-  encode(encoder, sitesBuffer, paramsBuf, cand0, cand1, outputTex, width, height) {
-    const entries = [
-      { binding: 0, resource: { buffer: sitesBuffer } },
-      { binding: 1, resource: { buffer: paramsBuf } },
-      { binding: 2, resource: getTextureView(this._views, cand0) },
-      { binding: 3, resource: getTextureView(this._views, cand1) },
-      { binding: 4, resource: getTextureView(this._views, outputTex) },
-    ];
-    const layout = this.pipeline.getBindGroupLayout(0);
-    const bg = getBindGroup(this.device, this._bgs, layout, entries);
-    dispatch2D(encoder, this.pipeline, bg,
-      Math.ceil(width / 16), Math.ceil(height / 16));
-  }
-}
-
 // Tau heatmap overlay — adds a TauHeatmapParams uniform (bind 5) on top of the
 // normal render bindings.
 export class RenderTauHeatmapEncoder {

@@ -11,8 +11,8 @@ import { dirname, join, resolve, basename } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 
-import { Trainer, buildArgs } from "../trainer/trainer.js";
-import { parseSitesTxt, serializeSitesTxt, computePsnr, computeBpp, BITS_PER_SITE } from "../trainer/io.js";
+import { Trainer, buildArgs } from "../trainer/trainer.js?v=20261019";
+import { parseSitesTxt, serializeSitesTxt, computePsnr, computeBpp, BITS_PER_SITE } from "../trainer/io.js?v=20261019";
 import {
   createHeadlessDevice,
   loadShadersFromDisk,
@@ -198,7 +198,7 @@ async function runOne(ctx, run) {
     if (cli["save-dir"]) {
       await writeFloatPng(join(cli["save-dir"], `${name}.png`), final.renderRgba, final.width, final.height);
       await writeFile(join(cli["save-dir"], `${name}_sites.txt`),
-        serializeSitesTxt(final.sites, final.count, final.width, final.height));
+        serializeSitesTxt(final.sites, final.count, final.width, final.height, { globalSite: final.globalSite }));
     }
     return {
       name, ...run, startedAt, status: "ok",

@@ -1,14 +1,18 @@
 // Sites .txt parsing + serialization. PNG download helper.
 // The .txt format matches what the former native backends read and wrote.
 
-import { SITE_FLOATS } from "./params.js";
+import { SITE_FLOATS } from "./params.js?v=20261019";
 
-// Returns { data: Float32Array of length count*SITE_FLOATS, width, height, count }.
+// Returns { data: Float32Array of length count*SITE_FLOATS, width, height, count,
+// globalSite } (globalSite: the row every pixel blends besides its candidate
+// list, e.g. the histogram layer, from a "# Global site: k" line; -1 if none).
 // Layout per site row: [pos_x, pos_y, log_tau, radius, color_r, color_g, color_b,
 // aniso_dir_x, aniso_dir_y, log_aniso]. The .txt file format written by
 // write_sites_txt orders the columns differently on disk — see below.
 export function parseSitesTxt(text) {
   const sizeRe = /image size\s*:?\s*(\d+)\s+(\d+)/i;
+  const globalRe = /global site\s*:?\s*(\d+)/i;
+  let globalSite = -1;
   let width = null;
   let height = null;
   const rows = [];
@@ -21,6 +25,8 @@ export function parseSitesTxt(text) {
         width = Number(m[1]);
         height = Number(m[2]);
       }
+      const g = globalRe.exec(line);
+      if (g) globalSite = Number(g[1]);
       continue;
     }
     const parts = line.split(/\s+/);
@@ -48,7 +54,7 @@ export function parseSitesTxt(text) {
     data[base + 8] = s[8]; // aniso_dir_y
     data[base + 9] = s[9]; // log_aniso
   }
-  return { data, width, height, count: rows.length };
+  return { data, width, height, count: rows.length, globalSite: globalSite < rows.length ? globalSite : -1 };
 }
 
 export async function loadSitesFromFile(file) {
@@ -58,11 +64,15 @@ export async function loadSitesFromFile(file) {
 
 // Serialize Float32Array (count*SITE_FLOATS) to the on-disk .txt format.
 // Only active sites (pos_x >= 0) are written, matching write_sites_txt().
-export function serializeSitesTxt(data, count, width, height) {
+// globalSite: index (among all `count`) of the site every pixel blends, or -1.
+export function serializeSitesTxt(data, count, width, height, { globalSite = -1 } = {}) {
   const active = [];
+  let globalRow = -1;
   for (let i = 0; i < count; i += 1) {
     const base = i * SITE_FLOATS;
-    if (data[base + 0] >= 0.0) active.push(base);
+    if (!(data[base + 0] >= 0.0)) continue;
+    if (i === globalSite) globalRow = active.length;
+    active.push(base);
   }
   const lines = [];
   lines.push(
@@ -71,6 +81,7 @@ export function serializeSitesTxt(data, count, width, height) {
   lines.push(`# Image size: ${width} ${height}`);
   lines.push(`# Total sites: ${active.length}`);
   lines.push(`# Active sites: ${active.length}`);
+  if (globalRow >= 0) lines.push(`# Global site: ${globalRow}`);
   for (const base of active) {
     lines.push(
       [

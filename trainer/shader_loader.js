@@ -1,6 +1,6 @@
 // WGSL assembly (originally ported from wgpu-py's sad_shaders.py).
-// Fetches sad_shared.wgsl (the COMMON block between // BEGIN COMMON / // END COMMON)
-// and concatenates it with each per-kernel snippet from shaders/wgsl/*.wgsl.
+// Fetches sad_shared.wgsl (structs and helpers every kernel shares) and
+// concatenates it with each per-kernel snippet from shaders/wgsl/*.wgsl.
 // gradients_tiled's `const TILE_SLOTS` line is rewritten at load time.
 
 // Channels per site in the interleaved gradient buffer (see gradients_tiled.wgsl).
@@ -43,7 +43,6 @@ const SHADER_FILES = [
   "tau_writeback",
   "hilbert",
   "radix_sort",
-  "render_hashed",
   "render_tau_heatmap",
   "grow_blur",
   "site_stats",
@@ -65,24 +64,13 @@ async function fetchText(url) {
   return await response.text();
 }
 
-function extractCommon(source) {
-  const beginMarker = "// BEGIN COMMON";
-  const endMarker = "// END COMMON";
-  const start = source.indexOf(beginMarker);
-  const end = source.indexOf(endMarker);
-  if (start === -1 || end === -1) {
-    throw new Error("Missing COMMON markers in sad_shared.wgsl");
-  }
-  return source.slice(start + beginMarker.length, end).trim() + "\n";
-}
 
 // tileSlots: gradient tile hash size (see tileSlotsForLimit).
 // readText: async (URL) => string; defaults to fetch().
 export async function loadShaders({ tileSlots = 128, readText = fetchText } = {}) {
   if (_cache && _cache.tileSlots === tileSlots) return _cache;
 
-  const commonSource = await readText(COMMON_URL);
-  const common = extractCommon(commonSource);
+  const common = await readText(COMMON_URL);
 
   const snippets = await Promise.all(
     SHADER_FILES.map((name) =>
@@ -111,7 +99,6 @@ export async function loadShaders({ tileSlots = 128, readText = fetchText } = {}
     TAU_WRITEBACK: out.tau_writeback,
     HILBERT: out.hilbert,
     RADIX_SORT: out.radix_sort,
-    RENDER_HASHED: out.render_hashed,
     RENDER_TAU_HEATMAP: out.render_tau_heatmap,
     GROW_BLUR: out.grow_blur,
     SITE_STATS: out.site_stats,

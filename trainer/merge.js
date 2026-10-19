@@ -16,10 +16,11 @@
 // their anisotropy axes as orientations: dir and −dir render the same, so
 // the axes are averaged as doubled angles.
 
-import { SITE_FLOATS } from "./params.js?v=lr-decay-20261018";
+import { SITE_FLOATS } from "./params.js?v=20261019";
 
-// Logit of site `b` (sites[b..b+SITE_FLOATS)) at pixel (x, y), as rendered.
-function siteLogit(sites, b, x, y, invScale) {
+// Logit of the site at sites[b..b+SITE_FLOATS) at pixel (x, y): the CPU copy
+// of site_logit in sad_shared.wgsl (merge.js and insert.js use it).
+export function siteLogit(sites, b, x, y, invScale) {
   const dx = x - sites[b], dy = y - sites[b + 1];
   const dirX = sites[b + 7], dirY = sites[b + 8];
   const proj = dirX * dx + dirY * dy;

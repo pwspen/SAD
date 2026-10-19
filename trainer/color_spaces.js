@@ -13,7 +13,7 @@
 // To add a space: add an entry here with the next id, add a case to the three
 // WGSL functions, and run the test.
 
-import { SITE_FLOATS } from "./params.js";
+import { SITE_FLOATS } from "./params.js?v=20261019";
 
 const COLOR_OFFSET = 4; // color_r/g/b within a site row (see io.js)
 

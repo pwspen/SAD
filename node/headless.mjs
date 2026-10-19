@@ -7,9 +7,9 @@ import { fileURLToPath } from "node:url";
 import { create, globals } from "webgpu";
 import { PNG } from "pngjs";
 
-import { requestTrainingDevice, adapterLabel } from "../trainer/device.js";
-import { loadShaders, tileSlotsForLimit } from "../trainer/shader_loader.js";
-import { floatImageToRgba8 } from "../trainer/io.js";
+import { requestTrainingDevice, adapterLabel } from "../trainer/device.js?v=20261019";
+import { loadShaders, tileSlotsForLimit } from "../trainer/shader_loader.js?v=20261019";
+import { floatImageToRgba8 } from "../trainer/io.js?v=20261019";
 
 // GPUBufferUsage, GPUMapMode, GPUTextureUsage, ... are globals in the browser.
 Object.assign(globalThis, globals);

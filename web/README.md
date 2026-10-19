@@ -20,8 +20,11 @@ All pages read hyperparameters from `training_config.json`.
 
 ## Viewer (`index.html`)
 
-- Load a `*_sites.txt` file with an `# Image size: W H` header.
+- Load a `*_sites.txt` file with an `# Image size: W H` header (and `# Global site: k` for a
+  histogram layer).
 - Choose render mode, toggle site dots, and export PNG.
+- It renders with the trainer's kernels (`trainer/candidates.js`, `render_compute.wgsl`), so a
+  file looks as it did in training.
 
 ## Trainer (`train.html`)
 
@@ -47,10 +50,5 @@ The page logs `BENCH_RESULT` with final PSNR, active sites, training time, and t
 
 ## Shader Source
 
-The viewer has `shaders.js` as a fallback with embedded WGSL. After editing any WGSL under `shaders/`, regenerate it with:
-
-```bash
-python shaders/gen_shaders_js.py
-```
-
-The trainer fetches WGSL at runtime and has no embedded fallback.
+Both pages fetch WGSL at runtime (serve over HTTP; ES modules and `fetch` don't work from
+`file://`).

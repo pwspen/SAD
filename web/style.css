@@ -151,8 +151,10 @@ canvas {
   height: 100%;
 }
 
-#gpuCanvas {
+#viewCanvas {
   background: var(--canvas-bg);
+  object-fit: contain;
+  image-rendering: pixelated;
 }
 
 .fallback {

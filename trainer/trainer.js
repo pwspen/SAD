@@ -6,10 +6,8 @@
 import {
   SITE_FLOATS,
   ADAM_FLOATS,
-  PACKED_CAND_BYTES,
   TAU_DIFFUSE_PASSES,
   TAU_DIFFUSE_LAMBDA,
-  PARAMS_SIZE,
   createParamsBuffer,
   updateParamsBuffer,
   createInitParamsBuffer,
@@ -19,65 +17,52 @@ import {
   createClearParamsBuffer,
   createTauParamsBuffer,
   updateTauParamsBuffer,
-  createHilbertParamsBuffer,
-  updateHilbertParamsBuffer,
   updateGradParamsBuffer,
   updateClearParamsBuffer,
   createUniform32,
   updateGrowBlurParamsBuffer,
   updateInfoParamsBuffer,
-  packJumpStep,
-  hilbertBitsForSize,
-} from "./params.js?v=info-20261019";
+} from "./params.js?v=20261019";
 
 import {
   createSitesBuffer,
   createAdamBuffer,
-  createPackedCandidatesBuffer,
   createSeedCounter,
   createGradsBuffer,
   createAtomicU32Buffer,
-  createHilbertBuffers,
-  createDummyStorageBuffer,
   readSites,
-} from "./buffers.js?v=shared-wgsl-20261017";
+} from "./buffers.js?v=20261019";
 
 import {
   createRgba32FloatTexture,
-  createCandidateTexture,
   writeFloat32ToRgba32FloatTexture,
   readRgba32FloatTexture,
   whiteMaskRgba32Float,
-} from "./textures.js?v=shared-wgsl-20261017";
+} from "./textures.js?v=20261019";
 
 import {
   InitGradientEncoder,
-  CandidatesEncoder,
-  SeedCandidatesEncoder,
-  CandidatePackEncoder,
   RenderEncoder,
-  RenderHashedEncoder,
   RenderTauHeatmapEncoder,
   GradientsEncoder,
   AdamEncoder,
   TauEncoder,
   ClearBufferEncoder,
-  HilbertEncoder,
   GrowEncoder,
   SiteStatsEncoder,
   InfoEncoder,
-} from "./encoders.js?v=info-20261019";
+} from "./encoders.js?v=20261019";
 
-import { RadixSortUInt2 } from "./radix_sort.js?v=shared-wgsl-20261017";
-import { BITS_PER_SITE } from "./io.js";
-import { insertionField, pickInsertions } from "./insert.js?v=insert-20261018";
-import { cellMoments, pickMerges, mergedSite } from "./merge.js?v=info-20261019";
+import { BITS_PER_SITE } from "./io.js?v=20261019";
+import { insertionField, pickInsertions } from "./insert.js?v=20261019";
+import { cellMoments, pickMerges, mergedSite } from "./merge.js?v=20261019";
+import { CandidateLists } from "./candidates.js?v=20261019";
 import {
   colorSpaceFor,
   specializeShaders,
   encodeSiteColors,
   decodeSiteColors,
-} from "./color_spaces.js?v=color-space-20261017";
+} from "./color_spaces.js?v=20261019";
 
 const MAX_PREVIEW_IMAGE_READBACKS = 2;
 // Direction/anisotropy start learning here. Previously derived from the prune
@@ -479,23 +464,18 @@ export class Trainer {
     this.onLog = onLog;
     this.signal = signal;
 
-    this.usesHilbert = args.candHilbertWindow > 0 && args.candHilbertProbes > 0;
     this._previewImageInFlight = 0;
     this._previewSiteInFlight = 0;
 
     // Encoders
     this.initEnc = new InitGradientEncoder(device, shaders);
-    this.candsEnc = new CandidatesEncoder(device, shaders);
-    this.seedEnc = new SeedCandidatesEncoder(device, shaders);
-    this.packEnc = new CandidatePackEncoder(device, shaders);
     this.renderEnc = new RenderEncoder(device, shaders);
-    this.renderHashedEnc = new RenderHashedEncoder(device, shaders);
+    this.renderIdsEnc = new RenderEncoder(device, shaders, { hashIds: true });
     this.renderTauEnc = new RenderTauHeatmapEncoder(device, shaders);
     this.gradsEnc = new GradientsEncoder(device, shaders, { loss: LOSSES[args.loss].id });
     this.adamEnc = new AdamEncoder(device, shaders);
     this.tauEnc = new TauEncoder(device, shaders);
     this.clearI32Enc = new ClearBufferEncoder(device, shaders, { useI32: true });
-    this.hilbertEnc = this.usesHilbert ? new HilbertEncoder(device, shaders) : null;
     // Whether the count changes is settled in prepare() (a loaded sites file
     // sets the start), so the growth kernels are always built.
     this.growEnc = new GrowEncoder(device, shaders);
@@ -510,9 +490,6 @@ export class Trainer {
 
     this.width = width;
     this.height = height;
-    this.candDownscale = Math.max(1, args.candDownscale);
-    this.candWidth = Math.max(1, Math.floor((width + this.candDownscale - 1) / this.candDownscale));
-    this.candHeight = Math.max(1, Math.floor((height + this.candDownscale - 1) / this.candDownscale));
     this.target = targetRgba32f; // keep a CPU copy for PSNR
     this.maskSum = maskSum;
     this.maskCpu = null;
@@ -549,7 +526,6 @@ export class Trainer {
 
     // Buffers
     this.sitesBuf = createSitesBuffer(device, this.bufferCapacity);
-    this.packedSitesBuf = createPackedCandidatesBuffer(device, this.bufferCapacity);
     this.adamBuf = createAdamBuffer(device, this.bufferCapacity);
     this.seedCounter = createSeedCounter(device);
     this.grads = createGradsBuffer(device, this.bufferCapacity);
@@ -577,21 +553,17 @@ export class Trainer {
     this.settledBuf = device.createBuffer({ size: width * height * 4, usage: storage });
     this.infoParams = createUniform32(device);
 
-    // Candidate textures
-    this.cand0A = createCandidateTexture(device, this.candWidth, this.candHeight);
-    this.cand0B = createCandidateTexture(device, this.candWidth, this.candHeight);
-    this.cand1A = createCandidateTexture(device, this.candWidth, this.candHeight);
-    this.cand1B = createCandidateTexture(device, this.candWidth, this.candHeight);
+    // Candidate lists (candidates.js)
+    this.cands = new CandidateLists(device, shaders, { ...args, width, height, capacity: this.bufferCapacity });
+    this.cands.globalCand = this._globalCand();
+    this.candWidth = this.cands.candWidth;
+    this.candHeight = this.cands.candHeight;
+    this.candDownscale = this.cands.downscale;
 
     // Render texture
     this.renderTex = createRgba32FloatTexture(device, width, height, { storage: true, copyDst: false, copySrc: true });
 
     // Param buffers
-    this.candUpdatePasses = Math.max(1, args.candUpdatePasses);
-    this.candParams = [];
-    for (let i = 0; i < this.candUpdatePasses; i += 1) {
-      this.candParams.push(createParamsBuffer(device, this._paramsArgs(initSiteCount, 0, 0)));
-    }
     this.renderParams = createParamsBuffer(device, this._paramsArgs(initSiteCount, 0, 0));
 
     const invScaleSq = 1.0 / Math.pow(Math.max(width, height), 2);
@@ -605,24 +577,6 @@ export class Trainer {
     this.gradCountParams = createClearParamsBuffer(device, this.bufferCapacity * 10);
     this.tauParams = createTauParamsBuffer(device, initSiteCount, TAU_DIFFUSE_LAMBDA, this.candDownscale);
 
-    // Hilbert resources
-    this.dummyHilbertBuf = createDummyStorageBuffer(device);
-    if (this.usesHilbert) {
-      this.hilbertRes = createHilbertBuffers(device, this.bufferCapacity);
-      this.hilbertReady = false;
-      this.hilbertSiteCount = 0;
-      this.hilbertParams = createHilbertParamsBuffer(
-        device, 1, this.hilbertRes.paddedCount, width, height, hilbertBitsForSize(width, height),
-      );
-      this.hilbertSort = new RadixSortUInt2(device, shaders, this.hilbertRes.paddedCount);
-    } else {
-      this.hilbertRes = null;
-      this.hilbertReady = true;
-      this.hilbertSiteCount = 0;
-      this.hilbertParams = null;
-      this.hilbertSort = null;
-    }
-
     if (this.bufferCapacity > initSiteCount) {
       const inactive = new Float32Array((this.bufferCapacity - initSiteCount) * SITE_FLOATS);
       for (let i = 0; i < inactive.length; i += SITE_FLOATS) { inactive[i] = -1; inactive[i + 1] = -1; }
@@ -634,7 +588,6 @@ export class Trainer {
     if (this.usesGrow) {
       this.maskArea = maskSum > 0 ? maskSum : width * height;
       this.growBlurParams = createUniform32(device);
-      this.growSeedParams = createParamsBuffer(device, this._paramsArgs(initSiteCount, 0, 0));
       if (args.growBlur > 0) {
         this.blurTex = createRgba32FloatTexture(device, width, height, { storage: true, copyDst: false });
         this.blurTmpTex = createRgba32FloatTexture(device, width, height, { storage: true, copyDst: false });
@@ -690,24 +643,8 @@ export class Trainer {
         (args.layer === "learn" ? `, depth β starts at ${this._layerBeta0().toFixed(2)}` : ""));
     }
 
-    // Prime candidate state (init + seed) — mirrors the one-time setup in Python.
-    {
-      updateParamsBuffer(device.queue, this.candParams[0], this._paramsArgs(initSiteCount, 0, 0));
-      const encoder = device.createCommandEncoder();
-      this.candsEnc.encodeInit(encoder, this.candParams[0], this.cand0A, this.cand1A,
-                                this.candWidth, this.candHeight);
-      encoder.copyTextureToTexture(
-        { texture: this.cand0A },
-        { texture: this.cand0B },
-        [this.candWidth, this.candHeight, 1],
-      );
-      this.seedEnc.encode(encoder, this.sitesBuf, this.candParams[0], this.cand0A, this.cand0B,
-                           initSiteCount);
-      device.queue.submit([encoder.finish()]);
-      // After seed, the freshly-written texture for cand0 is cand0B; swap so
-      // cand0A is current. cand1 was written by init into cand1A, so leave it.
-      [this.cand0A, this.cand0B] = [this.cand0B, this.cand0A];
-    }
+    // Candidate lists for the initial sites.
+    this.cands.rebuild(this.sitesBuf, initSiteCount);
 
     // Zero the gradient accumulators once; Adam re-zeroes each site after use.
     {
@@ -731,7 +668,6 @@ export class Trainer {
     this.growStop = null;
     if (this.usesGrow) this._updateFitTarget();
 
-    this.jumpPassIndex = 0;
     this.aniStartIter = ANI_START_ITER;
     this.trainStartMs = performance.now();
     this.bestPsnr = 0;
@@ -792,58 +728,15 @@ export class Trainer {
               `${this.args.keepBest === "mdl" ? `${(b.score / 8192).toFixed(2)} KiB` : `loss ${b.err.toPrecision(4)}`}.`);
   }
 
-  // Candidate lists from scratch for sites [0, n): init, seed every site at
-  // its home pixel, then jump-flood passes from long jumps down to 1 px, twice.
+  // Candidate lists from scratch for sites [0, n) (CandidateLists.rebuild).
   _rebuildCandidates(n) {
-    const device = this.device;
-    const queue = device.queue;
-    const stages = Math.max(1, Math.ceil(Math.log2(Math.max(this.candWidth, this.candHeight, 2))));
-    this.growJfaParams ??= [];
-    for (let st = 0; st < stages; st += 1) {
-      this.growJfaParams[st] ??= createParamsBuffer(device, this._paramsArgs(n, 0, 0));
-      updateParamsBuffer(queue, this.growJfaParams[st],
-        this._paramsArgs(n, packJumpStep(st, this.candWidth, this.candHeight), 0));
-    }
-    this.rebuildParams ??= createParamsBuffer(device, this._paramsArgs(n, 0, 0));
-    updateParamsBuffer(queue, this.rebuildParams, this._paramsArgs(n, 0, 0));
-    const encoder = device.createCommandEncoder();
-    this.candsEnc.encodeInit(encoder, this.rebuildParams, this.cand0A, this.cand1A, this.candWidth, this.candHeight);
-    encoder.copyTextureToTexture({ texture: this.cand0A }, { texture: this.cand0B },
-      [this.candWidth, this.candHeight, 1]);
-    this.seedEnc.encode(encoder, this.sitesBuf, this.rebuildParams, this.cand0A, this.cand0B, n);
-    [this.cand0A, this.cand0B] = [this.cand0B, this.cand0A];
-    this.hilbertReady = false;
-    this._maybeRefreshHilbert(encoder, n);
-    this.packEnc.encode(encoder, this.sitesBuf, this.packedSitesBuf, this.countParams, n);
-    for (let pass = 0; pass < 2; pass += 1) {
-      for (let st = 0; st < stages; st += 1) {
-        this.candsEnc.encodeUpdate(encoder, this.packedSitesBuf, this.growJfaParams[st],
-          this.cand0A, this.cand1A, this.cand0B, this.cand1B,
-          this._hilbertOrderBuf(), this._hilbertPosBuf(), this.candWidth, this.candHeight);
-        [this.cand0A, this.cand0B] = [this.cand0B, this.cand0A];
-        [this.cand1A, this.cand1B] = [this.cand1B, this.cand1A];
-      }
-    }
-    queue.submit([encoder.finish()]);
+    this.cands.globalCand = this._globalCand();
+    this.cands.rebuild(this.sitesBuf, n);
   }
 
-  _paramsArgs(siteCount, step, seed) {
-    return {
-      width: this.width,
-      height: this.height,
-      siteCount,
-      step,
-      seed,
-      radiusScale: this.args.candRadiusScale,
-      radiusProbes: this.args.candRadiusProbes,
-      injectCount: this.args.candInjectCount,
-      hilbertProbes: this.usesHilbert ? this.args.candHilbertProbes : 0,
-      hilbertWindow: this.usesHilbert ? this.args.candHilbertWindow : 0,
-      candDownscale: this.candDownscale,
-      candWidth: this.candWidth,
-      candHeight: this.candHeight,
-      globalCand: this._globalCand(),
-    };
+  // Params (sad_shared.wgsl) for `siteCount` sites, for render passes.
+  _paramsArgs(siteCount) {
+    return this.cands.paramsArgs(siteCount);
   }
 
   // The site every pixel blends besides its candidate list (cand_ids in
@@ -884,29 +777,6 @@ export class Trainer {
     this.device.queue.writeBuffer(this.siteLiveBuf, 0, new Uint32Array(this.bufferCapacity).fill(1));
   }
 
-  _hilbertOrderBuf() {
-    return this.usesHilbert && this.hilbertRes ? this.hilbertRes.order : this.dummyHilbertBuf;
-  }
-  _hilbertPosBuf() {
-    return this.usesHilbert && this.hilbertRes ? this.hilbertRes.pos : this.dummyHilbertBuf;
-  }
-
-  _maybeRefreshHilbert(encoder, preSites) {
-    if (!this.usesHilbert) return;
-    if (this.hilbertReady && this.hilbertSiteCount === preSites) return;
-    const bits = hilbertBitsForSize(this.width, this.height);
-    updateHilbertParamsBuffer(this.device.queue, this.hilbertParams,
-      preSites, this.hilbertRes.paddedCount, this.width, this.height, bits);
-    this.hilbertEnc.encodePairs(encoder, this.sitesBuf, this.hilbertRes.pairs, this.hilbertParams,
-      this.hilbertRes.paddedCount);
-    const maxKeyExclusive = bits >= 16 ? 0xffffffff : (1 << (bits * 2));
-    this.hilbertSort.encode(encoder, this.hilbertRes.pairs, maxKeyExclusive);
-    this.hilbertEnc.encodeOrder(encoder, this.hilbertRes.pairs, this.hilbertRes.order,
-      this.hilbertRes.pos, this.hilbertParams, preSites);
-    this.hilbertReady = true;
-    this.hilbertSiteCount = preSites;
-  }
-
   async run() {
     const args = this.args;
     const iters = args.iters;
@@ -927,17 +797,6 @@ export class Trainer {
       const siteCount = this.siteCount;
       const activeSites = this.activeEstimate;
       const updateCandidates = (it % candUpdateFreq === 0);
-      const candPasses = this.candUpdatePasses;
-
-      // Update candidate params for each pass
-      if (updateCandidates) {
-        for (let p = 0; p < candPasses; p += 1) {
-          const stepIndex = this.jumpPassIndex + p;
-          const step = packJumpStep(stepIndex, this.candWidth, this.candHeight);
-          const seed = (stepIndex >>> 16) & 0xffff;
-          updateParamsBuffer(queue, this.candParams[p], this._paramsArgs(siteCount, step, seed));
-        }
-      }
 
       const lrScale = args.lrMult * lrSchedule(it, args.iters, args.lrSchedule, this.growDoneIter ?? Infinity);
       const lrDir = it >= this.aniStartIter ? args.lrDirBase * lrScale : 0;
@@ -970,18 +829,8 @@ export class Trainer {
 
       // Candidate update
       if (updateCandidates) {
-        this._maybeRefreshHilbert(encoder, siteCount);
-        this.packEnc.encode(encoder, this.sitesBuf, this.packedSitesBuf, this.countParams, siteCount);
-        for (let p = 0; p < candPasses; p += 1) {
-          this.candsEnc.encodeUpdate(encoder,
-            this.packedSitesBuf, this.candParams[p],
-            this.cand0A, this.cand1A, this.cand0B, this.cand1B,
-            this._hilbertOrderBuf(), this._hilbertPosBuf(),
-            this.candWidth, this.candHeight);
-          [this.cand0A, this.cand0B] = [this.cand0B, this.cand0A];
-          [this.cand1A, this.cand1B] = [this.cand1B, this.cand1A];
-          this.jumpPassIndex += 1;
-        }
+        this.cands.globalCand = this._globalCand();
+        this.cands.encodeUpdate(encoder, this.sitesBuf, siteCount);
       }
 
       // Remaining information: per-pixel loss weights from the current lists.
@@ -989,7 +838,7 @@ export class Trainer {
 
       // Gradients
       this.gradsEnc.encode(encoder, this.sitesBuf, this.gradParams,
-        this.cand0A, this.cand1A, this.fitTex, args.infoGrad ? this.lossWeightBuf : this.maskBuf,
+        this.cands.cand0, this.cands.cand1, this.fitTex, args.infoGrad ? this.lossWeightBuf : this.maskBuf,
         this.grads, this.width, this.height);
 
       // Tau diffusion
@@ -999,7 +848,7 @@ export class Trainer {
         let curIn = this.tauGradRaw;
         let curOut = this.tauGradTmp;
         for (let p = 0; p < TAU_DIFFUSE_PASSES; p += 1) {
-          this.tauEnc.encodeDiffuse(encoder, this.cand0A, this.cand1A,
+          this.tauEnc.encodeDiffuse(encoder, this.cands.cand0, this.cands.cand1,
             this.sitesBuf, this.tauGradRaw, curIn, curOut, this.tauParams, siteCount);
           if (curOut === this.tauGradTmp) {
             [curIn, curOut] = [curOut, this.tauGradTmp2];
@@ -1032,7 +881,7 @@ export class Trainer {
       let previewReadback = null;
       if (shouldPreview) {
         this.renderEnc.encode(encoder, this.sitesBuf, this.renderParams,
-          this.cand0A, this.cand1A, this.renderTex, this.width, this.height);
+          this.cands.cand0, this.cands.cand1, this.renderTex, this.width, this.height);
         if (!shouldLog) {
           previewReadback = this._encodePreviewReadback(encoder, it, iters, activeSites, siteCount);
         }
@@ -1092,7 +941,7 @@ export class Trainer {
     updateParamsBuffer(queue2, this.renderParams, this._paramsArgs(this.actualSites, 0, 0));
     const encoder = device.createCommandEncoder();
     this.renderEnc.encode(encoder, this.sitesBuf, this.renderParams,
-      this.cand0A, this.cand1A, this.renderTex, this.width, this.height);
+      this.cands.cand0, this.cands.cand1, this.renderTex, this.width, this.height);
     device.queue.submit([encoder.finish()]);
   }
 
@@ -1144,7 +993,7 @@ export class Trainer {
     const bytes = n * SITE_STAT_CH * 4;
     const staging = device.createBuffer({ size: bytes, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
     const encoder = device.createCommandEncoder();
-    this.statsEnc.encode(encoder, this.sitesBuf, this.siteStatsParams, this.cand0A, this.cand1A,
+    this.statsEnc.encode(encoder, this.sitesBuf, this.siteStatsParams, this.cands.cand0, this.cands.cand1,
       this.fitTex, this.lossWeightBuf, this.siteStatsBuf, this.width, this.height, this.sitePinBuf);
     encoder.copyBufferToBuffer(this.siteStatsBuf, 0, staging, 0, bytes);
     device.queue.submit([encoder.finish()]);
@@ -1241,22 +1090,8 @@ export class Trainer {
     return { data, k, predicted: splits.map((sp) => sp.gain), best: splits[0].gain };
   }
 
-  // The candidate lists as 8 u32 site ids per candidate pixel. The textures
-  // are rgba32uint; the float readback copies their bytes unchanged
-  // (same-type typed-array copies are bitwise).
-  async _readCandidates() {
-    const [c0, c1] = await Promise.all([
-      readRgba32FloatTexture(this.device, this.cand0A, this.candWidth, this.candHeight),
-      readRgba32FloatTexture(this.device, this.cand1A, this.candWidth, this.candHeight),
-    ]);
-    const u0 = new Uint32Array(c0.buffer), u1 = new Uint32Array(c1.buffer);
-    const cand = new Uint32Array(this.candWidth * this.candHeight * 8);
-    for (let i = 0; i < this.candWidth * this.candHeight; i += 1) {
-      cand.set(u0.subarray(i * 4, i * 4 + 4), i * 8);
-      cand.set(u1.subarray(i * 4, i * 4 + 4), i * 8 + 4);
-    }
-    return cand;
-  }
+  // The candidate lists as 8 u32 site ids per candidate pixel.
+  _readCandidates() { return this.cands.read(); }
 
   // ---- Pruning (args.pruneEvery) ----
   // Every pruneEvery iterations after growth (any time in fixed mode), until
@@ -1358,7 +1193,7 @@ export class Trainer {
   // The remaining-information pass (info_update.wgsl) into `encoder`.
   _encodeInfo(encoder) {
     this.infoEnc.encode(encoder, {
-      sites: this.sitesBuf, params: this.infoParams, cand0: this.cand0A, cand1: this.cand1A,
+      sites: this.sitesBuf, params: this.infoParams, cand0: this.cands.cand0, cand1: this.cands.cand1,
       targetTex: this.targetTex, mask: this.maskBuf, weight: this.lossWeightBuf,
       settled: this.settledBuf, siteLive: this.siteLiveBuf, width: this.width, height: this.height,
     });
@@ -1388,7 +1223,7 @@ export class Trainer {
     updateParamsBuffer(this.device.queue, this.renderParams, this._paramsArgs(this.siteCount, 0, 0));
     const encoder = this.device.createCommandEncoder();
     this.renderEnc.encode(encoder, this.sitesBuf, this.renderParams,
-      this.cand0A, this.cand1A, this.renderTex, this.width, this.height);
+      this.cands.cand0, this.cands.cand1, this.renderTex, this.width, this.height);
     this.device.queue.submit([encoder.finish()]);
     const rgba = await readRgba32FloatTexture(this.device, this.renderTex, this.width, this.height);
     return computeLoss(rgba, this.target, this.width, this.height, this.maskCpu, this.args.loss);
@@ -1572,33 +1407,12 @@ export class Trainer {
     updateClearParamsBuffer(queue, this.countParams, n1, Math.sqrt(this.invScaleSq));
     updateGradParamsBuffer(queue, this.gradParams, n1, this.invScaleSq, this._globalCand());
 
-    // Seed the new sites into their home candidate pixels, then run a full
-    // jump-flood sequence of candidate passes (long jumps down to 1 px) so they
-    // claim their regions now. Left to the regular updates (every candFreq
-    // iterations, 1 px steps by then) they would barely spread before the next
-    // step, which would then see the same error in the same places.
-    updateParamsBuffer(queue, this.growSeedParams, this._paramsArgs(n1, n0, 0));
-    const stages = Math.max(1, Math.ceil(Math.log2(Math.max(this.candWidth, this.candHeight, 2))));
-    this.growJfaParams ??= [];
-    for (let st = 0; st < stages; st += 1) {
-      this.growJfaParams[st] ??= createParamsBuffer(device, this._paramsArgs(n1, 0, 0));
-      updateParamsBuffer(queue, this.growJfaParams[st],
-        this._paramsArgs(n1, packJumpStep(st, this.candWidth, this.candHeight), 0));
-    }
+    // Seed the new sites and run a jump flood so they claim their regions now;
+    // left to the regular updates (1 px steps by then) they would barely spread
+    // before the next step, which would then see the same error in the same places.
     const seedEnc = device.createCommandEncoder();
-    seedEnc.copyTextureToTexture({ texture: this.cand0A }, { texture: this.cand0B },
-      [this.candWidth, this.candHeight, 1]);
-    this.seedEnc.encode(seedEnc, this.sitesBuf, this.growSeedParams, this.cand0A, this.cand0B, k);
-    [this.cand0A, this.cand0B] = [this.cand0B, this.cand0A];
-    this._maybeRefreshHilbert(seedEnc, n1);
-    this.packEnc.encode(seedEnc, this.sitesBuf, this.packedSitesBuf, this.countParams, n1);
-    for (let st = 0; st < stages; st += 1) {
-      this.candsEnc.encodeUpdate(seedEnc, this.packedSitesBuf, this.growJfaParams[st],
-        this.cand0A, this.cand1A, this.cand0B, this.cand1B,
-        this._hilbertOrderBuf(), this._hilbertPosBuf(), this.candWidth, this.candHeight);
-      [this.cand0A, this.cand0B] = [this.cand0B, this.cand0A];
-      [this.cand1A, this.cand1B] = [this.cand1B, this.cand1A];
-    }
+    this.cands.globalCand = this._globalCand();
+    this.cands.encodeAdded(seedEnc, this.sitesBuf, n0, n1);
     queue.submit([seedEnc.finish()]);
 
     this._updateFitTarget();
@@ -1747,19 +1561,19 @@ export class Trainer {
 
     const encoder = device.createCommandEncoder();
     if (mode === "hashed") {
-      this.renderHashedEnc.encode(encoder,
+      this.renderIdsEnc.encode(encoder,
         this.sitesBuf, this.renderParams,
-        this.cand0A, this.cand1A, this.renderTex, this.width, this.height);
+        this.cands.cand0, this.cands.cand1, this.renderTex, this.width, this.height);
     } else if (mode === "heatmap") {
       const heat = this._taskHeatmapParamsBuffer();
       this.renderTauEnc.encode(encoder,
         this.sitesBuf, this.renderParams,
-        this.cand0A, this.cand1A, this.renderTex,
+        this.cands.cand0, this.cands.cand1, this.renderTex,
         heat, this.width, this.height);
     } else {
       this.renderEnc.encode(encoder,
         this.sitesBuf, this.renderParams,
-        this.cand0A, this.cand1A, this.renderTex, this.width, this.height);
+        this.cands.cand0, this.cands.cand1, this.renderTex, this.width, this.height);
     }
     queue.submit([encoder.finish()]);
     return await readRgba32FloatTexture(device, this.renderTex, this.width, this.height);
@@ -1817,30 +1631,8 @@ export class Trainer {
     const n = this.actualSites;
     if (!(i >= 0 && i < n)) throw new Error(`site ${i} out of range (0–${n - 1})`);
     queue.writeBuffer(this.sitesBuf, i * SITE_FLOATS * 4, encodeSiteColors(Float32Array.from(rgbSite), 1, this.colorSpace));
-    this.editSeedParams ??= createParamsBuffer(device, this._paramsArgs(n, 0, 0));
-    updateParamsBuffer(queue, this.editSeedParams, this._paramsArgs(i + 1, i, 0));
-    const stages = Math.max(1, Math.ceil(Math.log2(Math.max(this.candWidth, this.candHeight, 2))));
-    this.growJfaParams ??= [];
-    for (let st = 0; st < stages; st += 1) {
-      this.growJfaParams[st] ??= createParamsBuffer(device, this._paramsArgs(n, 0, 0));
-      updateParamsBuffer(queue, this.growJfaParams[st],
-        this._paramsArgs(n, packJumpStep(st, this.candWidth, this.candHeight), 0));
-    }
     const encoder = device.createCommandEncoder();
-    encoder.copyTextureToTexture({ texture: this.cand0A }, { texture: this.cand0B },
-      [this.candWidth, this.candHeight, 1]);
-    this.seedEnc.encode(encoder, this.sitesBuf, this.editSeedParams, this.cand0A, this.cand0B, 1);
-    [this.cand0A, this.cand0B] = [this.cand0B, this.cand0A];
-    this.hilbertReady = false; // the moved site's place in the Hilbert order
-    this._maybeRefreshHilbert(encoder, n);
-    this.packEnc.encode(encoder, this.sitesBuf, this.packedSitesBuf, this.countParams, n);
-    for (let st = 0; st < stages; st += 1) {
-      this.candsEnc.encodeUpdate(encoder, this.packedSitesBuf, this.growJfaParams[st],
-        this.cand0A, this.cand1A, this.cand0B, this.cand1B,
-        this._hilbertOrderBuf(), this._hilbertPosBuf(), this.candWidth, this.candHeight);
-      [this.cand0A, this.cand0B] = [this.cand0B, this.cand0A];
-      [this.cand1A, this.cand1B] = [this.cand1B, this.cand1A];
-    }
+    this.cands.encodeAdded(encoder, this.sitesBuf, i, i + 1, n);
     queue.submit([encoder.finish()]);
   }
 
@@ -1867,7 +1659,7 @@ export class Trainer {
     const encoder = device.createCommandEncoder();
     encoder.clearBuffer(this._gnBuf);
     this.gnEnc.encode(encoder, this.sitesBuf, this.gradParams,
-      this.cand0A, this.cand1A, this.fitTex, this.maskBuf,
+      this.cands.cand0, this.cands.cand1, this.fitTex, this.maskBuf,
       this._gnBuf, this.width, this.height);
     encoder.copyBufferToBuffer(this._gnBuf, 0, staging, 0, bytes);
     device.queue.submit([encoder.finish()]);
@@ -1909,6 +1701,7 @@ export class Trainer {
       renderRgba: rgba,
       sites: sitesArray,
       count: this.actualSites,
+      globalSite: this.layerIndex ?? -1, // for serializeSitesTxt
       width: this.width,
       height: this.height,
       bestPsnr: this.bestPsnr,
@@ -1973,27 +1766,19 @@ export class Trainer {
     this._destroyed = true;
     const owned = [
       this.targetTex, this.maskTex, this.renderTex,
-      this.cand0A, this.cand0B, this.cand1A, this.cand1B,
-      this.sitesBuf, this.packedSitesBuf, this.adamBuf, this.seedCounter, this.grads,
+      this.sitesBuf, this.adamBuf, this.seedCounter, this.grads,
       this.tauGradRaw, this.tauGradTmp, this.tauGradTmp2,
-      ...(this.candParams || []),
       this.renderParams, this.gradParams, this.adamParams,
       this.countParams, this.gradCountParams, this.tauParams,
-      this.dummyHilbertBuf, this.hilbertParams, this._tauHeatBuf, this._gnBuf,
-      this.blurTex, this.blurTmpTex, this.growBlurParams, this.growSeedParams,
-      ...(this.growJfaParams || []), this.siteStatsParams, this.siteStatsBuf,
-      this.bestSitesBuf, this.bestAdamBuf, this.rebuildParams, this.editSeedParams,
+      this._tauHeatBuf, this._gnBuf,
+      this.blurTex, this.blurTmpTex, this.growBlurParams,
+      this.siteStatsParams, this.siteStatsBuf,
+      this.bestSitesBuf, this.bestAdamBuf,
       this.pruneSitesBuf, this.pruneAdamBuf,
       this.sitePinBuf, this.siteLiveBuf, this.maskBuf, this.lossWeightBuf, this.settledBuf, this.infoParams,
     ];
-    if (this.hilbertRes) {
-      owned.push(this.hilbertRes.pairs, this.hilbertRes.order, this.hilbertRes.pos);
-    }
-    if (this.hilbertSort) {
-      const s = this.hilbertSort;
-      owned.push(s.histBuffer, s.blockSums, s.scratch, ...s.paramsBuffers);
-    }
     for (const res of owned) res?.destroy();
+    this.cands?.destroy();
     this.target = null;
     this.maskCpu = null;
     this._lastSitesCpu = null;

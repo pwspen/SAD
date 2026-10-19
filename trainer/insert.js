@@ -19,7 +19,8 @@
 // each, the per-pixel state is updated as if the site were there, and the
 // candidates it affects are rescored.
 
-import { SITE_FLOATS } from "./params.js?v=lr-decay-20261018";
+import { siteLogit } from "./merge.js?v=20261019";
+import { SITE_FLOATS } from "./params.js?v=20261019";
 
 const SMALL_IMAGE = 16384;    // pixels; at or below, every pixel is a candidate and windows are the whole image
 const MAX_POSITIONS = 1024;   // candidate positions on larger images
@@ -70,17 +71,6 @@ export function insertionField({ width, height, sites, siteCount, cand, candWidt
     }
   }
   return { m, s, pred, owner };
-}
-
-function siteLogit(sites, b, x, y, invScale) {
-  const dx = x - sites[b], dy = y - sites[b + 1];
-  const dirX = sites[b + 7], dirY = sites[b + 8];
-  const proj = dirX * dx + dirY * dy;
-  const diff2 = dx * dx + dy * dy;
-  const perp2 = Math.max(diff2 - proj * proj, 0);
-  const l1 = Math.exp(sites[b + 9]);
-  const d2 = (l1 * proj * proj + perp2 / l1) * invScale * invScale;
-  return -Math.exp(sites[b + 2]) * (Math.sqrt(Math.max(d2, 1e-8)) - sites[b + 3] * invScale);
 }
 
 // Isotropic candidate logit at pixel (x, y).
