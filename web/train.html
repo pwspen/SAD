@@ -649,7 +649,15 @@
         border-radius: 4px;
         backdrop-filter: blur(6px);
         border: 1px solid var(--line-soft);
+        opacity: 0;
+        transition: opacity 0.12s;
       }
+      /* Labels stay out of the way until the card is hovered; always shown
+         while editing the layout (cards are dragged by them) and on touch. */
+      .canvas-card:hover .card-label,
+      .canvas-card:focus-within .card-label,
+      .canvases.editing .card-label { opacity: 1; }
+      @media (hover: none) { .card-label { opacity: 1; } }
       /* Where a card's data comes from (SOURCES in train.js); the label's
          tooltip spells it out. */
       .source-badge {
