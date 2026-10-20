@@ -329,7 +329,7 @@
       #paramsPanel:not([data-count-schedule="sawtooth"]) .param[data-count-schedule="sawtooth"],
       #paramsPanel:not([data-count-schedule="constant"]) .param[data-count-schedule="constant"],
       #paramsPanel[data-count-schedule="constant"] .param[data-count-range] { display: none; }
-      .row input:disabled { color: var(--text-soft); background: var(--panel-soft); }
+      .row input:disabled, .row input[readonly] { color: var(--text-soft); background: var(--panel-soft); }
       .panel h3.has-tip::after { content: " ⓘ"; letter-spacing: 0; }
       .tip {
         position: absolute;
@@ -820,6 +820,11 @@
     <div class="main">
       <aside class="panel hidden" id="paramsPanel">
         <h3 class="has-tip" tabindex="0">Site count<span class="tip" role="tooltip">The only settings that decide how many sites the run uses. The count goes from <b>start sites</b> at iteration 0 to <b>end sites</b> by <b>reach end by</b>, on the chosen curve, then holds while the rest of the run refines. Start &lt; end grows by splitting the cells a second site would explain best; start &gt; end prunes, merging the cheapest neighbouring pairs into one site (the pixel-weighted average of both); start = end is a fixed count, as is the <b>constant</b> schedule's single <b>sites</b> field. Each site costs 128 bits: bpp = sites × 128 / (width × height).</span></h3>
+        <div class="param">
+          <div class="row"><label for="p-fromBpp">from bpp</label><input id="p-fromBpp" type="checkbox" /><input id="p-bpp" data-no-tune type="number" min="0" step="0.01" aria-label="Target bits per pixel" disabled /></div>
+          <p class="help"><span class="unit" id="bppSitesNote">set the count from a target bpp</span></p>
+          <div class="tip" role="tooltip">Calculate the site count from a target bpp and the loaded image: sites = bpp × width × height / 128 (the bits per site), rounded. Sets <b>sites</b> and <b>end sites</b> and keeps them in step when the image changes; untick to type them again. Checking it fills in the bpp of the current count.</div>
+        </div>
         <div class="param" data-count-schedule="constant">
           <div class="row"><label>sites</label><input id="p-sites" data-tune="int" type="number" min="1" /></div>
           <p class="help"><span class="unit">sites throughout the run</span></p>

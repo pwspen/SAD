@@ -224,6 +224,7 @@ function applyConfigToForm(config, overrides = {}) {
     else el.value = v;
   }
   syncSiteFields();
+  syncBppSites();
 }
 
 // The advanced panel's fields as buildArgs overrides.
@@ -319,6 +320,37 @@ function syncSiteFields() {
   ui.paramsPanel.dataset.siteMode = varies ? "grow" : "fixed";
   ui.paramsPanel.dataset.countSchedule = document.getElementById("p-countSchedule").value;
   updatePlanSummary();
+}
+
+// "from bpp": sites and end sites follow a target bpp on the loaded image
+// (BITS_PER_SITE bits per site), read-only while it's on. Called on the
+// checkbox, the bpp field and every new target.
+function syncBppSites() {
+  const on = document.getElementById("p-fromBpp").checked;
+  const bppEl = document.getElementById("p-bpp");
+  const note = document.getElementById("bppSitesNote");
+  const img = state.targetImage;
+  const pixels = img ? img.width * img.height : 0;
+  const countEls = ["p-sites", "p-endSites"].map((id) => document.getElementById(id));
+  bppEl.disabled = !on;
+  for (const el of countEls) {
+    el.readOnly = on;
+    el.title = on ? "Set by from bpp (untick it to edit)" : el.title.startsWith("Set by from bpp") ? "" : el.title;
+  }
+  if (!on) { note.textContent = "set the count from a target bpp"; return; }
+  if (bppEl.value === "" && pixels) {
+    const sites = Number(document.getElementById(ui.paramsPanel.dataset.countSchedule === "constant" ? "p-sites" : "p-endSites").value);
+    if (sites > 0) bppEl.value = fmtSig(computeBpp(sites, img.width, img.height));
+  }
+  const bpp = Number(bppEl.value);
+  if (!pixels || bppEl.value === "" || !(bpp >= 0)) {
+    note.textContent = pixels ? "enter a bpp" : "load an image to set the count";
+    return;
+  }
+  const sites = Math.max(1, Math.round((bpp * pixels) / BITS_PER_SITE));
+  for (const el of countEls) if (!el.disabled) el.value = sites;
+  note.textContent = `${sites} sites on ${img.width}×${img.height} (${fmtSig(computeBpp(sites, img.width, img.height))} bpp)`;
+  syncSiteFields();
 }
 
 async function initDevice() {
@@ -3142,6 +3174,7 @@ async function setTarget(file, name, token = ++state.targetToken) {
     state.lastOwner = null;
     ui.saveBtn.disabled = true;
     invalidateAnalysis();
+    syncBppSites();
     blankRenderViews(img.width, img.height);
     await refreshViews("target", "render");
     updateCanvasLayout(img.width, img.height);
@@ -4084,6 +4117,7 @@ async function selectBatchRun(id) {
   state.maskData = null;
   ui.maskLabel.textContent = "none";
   invalidateAnalysis();
+  syncBppSites();
 
   const args = b.args;
   const varies = countVaries(args, args.startSites);
@@ -5253,6 +5287,7 @@ async function main() {
   ui.maskInput.addEventListener("change", handleMaskInput);
   ui.initSitesInput.addEventListener("change", handleInitSitesInput);
   ui.initSitesClear.addEventListener("click", clearInitSites);
+  for (const id of ["p-fromBpp", "p-bpp"]) document.getElementById(id).addEventListener("input", syncBppSites);
   for (const id of ["p-sites", "p-startSites", "p-endSites", "p-countSchedule", "p-sawAmp", "p-sawTeeth"]) {
     document.getElementById(id).addEventListener("input", syncSiteFields);
     document.getElementById(id).addEventListener("change", syncSiteFields);
