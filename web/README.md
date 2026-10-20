@@ -14,9 +14,18 @@ All pages read hyperparameters from `training_config.json`.
 - HTTP(S) hosting. ES modules + `fetch` won't run from `file://`; GitHub Pages
   works because it serves the repository over HTTPS. Locally, run `./serve.sh`
   from the repo root and open the trainer link it prints. It serves the parent
-  folder so the dataset picker can find `../comp/data/kodak` and
-  `../comp/data/mnist` (the MNIST test split's `t10k-*-ubyte.gz` files);
-  override the folders with `?kodak=<dir>` / `?mnist=<dir>`.
+  folder so the dataset picker can find its Hugging Face parquet files:
+
+  | Dataset | File | Source |
+  | --- | --- | --- |
+  | Kodak | `../comp/data/kodak/validation.parquet` | [danjacobellis/kodak](https://huggingface.co/datasets/danjacobellis/kodak) (lossless WebP, pixel-identical to the PNGs) |
+  | MNIST | `../comp/data/mnist/test.parquet` | [ylecun/mnist](https://huggingface.co/datasets/ylecun/mnist), test split |
+  | CIFAR-10 | `../comp/data/cifar10/test.parquet` | [uoft-cs/cifar10](https://huggingface.co/datasets/uoft-cs/cifar10), test split |
+
+  Override a folder with `?kodak=<dir>` / `?mnist=<dir>` / `?cifar10=<dir>`.
+  The files are read with [hyparquet](https://github.com/hyparam/hyparquet)
+  1.31.2, vendored in `web/vendor/hyparquet` (MIT). CIFAR-10 uses the MNIST
+  preset (small images, fixed sites); it hasn't been tuned on CIFAR.
 
 ## Viewer (`index.html`)
 
@@ -33,7 +42,7 @@ All pages read hyperparameters from `training_config.json`.
 - The site count follows the schedule in the **Site count** section (start → end sites, linear / exponential / sawtooth); see `trainer/README.md`.
 - Click **Train**. `viewer-freq` controls visual refreshes, while `log-freq` controls PSNR log lines (`Iter N | PSNR: X dB | Active: a/t | it/s | seconds`).
 - Each viewer card carries a badge for where its data comes from: **Input**, **Model** (rendered by the trainer), **Training** (metrics the trainer reports) or **Viz only** (computed in the viewer by `analysis.js`; dashed card edge). Hover a card's label for exactly what it shows. The **Spectral** layout has the radial power spectrum, spectral SNR / FRC, 2D spectra and per-band SNR.
-- **Batch** trains a range of dataset images with one set of settings. Its layout shows PSNR vs iteration, final PSNR, and, for MNIST, the final PSNR of every run grouped by digit (box plot with one dot per run) once the batch finishes.
+- **Batch** trains a range of dataset images with one set of settings. Its layout shows PSNR vs iteration, final PSNR, and, for MNIST and CIFAR-10, the final PSNR of every run grouped by digit / class (box plot with one dot per run) once the batch finishes.
 - **tune**, next to each float setting under Advanced, auto-tunes that one setting with the current batch settings: it runs a batch at the value × and ÷ **tune ratio** (default 1.5, on the same images as the baseline), moves to whichever raises the median final PSNR, and repeats until neither does or **tune max rounds** (default 20) is reached. Both are under Advanced → Tuning. Click it again, or Stop, to end early and keep the best value so far.
 - **Edit layout** lets you drag cards by their label (onto an empty cell, or onto a same-size card to swap), add views from empty cells, remove them with ×, and add or remove rows / columns. Cards keep the size their layout gave them. Edits go to a **Custom** layout saved in the browser.
 - **Export PNG** / **Export sites.txt** produce the same formats the Python and Metal trainers write.

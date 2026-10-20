@@ -21,7 +21,7 @@ Serve the pages over HTTP (ES modules and `fetch` don't work from `file://`):
 ```
 
 It serves the folder above the repo on port 8766 (`PORT=…` to change it), so the
-trainer's dataset picker can reach `../comp/data/kodak` and `../comp/data/mnist`,
+trainer's dataset picker can reach `../comp/data/{kodak,mnist,cifar10}` (Hugging Face parquet files; see `web/README.md`),
 and prints the links:
 
 - http://127.0.0.1:8766/SAD/web/train.html: interactive trainer

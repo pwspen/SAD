@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Serves the browser pages for local use. It serves the folder *above* this
-# repo, so train.html's dataset picker can reach ../comp/data/{kodak,mnist} next to it.
+# repo, so train.html's dataset picker can reach ../comp/data/{kodak,mnist,cifar10} next to it.
 #   ./serve.sh            # port 8766
 #   PORT=9000 ./serve.sh
 set -euo pipefail
@@ -22,12 +22,11 @@ if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
   exit 0
 fi
 
-if [ ! -d "$REPO_DIR/../comp/data/kodak" ]; then
-  echo "Note: no Kodak set at $(dirname "$REPO_DIR")/comp/data/kodak; the Kodak picker will 404."
-fi
-if [ ! -d "$REPO_DIR/../comp/data/mnist" ]; then
-  echo "Note: no MNIST set at $(dirname "$REPO_DIR")/comp/data/mnist; the MNIST picker will 404."
-fi
+for f in kodak/validation.parquet mnist/test.parquet cifar10/test.parquet; do
+  if [ ! -f "$REPO_DIR/../comp/data/$f" ]; then
+    echo "Note: no $(dirname "$REPO_DIR")/comp/data/$f; that dataset's picker will 404 (sources in web/README.md)."
+  fi
+done
 
 echo "Serving $(dirname "$REPO_DIR") on port $PORT. Open:"
 print_links

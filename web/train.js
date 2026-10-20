@@ -11,6 +11,7 @@ import { loadSitesFromFile, serializeSitesTxt, triggerDownload, floatImageToRgba
 import { SITE_FLOATS } from "../trainer/params.js?v=20261019";
 import { BatchTrainer, planBatches, tileSites, tileActive, tileSize, atlasCapacity } from "../trainer/batch.js?v=defaults-20261019";
 import { COLOR_SPACES } from "../trainer/color_spaces.js?v=20261019";
+import { parquetMetadata, parquetReadObjects } from "./vendor/hyparquet/src/index.js";
 import {
   luma, maskWeights, laplacianBands, maskLevels, bandEnergies, IMPORTANCE, importanceMap,
   spectralPlan, windowedSpectrum, spectrumDiff, radialStats, frcCrossing, logPowerImage,
@@ -31,13 +32,11 @@ const DEMO_MAX_IMAGE_SIDE = 2048;
 const VALUE_BINS = 24; // bins per panel of the site parameter values view
 const MI_ROUND_ANISO = 0.05; // |log_aniso| below this, a site has no orientation (site MI view)
 const SNAP_MAP_K = 4; // snap-analysis fit drawn on the image (one of SNAP_KS)
-// Kodak set lives outside this repo; the default resolves under the
-// kodak-bench server (which serves the parent dir). Override with ?kodak=<dir>.
-const KODAK_DIR = new URLSearchParams(location.search).get("kodak") || "../../comp/data/kodak/";
-const KODAK_COUNT = 24;
-// MNIST test split (t10k-*-ubyte.gz, the original IDX files) sits next to
-// Kodak. Override with ?mnist=<dir>.
-const MNIST_DIR = new URLSearchParams(location.search).get("mnist") || "../../comp/data/mnist/";
+// Datasets live outside this repo, as Hugging Face parquet files (see
+// DATASETS): ../comp/data/<key>/<file>, which resolves under the kodak-bench
+// server (it serves the parent dir). Override a folder with ?<key>=<dir>.
+const DATA_DIR = "../../comp/data/";
+const MNIST_DIGITS = Array.from({ length: 10 }, (_, d) => String(d));
 
 // Fields that live in the advanced panel. The target image is in the top bar;
 // init-sites / mask are pickers inside the panel (not listed here).
@@ -574,9 +573,9 @@ const VIEWS = {
                 note: "How many runs ended at each PSNR. Each run is one cell, stacked in its bin by PSNR, so " +
                       "hovering picks out a single run; click it to load it once the batch has finished. Final " +
                       "PSNR is measured on the last render, so it can sit below the run's best log tick." },
-  batchDigits: { label: "Batch: PSNR by MNIST digit", kind: "plot", source: "train", on: ["batch"],
+  batchDigits: { label: "Batch: PSNR by class", kind: "plot", source: "train", on: ["batch"],
                 draw: drawBatchViews, hit: hitBatchDigits, click: clickBatchRun,
-                note: "Final PSNR of each finished run, grouped by the digit it shows (MNIST test split). Each " +
+                note: "Final PSNR of each finished run, grouped by its label (the digit for MNIST, the class for CIFAR-10). Each " +
                       "circle is one run; the box spans the quartiles, the thick line the median and the whiskers " +
                       "1.5× the interquartile range. Drawn once the batch has finished; hover a run to find it " +
                       "in the other batch plots, click to load it." },
@@ -2905,68 +2904,83 @@ async function handleImageInput(ev) {
   await setTarget(file, file.name);
 }
 
-let mnistData = null; // promise of { count, side, pixels, labels }
-
-async function fetchIdx(name) {
-  const res = await fetch(new URL(name, new URL(MNIST_DIR, location.href)));
-  if (!res.ok) throw new Error(`${name}: HTTP ${res.status}`);
-  const bytes = await new Response(res.body.pipeThrough(new DecompressionStream("gzip"))).arrayBuffer();
-  // IDX: big-endian magic (0x08 = ubyte, low byte = rank), dims, then data.
-  const view = new DataView(bytes);
-  const rank = view.getUint8(3);
-  const dims = Array.from({ length: rank }, (_, d) => view.getUint32(4 + 4 * d));
-  return { dims, data: new Uint8Array(bytes, 4 + 4 * rank) };
-}
-
-function loadMnist() {
-  mnistData ??= Promise.all([
-    fetchIdx("t10k-images-idx3-ubyte.gz"),
-    fetchIdx("t10k-labels-idx1-ubyte.gz"),
-  ]).then(([images, labels]) => ({
-    count: images.dims[0], side: images.dims[1], pixels: images.data, labels: labels.data,
-  }));
-  mnistData.catch(() => { mnistData = null; }); // let a failed load retry
-  return mnistData;
+// One Hugging Face parquet file per dataset: a row per image, with its
+// encoded PNG / WebP bytes in an Image column, and for labelled sets a
+// ClassLabel column, whose class names come from the file's "huggingface"
+// metadata. The whole file is read once, on the first prepare().
+function parquetDataset({ key, label, preset, file, source, imageColumn = "image", labelColumn = null,
+                          nameColumn = null, prefix = key, classTitle = null }) {
+  let rows = null; // promise of { images, labels, names, classNames }
+  const read = () => {
+    rows ??= (async () => {
+      const dir = new URLSearchParams(location.search).get(key) || `${DATA_DIR}${key}/`;
+      const res = await fetch(new URL(file, new URL(dir, location.href)));
+      if (!res.ok) throw new Error(`${file}: HTTP ${res.status} (get it from ${source})`);
+      const buf = await res.arrayBuffer();
+      const metadata = parquetMetadata(buf);
+      const hf = metadata.key_value_metadata?.find((kv) => kv.key === "huggingface");
+      const features = hf ? JSON.parse(hf.value).info?.features ?? {} : {};
+      const columns = [imageColumn, labelColumn, nameColumn].filter(Boolean);
+      // utf8: false keeps the image bytes raw (string columns are still decoded).
+      const objects = await parquetReadObjects({ file: buf, metadata, columns, utf8: false });
+      return {
+        images: objects.map((o) => o[imageColumn].bytes),
+        labels: labelColumn ? Int32Array.from(objects, (o) => Number(o[labelColumn])) : null,
+        names: nameColumn ? objects.map((o) => String(o[nameColumn]).split("/").pop().replace(/\.[^.]*$/, "")) : null,
+        classNames: labelColumn ? features[labelColumn]?.names ?? null : null,
+      };
+    })();
+    rows.catch(() => { rows = null; }); // let a failed load retry
+    return rows;
+  };
+  return {
+    label, preset, classTitle,
+    count: 0,
+    labels: null,
+    names: null,
+    classNames: null,
+    async prepare() {
+      const r = await read();
+      ({ labels: this.labels, names: this.names, classNames: this.classNames } = r);
+      this.count = r.images.length;
+    },
+    itemName(i) {
+      if (this.names) return this.names[i];
+      const tag = this.labels ? `_${this.classNames?.[this.labels[i]] ?? this.labels[i]}` : "";
+      return `${prefix}${String(i).padStart(4, "0")}${tag}`;
+    },
+    labelOf(i) { return this.labels?.[i] ?? null; },
+    async load(i) { return new Blob([(await read()).images[i]]); },
+  };
 }
 
 // Each dataset: item names for the picker (after prepare()), load(i)
 // returning something createImageBitmap takes, and the preset (PRESETS key)
-// selecting it applies.
+// selecting it applies. A labelled one also has labelOf(i) and classNames
+// (the batch's PSNR-by-class plot). Every image is checked against the
+// original release: Kodak's lossless WebPs match the PNGs, MNIST's PNGs the
+// IDX files.
 const DATASETS = {
-  kodak: {
-    label: "Kodak",
-    preset: "kodak",
-    count: KODAK_COUNT,
-    async prepare() {},
-    itemName: (i) => `kodim${String(i + 1).padStart(2, "0")}`,
-    async load(i) {
-      const name = `${this.itemName(i)}.png`;
-      const res = await fetch(new URL(name, new URL(KODAK_DIR, location.href)));
-      if (!res.ok) throw new Error(`${name}: HTTP ${res.status}`);
-      return res.blob();
-    },
-  },
-  mnist: {
-    label: "MNIST",
+  kodak: parquetDataset({
+    key: "kodak", label: "Kodak", preset: "kodak",
+    file: "validation.parquet",
+    source: "https://huggingface.co/datasets/danjacobellis/kodak/resolve/main/data/validation-00000-of-00001.parquet",
+    nameColumn: "path",
+  }),
+  mnist: parquetDataset({
+    key: "mnist", label: "MNIST", preset: "mnist",
+    file: "test.parquet",
+    source: "https://huggingface.co/datasets/ylecun/mnist/resolve/main/mnist/test-00000-of-00001.parquet",
+    labelColumn: "label", classTitle: "MNIST digit",
+  }),
+  cifar10: parquetDataset({
+    key: "cifar10", label: "CIFAR-10",
+    // Small images like MNIST's, so its fixed-site preset (one atlas per batch); not tuned on CIFAR.
     preset: "mnist",
-    count: 0,
-    labels: null,
-    async prepare() {
-      ({ count: this.count, labels: this.labels } = await loadMnist());
-    },
-    itemName(i) { return `mnist${String(i).padStart(4, "0")}_${this.labels[i]}`; },
-    labelOf(i) { return this.labels?.[i] ?? null; },
-    async load(i) {
-      const { side, pixels } = await loadMnist();
-      const n = side * side;
-      const img = new ImageData(side, side);
-      for (let p = 0; p < n; p += 1) {
-        const v = pixels[i * n + p];
-        img.data.set([v, v, v, 255], p * 4);
-      }
-      return img;
-    },
-  },
+    file: "test.parquet",
+    source: "https://huggingface.co/datasets/uoft-cs/cifar10/resolve/main/plain_text/test-00000-of-00001.parquet",
+    imageColumn: "img", labelColumn: "label", prefix: "cifar", classTitle: "CIFAR-10 class",
+  }),
 };
 
 function currentDataset() {
@@ -4294,11 +4308,11 @@ function hitBatchHist(g, mx, my) {
   return g.bins[k]?.[j]?.id ?? null;
 }
 
-// Final PSNR per MNIST digit: one dot per finished run, with a box for the
+// Final PSNR per class (MNIST digit, CIFAR-10 class): one dot per finished run, with a box for the
 // quartiles and whiskers at 1.5× the interquartile range. Nothing is drawn
 // while the batch runs, so the distributions never shift under the reader.
-function batchDigitGroups(runs) {
-  const groups = Array.from({ length: 10 }, () => []);
+function batchDigitGroups(runs, classCount) {
+  const groups = Array.from({ length: classCount }, () => []);
   for (const r of runs) {
     if (r.status !== "done" || r.final == null || r.label == null) continue;
     if (r.label >= 0 && r.label < groups.length) groups[r.label].push(r);
@@ -4332,24 +4346,27 @@ function drawBatchDigits(view) {
       lo = Math.min(lo, r.final.psnr);
       hi = Math.max(hi, r.final.psnr);
     }
-    const g = plotAxes(plotBox(p), { min: -0.6, max: 9.6 }, linRange(lo, hi, [0, 40]));
-    drawAxes(p, g, { xTitle: "MNIST digit", yTitle: "final PSNR (dB)", xLabels: false });
-    // Digits are categorical: label every one, whatever the tick spacing.
+    // Classes of the batch's dataset (MNIST's digits before any batch).
+    const dataset = DATASETS[b?.dataset] ?? DATASETS.mnist;
+    const classes = dataset.classNames ?? MNIST_DIGITS;
+    const g = plotAxes(plotBox(p), { min: -0.6, max: classes.length - 0.4 }, linRange(lo, hi, [0, 40]));
+    drawAxes(p, g, { xTitle: dataset.classTitle ?? "class", yTitle: "final PSNR (dB)", xLabels: false });
+    // Classes are categorical: label every one, whatever the tick spacing.
     const { ctx } = p;
     ctx.font = PLOT_FONT;
     ctx.fillStyle = p.col.soft;
     ctx.textAlign = "center";
     ctx.textBaseline = "top";
-    for (let d = 0; d < 10; d += 1) ctx.fillText(String(d), g.x(d), g.bottom + 6);
+    for (let d = 0; d < classes.length; d += 1) ctx.fillText(classes[d], g.x(d), g.bottom + 6);
     if (b?.running) {
       drawEmpty(p, g, "Available when the batch finishes");
       return { ...g, empty: true };
     }
-    if (b && b.dataset !== "mnist") {
-      drawEmpty(p, g, "Only MNIST batches have digit labels");
+    if (b && !dataset.classNames) {
+      drawEmpty(p, g, "Only labelled datasets (MNIST, CIFAR-10) have classes");
       return { ...g, empty: true };
     }
-    const groups = batchDigitGroups(runs);
+    const groups = batchDigitGroups(runs, classes.length);
     if (!groups.some((group) => group.length)) {
       drawEmpty(p, g, b ? "No finished runs" : "Run a batch (Batch… in the top bar)");
       return { ...g, empty: true };
