@@ -3062,6 +3062,49 @@ function parquetDataset({ key, label, preset, file, source, imageColumn = "image
   };
 }
 
+// A folder of PNGs inside this repo (../data/<folder>/), listed through the
+// dev server's directory index (python's http.server: a link per file), one
+// item per PNG in name order. `name` shortens a file's stem for the picker.
+// Override the folder with ?<key>=<dir>.
+function pngFolderDataset({ key, label, preset, folder, source, name = (stem) => stem }) {
+  let files = null; // promise of [{ url, stem }]
+  const list = () => {
+    files ??= (async () => {
+      const dir = new URL(new URLSearchParams(location.search).get(key) || `../data/${folder}/`, location.href);
+      const res = await fetch(dir);
+      if (!res.ok) throw new Error(`${folder}: HTTP ${res.status} (get it from ${source})`);
+      const doc = new DOMParser().parseFromString(await res.text(), "text/html");
+      const found = [...doc.querySelectorAll("a[href]")]
+        .map((a) => a.getAttribute("href"))
+        .filter((href) => /\.png$/i.test(href))
+        .map((href) => ({ url: new URL(href, dir), stem: decodeURIComponent(href.split("/").pop()).replace(/\.png$/i, "") }))
+        .sort((x, y) => (x.stem < y.stem ? -1 : x.stem > y.stem ? 1 : 0));
+      if (!found.length) throw new Error(`${folder}: no PNGs listed (get them from ${source})`);
+      return found;
+    })();
+    files.catch(() => { files = null; }); // let a failed load retry
+    return files;
+  };
+  return {
+    label, preset, classTitle: null,
+    count: 0,
+    names: null,
+    async prepare() {
+      const f = await list();
+      this.names = f.map((x) => name(x.stem));
+      this.count = f.length;
+    },
+    itemName(i) { return this.names[i]; },
+    labelOf() { return null; },
+    async load(i) {
+      const { url } = (await list())[i];
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`${url.pathname}: HTTP ${res.status}`);
+      return res.blob();
+    },
+  };
+}
+
 // Each dataset: item names for the picker (after prepare()), load(i)
 // returning something createImageBitmap takes, and the preset (PRESETS key)
 // selecting it applies. A labelled one also has labelOf(i) and classNames
@@ -3088,6 +3131,15 @@ const DATASETS = {
     file: "test.parquet",
     source: "https://huggingface.co/datasets/uoft-cs/cifar10/resolve/main/plain_text/test-00000-of-00001.parquet",
     imageColumn: "img", labelColumn: "label", prefix: "cifar", classTitle: "CIFAR-10 class",
+  }),
+  clic2025: pngFolderDataset({
+    key: "clic2025", label: "CLIC 2025 test",
+    // Large photos like Kodak's (up to 2048 px), so its preset; not tuned on CLIC.
+    preset: "kodak",
+    folder: "clic2025_image_test",
+    source: "https://clic2027.compression.cc/tasks/#image",
+    // Stems are 64-hex-digit hashes; the first 8 tell the 30 apart.
+    name: (stem) => `clic_${stem.slice(0, 8)}`,
   }),
 };
 

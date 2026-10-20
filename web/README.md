@@ -21,8 +21,11 @@ All pages read hyperparameters from `training_config.json`.
   | Kodak | `../comp/data/kodak/validation.parquet` | [danjacobellis/kodak](https://huggingface.co/datasets/danjacobellis/kodak) (lossless WebP, pixel-identical to the PNGs) |
   | MNIST | `../comp/data/mnist/test.parquet` | [ylecun/mnist](https://huggingface.co/datasets/ylecun/mnist), test split |
   | CIFAR-10 | `../comp/data/cifar10/test.parquet` | [uoft-cs/cifar10](https://huggingface.co/datasets/uoft-cs/cifar10), test split |
+  | CLIC 2025 test | `data/clic2025_image_test/*.png` (in this repo, gitignored) | [CLIC image task](https://clic2027.compression.cc/tasks/#image), 30 PNGs up to 2048 px |
 
-  Override a folder with `?kodak=<dir>` / `?mnist=<dir>` / `?cifar10=<dir>`.
+  Override a folder with `?kodak=<dir>` / `?mnist=<dir>` / `?cifar10=<dir>` / `?clic2025=<dir>`.
+  A PNG folder is listed through the server's directory index, so it needs a
+  server that lists folders (`./serve.sh` does). CLIC uses the Kodak preset.
   The files are read with [hyparquet](https://github.com/hyparam/hyparquet)
   1.31.2, vendored in `web/vendor/hyparquet` (MIT). CIFAR-10 uses the MNIST
   preset (small images, fixed sites); it hasn't been tuned on CIFAR.
