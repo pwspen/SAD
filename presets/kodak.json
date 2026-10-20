@@ -1,7 +1,7 @@
 {
   "_note": "Trainer settings (camelCase = buildArgs args, UPPER_CASE = training_config.json keys, as in node/sweep.mjs --set) tuned on Kodak 768x512: growing 1 -> 100 sites over 1000 iterations, by mean final PSNR over 8 Kodak images, checked on the other 16 (commit adfadf0). Tuned with squared-error loss, before the loss option existed; growLrDecay 1 = off. Everything not listed comes from training_config.json. The LR warmup (200 of the 1000 iterations) was removed afterwards: within ±0.2 dB on MNIST and Kodak. Site count mapped afterwards to the start/end schedule: 1 → 100, exponential, reached at 30% of the run (countEnd 0.3): on 8 images at 256 px 24.04 dB vs 23.82 at 70%; at 5% λ 400 stopped growth at ~30 sites. Then a sweep of the count schedule (two rounds, 130 settings, 8 images at 256 px, 100 sites) found a plateau around 24.7 dB for sawtooth with 6–12 teeth, amplitude 2–3, any grow:merge, reached at 50%, a step every 5, vs 24.04 for the best exponential; picked 6 teeth, amplitude 2, grow:merge 3 (mid-plateau). On the 16 held-out images: 25.81 dB vs 25.08 for the exponential preset and 25.18 for the best exponential. Later removed from the trainer (ablations within noise or negative): growth LR decay, Hilbert-order candidate probes, τ-gradient diffusion, keep-best, growth blur, insertion growth, MDL stop and pruning.",
   "args": {
-    "iters": 1000,
+    "iters": 500,
     "lrMult": 8,
     "lrSchedule": "fixed",
     "loss": "l2",

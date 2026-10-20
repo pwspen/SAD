@@ -18,8 +18,8 @@ import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { gunzipSync } from "node:zlib";
 
-import { Trainer, buildArgs } from "../trainer/trainer.js?v=20261019";
-import { BatchTrainer, planBatches } from "../trainer/batch.js?v=20261019";
+import { Trainer, buildArgs } from "../trainer/trainer.js?v=defaults-20261019";
+import { BatchTrainer, planBatches } from "../trainer/batch.js?v=defaults-20261019";
 import { computePsnr } from "../trainer/io.js?v=20261019";
 import { whiteMaskRgba32Float } from "../trainer/textures.js?v=20261019";
 import { createHeadlessDevice, loadShadersFromDisk, loadJson, loadPngToFloat32 } from "./headless.mjs";

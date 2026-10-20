@@ -240,8 +240,8 @@ export function buildArgs(config, overrides = {}) {
     // Run length. The schedule, LR and growth defaults (and LR_POS_BASE / LR_TAU_BASE in
     // training_config.json) were tuned for growing 1 -> 100 sites over 1000
     // iterations, by mean final PSNR over 8 Kodak images, then checked on the
-    // other 16.
-    iters: Math.max(1, Math.floor(Number(pick("iters", null, 1000)))),
+    // other 16. The fallback is now 500 iterations.
+    iters: Math.max(1, Math.floor(Number(pick("iters", null, 500)))),
     candFreq: Number(pick("candFreq", "CAND_UPDATE_FREQ", 1)),
     candDownscale: Math.max(1, Number(pick("candDownscale", "CAND_DOWNSCALE", 1))),
     candUpdatePasses: Math.max(1, Number(pick("candUpdatePasses", "CAND_UPDATE_PASSES", 1))),
