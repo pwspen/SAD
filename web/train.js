@@ -105,6 +105,7 @@ const state = {
   lrHistory: [],         // [{ it, lr }] LR multiplier (schedule × LR mult) from log ticks
   growthGain: [],        // [{ step, addedAt, measuredAt, points: [{ site, predicted, realized }] }] per growth batch
   mergeEdges: null,      // { it, groups, scales, edgeWeights, mergedWeights } from the last "neighbor" merge step
+  tuneTrace: null,       // { name, start, best, points: [{ v, median, round }] } of the setting auto-tune is on
   lrPlan: null,          // { iters, lrMult, kind, growDoneIter } of the current run
   lastGrowth: null,      // { mode, doneIter, stop, sites, it, iters } at the latest log tick (Schedule summary)
   runSiteMode: null,     // siteMode of the current/last run
@@ -444,6 +445,7 @@ function fitCanvasToCard(canvas, width = canvas.width, height = canvas.height) {
 // events that redraw the view:
 //   target – a new target or mask      render – a new reconstruction
 //   log    – a log tick's metrics      run    – a run starting
+//   batch  – a batch's progress        tune   – an auto-tune batch finishing
 // Plot views also redraw on resize and hover; a plot with `hit` is hoverable.
 const SOURCES = {
   input:   { badge: "Input",    desc: "Input: what you loaded." },
@@ -451,7 +453,7 @@ const SOURCES = {
   train:   { badge: "Training", desc: "Training: reported by the trainer while it optimizes." },
   derived: { badge: "Viz only", desc: "Viz only: computed in the viewer (CPU) for display. The optimizer never sees it." },
 };
-const VIEW_EVENTS = ["target", "render", "log", "run", "batch"];
+const VIEW_EVENTS = ["target", "render", "log", "run", "batch", "tune"];
 
 const VIEWS = {
   target:     { label: "Target", kind: "image", source: "input", on: ["target"], draw: drawTarget,
@@ -585,6 +587,12 @@ const VIEWS = {
                       "circle is one run; the box spans the quartiles, the thick line the median and the whiskers " +
                       "1.5× the interquartile range. Drawn once the batch has finished; hover a run to find it " +
                       "in the other batch plots, click to load it." },
+  tune:       { label: "Auto-tune: PSNR vs setting", kind: "plot", source: "train", on: ["tune"],
+                draw: drawTunePlot, hit: hitTune,
+                note: "The setting the last auto-tune climbed (a tune button or optimize all, one setting at a " +
+                      "time): one dot per value tried, at the median final PSNR of its batch on the same images. " +
+                      "Orange: the best so far; the dashed line marks where it started. x is log-scaled, since " +
+                      "each round multiplies or divides by the tune ratio." },
   clusterMap: { label: `Snap clusters on the image (k = ${SNAP_MAP_K})`, kind: "image", source: "derived",
                 blank: "#f1f1ec", on: ["render"], draw: drawClusterMap,
                 note: "The latest render, washed out, with each site's centroid in its cluster's color from the " +
@@ -629,7 +637,7 @@ const LAYOUTS = {
   },
   batch: {
     label: "Batch",
-    areas: `"batchHist   batchPsnr batchPsnr"
+    areas: `"batchHist   batchPsnr tune"
             "batchDigits batchDigits batchDigits"
             "preview     target    psnr"`,
   },
@@ -1705,6 +1713,68 @@ function drawLrPlot(view) {
     drawTooltip(p, g, g.x(hover.it), g.y(hover.lr),
       { rows: [{ cells: [`iter ${hover.it} · LR ×${hover.lr.toPrecision(3)}`] }] });
   }
+}
+
+// ---- Auto-tune: median PSNR vs the setting's value ----
+
+const TUNE_DOT_COLOR = SERIES_COLORS[0];
+
+function tunePoints() {
+  return [...(state.tuneTrace?.points ?? [])].sort((a, b) => a.v - b.v);
+}
+
+function drawTunePlot(view) {
+  const p = beginPlot(view);
+  if (!p) return;
+  const trace = state.tuneTrace;
+  const pts = tunePoints();
+  let xr = { min: 0, max: 1 }, yr = { min: 0, max: 1 };
+  if (pts.length) {
+    const vs = pts.map((pt) => pt.v), ms = pts.map((pt) => pt.median);
+    const lo = Math.min(...vs), hi = Math.max(...vs);
+    xr = lo > 0
+      ? { min: lo / 1.25, max: hi * 1.25, log: true }
+      : { min: lo - Math.max(1e-6, (hi - lo) * 0.15) , max: hi + Math.max(1e-6, (hi - lo) * 0.15) };
+    const mlo = Math.min(...ms), mhi = Math.max(...ms);
+    const pad = Math.max(0.05, (mhi - mlo) * 0.15);
+    yr = { min: mlo - pad, max: mhi + pad };
+  }
+  const g = view.geom = plotAxes(plotBox(p), xr, yr);
+  drawAxes(p, g, { xTitle: trace?.name ?? "setting", yTitle: "median PSNR (dB)", xLabels: false,
+                   yFmt: (v) => v.toFixed(yr.max - yr.min < 1 ? 2 : 1) });
+  if (!pts.length) {
+    drawEmpty(p, g, "Click a tune button (or optimize all) to see its search");
+    return;
+  }
+  // x labels at the values tried, skipping any that would overlap the last one.
+  const { ctx, col } = p;
+  ctx.font = PLOT_FONT;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "top";
+  ctx.fillStyle = col.soft;
+  let lastRight = -Infinity;
+  for (const pt of pts) {
+    const label = String(pt.v);
+    const half = ctx.measureText(label).width / 2;
+    if (g.x(pt.v) - half < lastRight + 6) continue;
+    ctx.fillText(label, g.x(pt.v), g.bottom + 6);
+    lastRight = g.x(pt.v) + half;
+  }
+  drawRefLine(p, g, { x: trace.start, label: "start" });
+  drawLine(p, g, pts.map((pt) => [pt.v, pt.median]), col.soft, { width: 1 });
+  for (const pt of pts) drawMarker(p, g, pt.v, pt.median, pt.v === trace.best ? PSNR_LINE_COLOR : TUNE_DOT_COLOR);
+  const hover = view.hoverKey != null ? pts[view.hoverKey] : null;
+  if (hover) {
+    drawMarker(p, g, hover.v, hover.median, hover.v === trace.best ? PSNR_LINE_COLOR : TUNE_DOT_COLOR, 6);
+    drawTooltip(p, g, g.x(hover.v), g.y(hover.median), {
+      rows: [{ cells: [`${trace.name} ${hover.v}`, `${hover.median.toFixed(3)} dB`] }],
+      footer: (hover.round ? `round ${hover.round}` : "starting value") + (hover.v === trace.best ? " · best" : ""),
+    });
+  }
+}
+
+function hitTune(g, mx) {
+  return nearestX(g, tunePoints(), (pt) => pt.v, mx);
 }
 
 // ---- Predicted vs realized gain of grown sites (diagnostic) ----
@@ -3575,6 +3645,8 @@ const fmtDb = (db) => `${db >= 0 ? "+" : ""}${db.toFixed(3)} dB`;
 async function climbSetting(input, t, tune, items, isStopped, prefix = "") {
   const name = tuneName(input);
   const seen = new Map([[t.best, t.bestMedian]]); // same images, so no need to re-run a value
+  const trace = state.tuneTrace = { name, start: t.best, best: t.best, points: [{ v: t.best, median: t.bestMedian, round: 0 }] };
+  refreshViews("tune");
   for (let round = 1; round <= tune.rounds; round += 1) {
     const center = t.best;
     const centerMedian = t.bestMedian;
@@ -3590,9 +3662,12 @@ async function climbSetting(input, t, tune, items, isStopped, prefix = "") {
         if (!r || isStopped()) return false;
         median = r.median;
         seen.set(v, median);
+        trace.points.push({ v, median, round });
       }
       tried.push({ v, median });
       if (median > t.bestMedian) { t.best = v; t.bestMedian = median; }
+      trace.best = t.best;
+      refreshViews("tune");
     }
     appendLog(`Auto-tune ${name} round ${round}: ` +
               tried.map((x) => `${x.v} → ${x.median.toFixed(3)}`).join(", ") +
