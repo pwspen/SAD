@@ -821,7 +821,7 @@
       <aside class="panel hidden" id="paramsPanel">
         <h3 class="has-tip" tabindex="0">Site count<span class="tip" role="tooltip">The only settings that decide how many sites the run uses. The count goes from <b>start sites</b> at iteration 0 to <b>end sites</b> by <b>reach end by</b>, on the chosen curve, then holds while the rest of the run refines. Start &lt; end grows by splitting the cells a second site would explain best; start &gt; end prunes, merging the cheapest neighbouring pairs into one site (the pixel-weighted average of both); start = end is a fixed count, as is the <b>constant</b> schedule's single <b>sites</b> field. Each site costs 128 bits: bpp = sites × 128 / (width × height).</span></h3>
         <div class="param" data-count-schedule="constant">
-          <div class="row"><label>sites</label><input id="p-sites" type="number" min="1" /></div>
+          <div class="row"><label>sites</label><input id="p-sites" data-tune="int" type="number" min="1" /></div>
           <p class="help"><span class="unit">sites throughout the run</span></p>
           <div class="tip" role="tooltip">The count for the whole run: placed at iteration 0 by the default edge-based init and never grown or merged. A loaded init sites file sets this to its own count.</div>
         </div>
@@ -1034,7 +1034,7 @@
           <div class="tip" role="tooltip">Anisotropy: 0 = round, ±1 ≈ 2.7:1, clamped to ±2 ≈ 7.4:1. Frozen for the first 50 iterations.</div>
         </div>
 
-        <h3 class="has-tip" tabindex="0">Tuning<span class="tip" role="tooltip"><b>optimize all</b> tunes every setting in turn. How the <b>tune</b> buttons search. Each round runs one batch at the value × <b>tune ratio</b> and one at the value ÷ <b>tune ratio</b>, on the same images as the first batch, and moves to whichever raises the median final PSNR. It stops when neither does, or after <b>tune max rounds</b>. Not training settings: they don't change a run.</span></h3>
+        <h3 class="has-tip" tabindex="0">Tuning<span class="tip" role="tooltip"><b>optimize all</b> tunes every setting in turn except <b>sites</b> (more sites nearly always win). How the <b>tune</b> buttons search. Each round runs one batch at the value × <b>tune ratio</b> and one at the value ÷ <b>tune ratio</b>, on the same images as the first batch, and moves to whichever raises the median final PSNR. It stops when neither does, or after <b>tune max rounds</b>. Not training settings: they don't change a run.</span></h3>
         <div class="param">
           <div class="row"><label>tune ratio</label><input id="p-tuneRatio" data-no-tune type="number" step="0.1" min="1.01" value="1.5" /></div>
           <p class="help"><span class="unit">× up, ÷ down per round</span></p>

@@ -3516,9 +3516,14 @@ function tuneSettings() {
   return { up: ratio, down: 1 / ratio, rounds };
 }
 
-function tunableInputs() {
+// Float fields, plus integer ones marked data-tune="int" (tuned in whole
+// steps). Optimize all leaves out the integer ones (withInts false): sites is
+// the only one, and more sites almost always raise the PSNR, so it would just
+// spend the bit budget.
+function tunableInputs(withInts = true) {
   return [...ui.paramsPanel.querySelectorAll('input[type="number"]:not([data-no-tune])')]
-    .filter((el) => (el.getAttribute("step") ?? "").includes(".") || el.hasAttribute("data-float"));
+    .filter((el) => (el.getAttribute("step") ?? "").includes(".") || el.hasAttribute("data-float") ||
+                    (withInts && el.dataset.tune === "int"));
 }
 
 function setupAutoTune() {
@@ -3624,7 +3629,7 @@ async function optimizeAll(btn) {
       appendLog(`Optimize all: ${err.message}.`);
       return;
     }
-    const inputs = tunableInputs();
+    const inputs = tunableInputs(false);
     state.tune.progress = { units: 1 + cycles * inputs.length, done: -1 };
     nextTuneUnit(true);
     setStatus("Optimize all: baseline");
@@ -3680,7 +3685,8 @@ async function optimizeAll(btn) {
 function tuneValue(input, v) {
   const min = input.min === "" ? -Infinity : Number(input.min);
   const max = input.max === "" ? Infinity : Number(input.max);
-  return Number(Math.min(max, Math.max(min, v)).toPrecision(4));
+  const c = Math.min(max, Math.max(min, v));
+  return input.dataset.tune === "int" ? Math.max(min, Math.round(c)) : Number(c.toPrecision(4));
 }
 
 function setTuneValue(input, v) {
