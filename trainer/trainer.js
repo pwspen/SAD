@@ -1370,6 +1370,23 @@ export class Trainer {
     return { psnr: psnr(snapped), basePsnr: psnr(base) };
   }
 
+  // Renders with `rgbSites` (actualSites · SITE_FLOATS, decoded colors) as a
+  // decoder would: candidate lists rebuilt from them, not kept from the
+  // current sites. Then puts the originals back, rebuilds their lists the same
+  // way and renders them for the baseline. Returns { psnr, basePsnr }.
+  async decodedPsnr(rgbSites) {
+    const queue = this.device.queue;
+    const n = this.actualSites;
+    const original = await readSites(this.device, this.sitesBuf, n);
+    const psnr = (rgba) => computePsnrSafe(rgba, this.target, this.width, this.height, this.maskCpu, this.maskSum);
+    queue.writeBuffer(this.sitesBuf, 0, encodeSiteColors(rgbSites.slice(0, n * SITE_FLOATS), n, this.colorSpace));
+    this._rebuildCandidates(n);
+    const decoded = psnr(await this.renderView("render"));
+    queue.writeBuffer(this.sitesBuf, 0, original);
+    this._rebuildCandidates(n);
+    return { psnr: decoded, basePsnr: psnr(await this.renderView("render")) };
+  }
+
   // Site readback with colors decoded to RGB, so nothing outside the trainer
   // sees color-space params.
   async _readSitesRgb(count) {

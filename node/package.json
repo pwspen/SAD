@@ -5,7 +5,7 @@
   "description": "Headless Node runner for the SAD WebGPU JS trainer (Dawn bindings).",
   "scripts": {
     "sweep": "node sweep.mjs",
-    "test": "node color_spaces_test.mjs && node merge_test.mjs"
+    "test": "node color_spaces_test.mjs && node merge_test.mjs && node codec_test.mjs"
   },
   "dependencies": {
     "pngjs": "7.0.0",

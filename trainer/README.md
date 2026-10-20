@@ -71,6 +71,9 @@ There is no LR warmup. `lrSchedule` is `"cosine"` (1 to 0 over `iters`), `"fixed
 - `textures.js` - target / mask / candidate texture helpers + image upload.
 - `color_spaces.js` - site color parameterizations.
 - `io.js` - sites `.txt` parsing + serialization + PNG download.
+- `codec.js` - site codec: quantization (steps from the Gauss–Newton sensitivity), neighbour
+  prediction and adaptive arithmetic coding, with a decoder, so the rate is a real bitstream
+  length rather than `BITS_PER_SITE`. `node/codec_test.mjs` checks the round trip.
 
 ## Storage-buffer limits
 

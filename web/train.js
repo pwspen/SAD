@@ -5,12 +5,13 @@
 
 import { loadShaders, tileSlotsForLimit } from "../trainer/shader_loader.js?v=20261019";
 import { requestTrainingDevice } from "../trainer/device.js?v=20261019";
-import { Trainer, buildArgs, GRAD_GROUPS, GRAD_CHANNELS, lrSchedule, LR_SCHEDULES, LOSSES, COUNT_SCHEDULES, LAYER_MODES, countPlan, countVaries, countHorizon } from "../trainer/trainer.js?v=defaults-20261020";
+import { Trainer, buildArgs, GRAD_GROUPS, GRAD_CHANNELS, lrSchedule, LR_SCHEDULES, LOSSES, COUNT_SCHEDULES, LAYER_MODES, countPlan, countVaries, countHorizon } from "../trainer/trainer.js?v=codec-20261020";
 import { loadImageToFloat32, loadMaskRgba32Float, whiteMaskRgba32Float } from "../trainer/textures.js?v=20261019";
 import { loadSitesFromFile, serializeSitesTxt, triggerDownload, floatImageToRgba8, computeBpp, computePsnr, BITS_PER_SITE } from "../trainer/io.js?v=20261019";
 import { SITE_FLOATS } from "../trainer/params.js?v=20261019";
-import { BatchTrainer, planBatches, tileSites, tileActive, tileSize, atlasCapacity } from "../trainer/batch.js?v=defaults-20261020";
+import { BatchTrainer, planBatches, tileSites, tileActive, tileSize, atlasCapacity } from "../trainer/batch.js?v=codec-20261020";
 import { COLOR_SPACES } from "../trainer/color_spaces.js?v=20261019";
+import { encodeSites, codecSteps, CODEC_PLANES } from "../trainer/codec.js?v=20261020b";
 import { parquetMetadata, parquetReadObjects } from "./vendor/hyparquet/src/index.js";
 import {
   luma, maskWeights, laplacianBands, maskLevels, bandEnergies, IMPORTANCE, importanceMap,
@@ -32,6 +33,11 @@ const DEMO_MAX_IMAGE_SIDE = 2048;
 const VALUE_BINS = 24; // bins per panel of the site parameter values view
 const MI_ROUND_ANISO = 0.05; // |log_aniso| below this, a site has no orientation (site MI view)
 const SNAP_MAP_K = 4; // snap-analysis fit drawn on the image (one of SNAP_KS)
+// Entropy coding: PSNR budgets (dB, predicted) to spend on quantization, and
+// the one a run's coded point on the PSNR vs bpp plot uses.
+const CODEC_LOSSES = [0.02, 0.05, 0.1, 0.2, 0.5, 1, 2];
+const CODEC_REPORT_LOSS = 0.1;
+const CODED_COLOR = "#1baf7a";
 // Datasets live outside this repo, as Hugging Face parquet files (see
 // DATASETS): ../comp/data/<key>/<file>, which resolves under the kodak-bench
 // server (it serves the parent dir). Override a folder with ?<key>=<dir>.
@@ -98,7 +104,7 @@ const state = {
   lastActiveSites: 0,    // active sites at the last log tick (site-spacing reference lines)
   psnrHistory: [],       // [{ it, psnr, sites }] from log ticks, plotted in the PSNR card
   psnrIters: 0,
-  bppRuns: [],           // [{ sites, bpp, colorSpace, points: [{ it, psnr, sites, bpp }] }] per run on this target; last is current
+  bppRuns: [],           // [{ sites, bpp, colorSpace, points: [{ it, psnr, sites, bpp }], coded? }] per run on this target; last is current
   gradHistory: [],       // [{ it, stats }] per-param |grad| mean/max from log ticks
   gradSnapshot: null,    // { grads, siteCount, numPixels } raw per-site grads from the last log tick
   gradHeatParam: "mag",  // gradient heatmap: "mag" or a channel index into GRAD_CHANNELS
@@ -115,6 +121,7 @@ const state = {
   siteMI: null,          // { sites, mi } parameter mutual information for the latest readback
   snapAnalysis: null,    // { sites, status, result, error, promise } for the latest sites (see snapAnalysis())
   sensitivity: null,     // { sites, promise } of Trainer.siteSensitivity() for the latest sites (sensitivityOf())
+  codec: null,           // { sites, status, result, error, promise } entropy coding of the latest sites (codecJob())
   sensitivityHist: null, // { sites, status, result, error } for the sensitivity histogram (sensitivityJob())
   siteValues: null,      // { sites, panels } parameter value histograms for the latest readback
   importanceImage: null, // RGBA8 importance map for the current target + mask
@@ -528,8 +535,21 @@ const VIEWS = {
                 note: "Masked PSNR the trainer computes at each log tick, with the active site count and each site's LR multiplier (schedule × growth LR decay) on the right axes." },
   bpp:        { label: "PSNR vs bpp", kind: "plot", source: "derived", on: ["log", "run", "target"],
                 draw: drawBppPlot, hit: hitBpp,
-                note: `Estimated rate: active sites × ${BITS_PER_SITE} bits / pixels. The bits per site are an ` +
-                      "assumption, not a measured code length. PSNR comes from the trainer." },
+                note: `Grey and orange: the raw rate, active sites × ${BITS_PER_SITE} bits / pixels (an assumption), ` +
+                      "at the trainer's PSNR. Green, once a run has stopped: the entropy-coded rate (the Entropy " +
+                      "coding card's bitstream) at the PSNR of the decoded sites; the current run shows the codec's " +
+                      `whole curve, earlier runs their point at the ${CODEC_REPORT_LOSS} dB budget.` },
+  codec:      { label: "Entropy coding", kind: "plot", source: "derived", on: ["render", "run"],
+                draw: drawCodec,
+                note: "After a run: the sites coded to a real bitstream (trainer/codec.js), decoded, and " +
+                      "re-rendered with candidate lists rebuilt from the decoded sites, as a decoder would. " +
+                      "Stages: quantize (uniform steps per parameter, from the Gauss–Newton sensitivity so each " +
+                      "parameter adds the same predicted error; aniso_dir as an angle mod π, its step divided by " +
+                      "|2 sinh log_aniso| per site, so none for round sites (the θ row shows the undivided step); colors as lossless YCoCg-R), sort by position and code positions as raster gaps, " +
+                      "predict each value from its 3 nearest earlier sites or a constant (whichever is shorter), " +
+                      "then adaptive arithmetic coding. Left: one row per PSNR budget spent on quantization " +
+                      "(predicted), with the measured loss. Right: where the bits go at the " +
+                      `${CODEC_REPORT_LOSS} dB budget (nbr = neighbour prediction, const = constant).` },
   grad:       { label: "|gradient| vs iteration (log)", kind: "plot", source: "train", on: ["log", "run"],
                 draw: drawGradPlot, hit: hitGrad,
                 note: "Per-parameter-group |gradient| over sites, reported by the trainer at each log tick." },
@@ -651,6 +671,11 @@ const LAYOUTS = {
     label: "Sites & tau",
     areas: `"preview  siteIds    tau"
             "residual importance psnr"`,
+  },
+  rate: {
+    label: "Rate",
+    areas: `"bpp  bpp     codec codec"
+            "psnr preview codec codec"`,
   },
   plots: {
     label: "Plots",
@@ -1565,6 +1590,8 @@ function hitPsnr(g, mx) {
 // accumulate: earlier runs show as their final point (joined in bpp order, an
 // RD curve per site color space); the current run shows its log-tick trail,
 // each tick at the bpp of the sites active then (grow mode moves it right).
+// Entropy-coded points (codecJob) go next to them in CODED_COLOR: the current
+// run's whole codec curve, earlier runs' CODEC_REPORT_LOSS points.
 
 const BPP_PAST_COLOR = "#66666e";
 
@@ -1574,18 +1601,30 @@ function colorSpaceColor(key) {
   return i <= 0 ? BPP_PAST_COLOR : SERIES_COLORS[(i - 1) % SERIES_COLORS.length];
 }
 
-// Plotted points: { x: bpp, y: psnr, sites, run, point, current }.
+// Plotted points: { x: bpp, y: psnr, sites, run, point, current, coded? }
+// (coded: { bitsPerSite, lossDb } of an entropy-coded point).
 function bppPlotPoints() {
   const runs = state.bppRuns;
   const pts = [];
+  const job = state.codec?.status === "done" && state.codec.sites === state.lastSites ? state.codec : null;
   runs.forEach((r, ri) => {
     const current = ri === runs.length - 1;
     if (current) {
       r.points.forEach((p, pi) => pts.push({ x: p.bpp, y: p.psnr, sites: p.sites, run: ri, point: pi, current }));
+      if (job && r.coded) {
+        job.result.rows.forEach((row, ci) => pts.push({
+          x: row.bpp, y: row.psnr, sites: row.n, run: ri, point: `c${ci}`, current,
+          coded: { bitsPerSite: row.bitsPerSite, lossDb: row.lossDb },
+        }));
+      }
     } else if (r.points.length) {
       const pi = r.points.length - 1;
       const p = r.points[pi];
       pts.push({ x: p.bpp, y: p.psnr, sites: p.sites, run: ri, point: pi, current });
+    }
+    if (r.coded && !(current && job)) {
+      pts.push({ x: r.coded.bpp, y: r.coded.psnr, sites: r.coded.n, run: ri, point: "c", current,
+                 coded: { bitsPerSite: r.coded.bitsPerSite, lossDb: CODEC_REPORT_LOSS } });
     }
   });
   return pts;
@@ -1594,6 +1633,7 @@ function bppPlotPoints() {
 function drawBppPlot(view) {
   const p = beginPlot(view);
   if (!p) return;
+  codecJob(); // starts coding the latest sites once training has stopped
   const pts = bppPlotPoints();
   let xMin = Infinity, xMax = -Infinity, lo = Infinity, hi = -Infinity;
   const cur0 = state.bppRuns[state.bppRuns.length - 1];
@@ -1609,27 +1649,40 @@ function drawBppPlot(view) {
   const xr = { min: 10 ** (mid - span / 2), max: 10 ** (mid + span / 2), log: true };
   // Color-space legend only once runs in more than one space are on the plot.
   const spaces = [...new Set(state.bppRuns.map((r) => r.colorSpace))];
-  const top = spaces.length > 1
-    ? drawLegend(p, spaces.map((key) => ({ label: COLOR_SPACES[key].label, color: colorSpaceColor(key) }))) + 10
-    : undefined;
+  const coded = pts.filter((pt) => pt.coded);
+  const legend = spaces.length > 1
+    ? spaces.map((key) => ({ label: `${COLOR_SPACES[key].label} (${BITS_PER_SITE} bits/site)`, color: colorSpaceColor(key) }))
+    : coded.length ? [{ label: `${BITS_PER_SITE} bits/site`, color: BPP_PAST_COLOR }] : [];
+  if (coded.length) legend.push({ label: "entropy coded", color: CODED_COLOR });
+  const top = legend.length ? drawLegend(p, legend) + 10 : undefined;
   const g = view.geom = plotAxes(plotBox(p, top), xr, linRange(lo, hi, [0, 40]));
-  drawAxes(p, g, { xTitle: `bpp (${BITS_PER_SITE} bits/site)`, yTitle: "PSNR (dB)", xFmt: fmtSig, xSpacing: 40 });
+  drawAxes(p, g, { xTitle: coded.length ? "bpp" : `bpp (${BITS_PER_SITE} bits/site)`, yTitle: "PSNR (dB)",
+                   xFmt: fmtSig, xSpacing: 40 });
   if (!pts.length) {
     drawEmpty(p, g, state.running ? "Waiting for first log tick…" : "Train to see PSNR vs bpp");
     return;
   }
 
   // Earlier runs: final points joined in bpp order, one curve per color space
+  // (raw rate solid, coded dashed)
   for (const space of spaces) {
     const color = colorSpaceColor(space);
-    const past = pts.filter((pt) => !pt.current && state.bppRuns[pt.run].colorSpace === space)
-      .sort((a, b) => a.x - b.x);
-    if (past.length > 1) drawLine(p, g, past.map((pt) => [pt.x, pt.y]), color, { width: 1.5 });
-    for (const pt of past) drawMarker(p, g, pt.x, pt.y, color, 3.5);
+    for (const isCoded of [false, true]) {
+      const past = pts.filter((pt) => !pt.current && !pt.coded === !isCoded && state.bppRuns[pt.run].colorSpace === space)
+        .sort((a, b) => a.x - b.x);
+      const c = isCoded ? CODED_COLOR : color;
+      if (past.length > 1) drawLine(p, g, past.map((pt) => [pt.x, pt.y]), c, { width: 1.5, dash: isCoded ? [5, 4] : [] });
+      for (const pt of past) drawMarker(p, g, pt.x, pt.y, c, 3.5);
+    }
   }
 
+  // Current run's codec curve, the report budget marked larger
+  const curCoded = coded.filter((pt) => pt.current).sort((a, b) => a.x - b.x);
+  if (curCoded.length > 1) drawLine(p, g, curCoded.map((pt) => [pt.x, pt.y]), CODED_COLOR);
+  for (const pt of curCoded) drawMarker(p, g, pt.x, pt.y, CODED_COLOR, pt.coded.lossDb === CODEC_REPORT_LOSS ? 4.5 : 3);
+
   // Current run: trail of log ticks in iteration order, latest marked
-  const cur = pts.filter((pt) => pt.current);
+  const cur = pts.filter((pt) => pt.current && !pt.coded);
   if (cur.length) {
     if (cur.length > 1) drawLine(p, g, cur.map((pt) => [pt.x, pt.y]), PSNR_LINE_COLOR);
     const last = cur[cur.length - 1];
@@ -1639,9 +1692,14 @@ function drawBppPlot(view) {
   const hover = view.hoverKey && pts.find((pt) => `${pt.run}:${pt.point}` === view.hoverKey);
   if (!hover) return;
   const run = state.bppRuns[hover.run];
-  drawMarker(p, g, hover.x, hover.y, hover.current ? PSNR_LINE_COLOR : colorSpaceColor(run.colorSpace), 5);
+  drawMarker(p, g, hover.x, hover.y,
+             hover.coded ? CODED_COLOR : hover.current ? PSNR_LINE_COLOR : colorSpaceColor(run.colorSpace), 5);
+  const rate = hover.coded
+    ? `${hover.coded.bitsPerSite.toFixed(1)} bits/site coded (${hover.coded.lossDb} dB budget)`
+    : `${BITS_PER_SITE} bits/site`;
   drawTooltip(p, g, g.x(hover.x), g.y(hover.y), {
-    rows: [{ cells: [`${hover.sites} sites · ${fmtSig(hover.x)} bpp · ${hover.y.toFixed(2)} dB · ${COLOR_SPACES[run.colorSpace].label}`] }],
+    rows: [{ cells: [`${hover.sites} sites · ${fmtSig(hover.x)} bpp · ${hover.y.toFixed(2)} dB · ${COLOR_SPACES[run.colorSpace].label}`] },
+           { cells: [rate] }],
   });
 }
 
@@ -2480,7 +2538,8 @@ function snapAnalysis() {
   if (state.snapAnalysis?.sites === sites) return state.snapAnalysis;
   if (!sites || !state.trainer || state.running) return null;
   const job = { sites, status: "running", result: null, error: null };
-  job.promise = runSnapAnalysis(job, state.trainer)
+  const trainer = state.trainer;
+  job.promise = withGpu(() => runSnapAnalysis(job, trainer))
     .then((result) => { job.result = result; job.status = "done"; })
     .catch((err) => { job.error = err.message; job.status = "error"; console.error(err); })
     .finally(() => { if (state.snapAnalysis === job) drawSnapViews(); });
@@ -2488,7 +2547,19 @@ function snapAnalysis() {
   return job;
 }
 
+// Analyses that swap other sites into the trainer to re-render (snap
+// analysis, entropy coding) take turns: each runs once the last has finished.
+// Training and snapshot loads wait for gpuIdle() before touching the trainer.
+let gpuChain = Promise.resolve();
+function withGpu(fn) {
+  const job = gpuChain.then(fn);
+  gpuChain = job.catch(() => {});
+  return job;
+}
+const gpuIdle = () => gpuChain;
+
 function drawSnapViews() {
+  drawCodecViews();
   if (VIEWS.siteClusters.canvas) drawSnapAnalysis(VIEWS.siteClusters);
   drawClusterMap();
   if (VIEWS.sensitivity.canvas) drawSensitivity(VIEWS.sensitivity);
@@ -2564,6 +2635,26 @@ async function runSnapAnalysis(job, trainer) {
   };
 }
 
+// A text table between x0 and x1 from box.top down: the first column left
+// aligned, the rest right aligned. A row may be { cells, color }.
+function drawTable(p, box, x0, x1, header, rows) {
+  const { ctx, col } = p;
+  const rowH = Math.min(18, (box.bottom - box.top) / (rows.length + 1));
+  const n = header.length;
+  const xs = header.map((_, j) => (j === 0 ? x0 : x0 + ((x1 - x0) * (j + 1)) / (n + 0.5)));
+  ctx.font = PLOT_FONT;
+  ctx.textBaseline = "middle";
+  const drawRow = (cells, y, color) => {
+    ctx.fillStyle = color;
+    cells.forEach((c, j) => { ctx.textAlign = j === 0 ? "left" : "right"; ctx.fillText(c, xs[j], y); });
+  };
+  let y = box.top + rowH / 2;
+  drawRow(header, y, col.dim);
+  ctx.strokeStyle = col.line;
+  ctx.beginPath(); ctx.moveTo(x0, y + rowH / 2); ctx.lineTo(x1, y + rowH / 2); ctx.stroke();
+  for (const row of rows) { y += rowH; drawRow(row.cells || row, y, row.color || col.text); }
+}
+
 // Two tables side by side: per k, predicted vs re-rendered PSNR loss of the
 // joint snap; per parameter, the predicted loss if every site shared one value.
 function drawSnapAnalysis(view) {
@@ -2582,22 +2673,7 @@ function drawSnapAnalysis(view) {
   }
   const r = job.result;
   const fmtDb = (v) => (v < 0.005 ? "<0.01" : v.toFixed(2));
-  const table = (x0, x1, header, rows) => {
-    const rowH = Math.min(18, (box.bottom - box.top) / (rows.length + 1));
-    const n = header.length;
-    const xs = header.map((_, j) => (j === 0 ? x0 : x0 + ((x1 - x0) * (j + 1)) / (n + 0.5)));
-    ctx.font = PLOT_FONT;
-    ctx.textBaseline = "middle";
-    const drawRow = (cells, y, color) => {
-      ctx.fillStyle = color;
-      cells.forEach((c, j) => { ctx.textAlign = j === 0 ? "left" : "right"; ctx.fillText(c, xs[j], y); });
-    };
-    let y = box.top + rowH / 2;
-    drawRow(header, y, col.dim);
-    ctx.strokeStyle = col.line;
-    ctx.beginPath(); ctx.moveTo(x0, y + rowH / 2); ctx.lineTo(x1, y + rowH / 2); ctx.stroke();
-    for (const cells of rows) { y += rowH; drawRow(cells, y, col.text); }
-  };
+  const table = (x0, x1, header, rows) => drawTable(p, box, x0, x1, header, rows);
   const mid = Math.round(w * 0.52);
   table(box.left, mid - 12, ["k clusters", "bits", "pred.", "actual"],
         r.rows.map((row) => [String(row.k), row.bits.toFixed(0), fmtDb(row.pred), fmtDb(row.real)]));
@@ -2607,6 +2683,105 @@ function drawSnapAnalysis(view) {
   ctx.textAlign = "center";
   ctx.textBaseline = "bottom";
   ctx.fillText(`PSNR loss (dB) from snapping: predicted, re-rendered · ${r.n} sites · base ${r.basePsnr.toFixed(2)} dB`,
+               w / 2, h - 8);
+}
+
+// ---- Entropy coding ----
+// The latest sites through trainer/codec.js at each CODEC_LOSSES budget: the
+// bitstream's length is the rate, and the decoded sites re-rendered with
+// rebuilt candidate lists give the PSNR. Runs between training runs; the
+// CODEC_REPORT_LOSS row also goes on the run's PSNR vs bpp entry.
+
+function codecJob() {
+  const sites = state.lastSites;
+  if (state.codec?.sites === sites) return state.codec;
+  if (!sites || !state.trainer || state.running) return null;
+  const job = { sites, status: "running", result: null, error: null };
+  const trainer = state.trainer, count = state.lastSiteCount, run = state.bppRuns.at(-1);
+  job.promise = withGpu(() => runCodec(sites, count, trainer))
+    .then((result) => {
+      job.result = result;
+      job.status = "done";
+      if (run && state.lastSites === sites) run.coded = result.report;
+    })
+    .catch((err) => { job.error = err.message; job.status = "error"; console.error(err); })
+    .finally(() => { if (state.codec === job) drawCodecViews(); });
+  state.codec = job;
+  return job;
+}
+
+function drawCodecViews() {
+  if (VIEWS.codec.canvas) drawCodec(VIEWS.codec);
+  if (VIEWS.bpp.canvas) drawBppPlot(VIEWS.bpp);
+}
+
+async function runCodec(sites, count, trainer) {
+  const { F, samples } = await sensitivityOf(trainer, sites);
+  const { width, height } = trainer;
+  const pixels = width * height;
+  const globalSite = trainer.layerIndex ?? -1;
+  const { basePsnr } = await trainer.decodedPsnr(sites);
+  const sse0 = samples * 10 ** (-basePsnr / 10);
+  const rows = [];
+  for (const lossDb of CODEC_LOSSES) {
+    await new Promise((r) => setTimeout(r, 0));
+    const steps = codecSteps(sites, count, F, { lossDb, sse0 });
+    const enc = encodeSites(sites, count, width, height, steps, { globalSite });
+    // Decoded sites back in their slots, so the layer keeps its index.
+    const placed = Float32Array.from(sites);
+    enc.slots.forEach((slot, i) => placed.set(enc.decoded.subarray(i * SITE_FLOATS, (i + 1) * SITE_FLOATS), slot * SITE_FLOATS));
+    const { psnr, basePsnr: base } = await trainer.decodedPsnr(placed);
+    rows.push({ lossDb, steps, enc, n: enc.n, bits: enc.bits, bitsPerSite: enc.bits / Math.max(1, enc.n),
+                bpp: enc.bits / pixels, psnr, loss: base - psnr });
+  }
+  const report = rows.find((r) => r.lossDb === CODEC_REPORT_LOSS);
+  return {
+    basePsnr, rows, pixels,
+    report: { bpp: report.bpp, psnr: report.psnr, bitsPerSite: report.bitsPerSite, n: report.n },
+  };
+}
+
+// Left: per budget, the rate and the measured loss. Right: the report
+// budget's bits per site by stage.
+function drawCodec(view) {
+  const p = beginPlot(view);
+  if (!p) return;
+  const { ctx, col, w, h } = p;
+  const box = { left: 12, right: w - 12, top: PLOT_PAD.top, bottom: h - 28 };
+  const job = codecJob();
+  const msg = state.running ? "Runs when training stops"
+    : !job ? "Sites appear after the first render"
+    : job.status === "running" ? "Coding…"
+    : job.status === "error" ? `Coding failed: ${job.error}` : null;
+  if (msg) {
+    drawEmpty(p, box, msg);
+    return;
+  }
+  const r = job.result;
+  const rep = r.rows.find((row) => row.lossDb === CODEC_REPORT_LOSS);
+  const mid = Math.round(w * 0.55);
+  drawTable(p, box, box.left, mid - 12, ["budget", "bits/site", "bpp", "PSNR", "loss"],
+    r.rows.map((row) => ({
+      color: row === rep ? CODED_COLOR : undefined,
+      cells: [String(row.lossDb), row.bitsPerSite.toFixed(1), fmtSig(row.bpp), row.psnr.toFixed(2), row.loss.toFixed(2)],
+    })));
+  const { enc, steps } = rep;
+  const per = (bits) => (bits / Math.max(1, enc.n)).toFixed(2);
+  const stepOf = { log_aniso: steps.logAniso, "θ": steps.theta, log_tau: steps.logTau, radius: steps.radius,
+                   Y: steps.color, Co: steps.color, Cg: steps.color };
+  drawTable(p, box, mid + 4, box.right, ["stage", "bits/site", "step", "pred."], [
+    ["header", per(enc.headerBits), "", ""],
+    ["position", per(enc.positionBits), fmtSig(steps.pos) + " px", "gaps"],
+    ...CODEC_PLANES.map((name, i) => [name, per(enc.planeBits[i]), Number.isFinite(stepOf[name]) ? fmtSig(stepOf[name]) : "∞",
+                                      enc.modes[i] ? "nbr" : "const"]),
+    { color: CODED_COLOR, cells: ["total", per(enc.bits), "", ""] },
+  ]);
+  ctx.fillStyle = col.soft;
+  ctx.font = PLOT_FONT;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "bottom";
+  ctx.fillText(`${enc.n} sites · decoded at ${r.basePsnr.toFixed(2)} dB unquantized · ` +
+               `${BITS_PER_SITE} bits/site would be ${fmtSig((BITS_PER_SITE * enc.n) / r.pixels)} bpp`,
                w / 2, h - 8);
 }
 
@@ -3353,7 +3528,7 @@ async function startTraining() {
   state.lastOwner = null;
   // The previous run's trainer only served site-ID / tau renders of its last
   // state; free its GPU buffers so repeated (or looped) runs don't pile up.
-  await state.snapAnalysis?.promise; // it renders with the old trainer
+  await gpuIdle(); // the analyses render with the old trainer
   state.trainer?.destroy();
   state.trainer = null;
 
@@ -3602,7 +3777,7 @@ async function runBatch({ items: fixedItems = null, quiet = false } = {}) {
   ui.stopBtn.disabled = false;
   ui.saveBtn.disabled = true;
   setDatasetEnabled(false);
-  await state.snapAnalysis?.promise; // it renders with the old trainer
+  await gpuIdle(); // the analyses render with the old trainer
   state.trainer?.destroy();
   state.trainer = null;
   updateBatchBar();
@@ -4241,6 +4416,8 @@ async function showBatchSnapshot(k) {
     do {
       shown = b.snapIndex;
       const snap = run.snaps[shown];
+      await gpuIdle(); // an analysis may still be rendering the last snapshot
+      if (state.trainer !== trainer) return;
       trainer.showSites(snap.sites, snap.count, snap.layer);
       const rgba = await trainer.renderView("render");
       if (state.trainer !== trainer) return;
