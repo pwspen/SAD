@@ -1373,15 +1373,15 @@ function iterRange() {
 
 // Right-hand y axis for another series on the same box (labels and title
 // only; the grid follows the left axis), `offset` px right of the plot.
-// Linear axes label integer ticks only.
-function drawRightAxis(p, g, { title, offset = 0, fmt = String, spacing = 48 }) {
+// Linear axes label integer ticks only unless `integers` is false.
+function drawRightAxis(p, g, { title, offset = 0, fmt = String, spacing = 48, integers = true }) {
   const { ctx, col } = p;
   ctx.font = PLOT_FONT;
   ctx.textAlign = "left";
   ctx.textBaseline = "middle";
   ctx.fillStyle = col.soft;
   for (const v of axisTicks(g.yr, g.bottom - g.top, spacing)) {
-    if (g.yr.log || Number.isInteger(v)) ctx.fillText(fmt(v), g.right + offset + 6, Math.round(g.y(v)) + 0.5);
+    if (g.yr.log || !integers || Number.isInteger(v)) ctx.fillText(fmt(v), g.right + offset + 6, Math.round(g.y(v)) + 0.5);
   }
   ctx.save();
   ctx.fillStyle = col.dim;
@@ -1393,7 +1393,8 @@ function drawRightAxis(p, g, { title, offset = 0, fmt = String, spacing = 48 }) 
 }
 
 const SITES_LINE_COLOR = SERIES_COLORS[0];
-const PSNR_PAD = { ...LEGEND_PAD, right: 50 }; // room for the sites axis
+const LR_LINE_COLOR = SERIES_COLORS[2];
+const PSNR_PAD = { ...LEGEND_PAD, right: 100 }; // room for the sites and LR axes
 
 function drawPsnrPlot(view) {
   const p = beginPlot(view);
@@ -1406,12 +1407,18 @@ function drawPsnrPlot(view) {
   const top = drawLegend(p, [
     { label: "PSNR", color: PSNR_LINE_COLOR },
     { label: "sites", color: SITES_LINE_COLOR },
+    { label: "LR mult", color: LR_LINE_COLOR },
   ]) + 10;
+  const lrData = state.lrHistory;
+  let maxLr = 0;
+  for (const d of lrData) maxLr = Math.max(maxLr, d.lr);
   const box = plotBox(p, top, PSNR_PAD);
   const g = view.geom = plotAxes(box, iterRange(), linRange(lo, hi, [0, 40]));
   const gs = plotAxes(box, g.xr, { min: 0, max: Math.ceil(maxSites * 1.08) });
+  const gl = plotAxes(box, g.xr, { min: 0, max: maxLr > 0 ? maxLr * 1.08 : 1 });
   drawAxes(p, g, { xTitle: "iteration", yTitle: "PSNR (dB)", xFmt: fmtIter });
   drawRightAxis(p, gs, { title: "sites" });
+  drawRightAxis(p, gl, { title: "LR multiplier", offset: 50, integers: false, fmt: (v) => String(Number(v.toPrecision(3))) });
   if (!data.length) {
     drawEmpty(p, g, state.running ? "Waiting for first log tick…" : "Train to see PSNR");
     return;
@@ -1419,15 +1426,20 @@ function drawPsnrPlot(view) {
   // Sites change in steps at growth; draw them as a step line.
   drawLine(p, gs, data.flatMap((d, i) => (i && d.sites !== data[i - 1].sites
     ? [[d.it, data[i - 1].sites], [d.it, d.sites]] : [[d.it, d.sites]])), SITES_LINE_COLOR, { width: 1.5 });
+  if (lrData.length) drawLine(p, gl, lrData.map((d) => [d.it, d.lr]), LR_LINE_COLOR, { width: 1.5 });
   drawLine(p, g, data.map((d) => [d.it, d.psnr]), PSNR_LINE_COLOR);
   const hover = view.hoverKey != null ? data[view.hoverKey] : null;
   if (hover) drawCrosshair(p, g, hover.it);
   const mark = hover || data[data.length - 1];
+  // LR samples come from the same log ticks; match by iteration.
+  const markLr = lrData.find((d) => d.it === mark.it);
   drawMarker(p, gs, mark.it, mark.sites, SITES_LINE_COLOR);
+  if (markLr) drawMarker(p, gl, markLr.it, markLr.lr, LR_LINE_COLOR);
   drawMarker(p, g, mark.it, mark.psnr, PSNR_LINE_COLOR);
   if (hover) {
+    const lrText = markLr ? ` · LR ×${markLr.lr.toPrecision(3)}` : "";
     drawTooltip(p, g, g.x(hover.it), g.y(hover.psnr), {
-      rows: [{ cells: [`iter ${hover.it} · ${hover.psnr.toFixed(2)} dB · ${hover.sites} sites`] }],
+      rows: [{ cells: [`iter ${hover.it} · ${hover.psnr.toFixed(2)} dB · ${hover.sites} sites${lrText}`] }],
     });
   }
 }
