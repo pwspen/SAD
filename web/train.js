@@ -562,8 +562,9 @@ const VIEWS = {
   batchPsnr:  { label: "Batch: PSNR vs iteration", kind: "plot", source: "train", on: ["batch"],
                 draw: drawBatchViews, hit: hitBatchPsnr, click: clickBatchRun,
                 note: "Every run of the last batch, from its PSNR log ticks (log every in the Batch menu). Grey: " +
-                      "finished; blue: still running; orange: the selected run. Hover a curve to find its run; " +
-                      "once the batch has finished, click it to load the run into the other views." },
+                      "finished; blue: still running; orange: the selected run; green: the mean over runs at each " +
+                      "tick, labeled at its start, middle and end. Hover a curve to find its run; once the batch " +
+                      "has finished, click it to load the run into the other views." },
   batchHist:  { label: "Batch: final PSNR", kind: "plot", source: "train", on: ["batch"],
                 draw: drawBatchViews, hit: hitBatchHist, click: clickBatchRun,
                 note: "How many runs ended at each PSNR. Each run is one cell, stacked in its bin by PSNR, so " +
@@ -3831,6 +3832,7 @@ function toggleBatchMenu() {
 // ---- Batch plots ----
 
 const BATCH_RUNNING_COLOR = SERIES_COLORS[0];
+const BATCH_AVG_COLOR = SERIES_COLORS[5];
 const batchHoverRun = () => VIEWS.batchPsnr.hoverKey ?? VIEWS.batchHist.hoverKey ?? null;
 
 // Both batch cards share hover and selection, so each draws both.
@@ -3879,12 +3881,53 @@ function batchRunTip(run) {
 // strokes; one for all would paint overlaps once and lose the band's density.
 const BATCH_CURVES_PER_STROKE = 16;
 
+// Mean PSNR over the runs at each log tick, in iteration order. A run that has
+// not logged a tick yet (or stopped before it) does not count there.
+function batchAverageCurve(runs) {
+  const byIt = new Map();
+  for (const r of runs) {
+    for (const d of r.curve) {
+      if (!Number.isFinite(d.psnr)) continue;
+      let s = byIt.get(d.it);
+      if (!s) byIt.set(d.it, s = { sum: 0, n: 0 });
+      s.sum += d.psnr;
+      s.n += 1;
+    }
+  }
+  return [...byIt].sort((a, b) => a[0] - b[0]).map(([it, s]) => ({ it, psnr: s.sum / s.n }));
+}
+
+// A dB value beside an average-curve point, in the line's color and kept
+// inside the plot box. The canvas-colored halo keeps it legible over the band.
+function drawBatchValueTag(p, g, d, align) {
+  const { ctx, col } = p;
+  const text = `${d.psnr.toFixed(2)} dB`;
+  ctx.font = PLOT_FONT;
+  ctx.textAlign = align;
+  ctx.textBaseline = "middle";
+  const width = ctx.measureText(text).width;
+  const lo = align === "left" ? g.left + 3 : align === "right" ? g.left + width + 3 : g.left + width / 2 + 3;
+  const hi = align === "left" ? g.right - width - 3 : align === "right" ? g.right - 3 : g.right - width / 2 - 3;
+  const px = g.x(d.it), py = g.y(d.psnr);
+  const tx = Math.max(lo, Math.min(hi, px + (align === "left" ? 8 : align === "right" ? -8 : 0)));
+  const ty = Math.max(g.top + 8, Math.min(g.bottom - 8, py - 12 < g.top + 8 ? py + 13 : py - 12));
+  ctx.save();
+  ctx.lineWidth = 3;
+  ctx.lineJoin = "round";
+  ctx.strokeStyle = col.surface;
+  ctx.strokeText(text, tx, ty);
+  ctx.fillStyle = BATCH_AVG_COLOR;
+  ctx.fillText(text, tx, ty);
+  ctx.restore();
+}
+
 function drawBatchPsnr(view) {
   const p = beginPlot(view);
   if (!p) return;
   const b = state.batch;
   const runs = b?.runs ?? [];
   const g = view.geom = batchLayer(view, p, String(batchVersion), () => {
+    const avg = batchAverageCurve(runs);
     let lo = Infinity, hi = -Infinity;
     for (const r of runs) for (const d of r.curve) { lo = Math.min(lo, d.psnr); hi = Math.max(hi, d.psnr); }
     const g = plotAxes(plotBox(p), { min: 0, max: Math.max(1, b?.args.iters ?? 1) }, linRange(lo, hi, [0, 40]));
@@ -3912,6 +3955,17 @@ function drawBatchPsnr(view) {
       }
     }
     ctx.restore();
+    // The batch mean over the run band, with its first, middle and last values.
+    if (avg.length) {
+      drawLine(p, g, avg.map((d) => [d.it, d.psnr]), BATCH_AVG_COLOR, { width: 2.5 });
+      const picks = [...new Set([0, Math.floor((avg.length - 1) / 2), avg.length - 1])];
+      for (const i of picks) {
+        const d = avg[i];
+        drawMarker(p, g, d.it, d.psnr, BATCH_AVG_COLOR, 3.5);
+        const align = avg.length === 1 ? "center" : i === 0 ? "left" : i === avg.length - 1 ? "right" : "center";
+        drawBatchValueTag(p, g, d, align);
+      }
+    }
     return g;
   });
   if (g.empty) return;
