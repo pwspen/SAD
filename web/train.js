@@ -634,7 +634,7 @@ const LAYOUTS = {
             "agreement agreement bandSnr    bandSnr"`,
   },
 };
-const DEFAULT_LAYOUT = "overview";
+const DEFAULT_LAYOUT = "batch";
 const LAYOUT_STORAGE_KEY = "sad.train.layout";
 // Edits in edit mode go to one "Custom" layout (editing a preset copies it
 // there first), saved in the same areas format as the presets.
@@ -3430,7 +3430,6 @@ async function runBatch({ items: fixedItems = null, quiet = false } = {}) {
   await state.snapAnalysis?.promise; // it renders with the old trainer
   state.trainer?.destroy();
   state.trainer = null;
-  if (state.layoutName !== "batch") await setLayout("batch");
   updateBatchBar();
   appendLog(`Batch: ${n} ${random ? "random " : ""}${dataset.label} image(s) ` +
             (random ? `from ${dataset.itemName(from)}–${dataset.itemName(dataset.count - 1)}`
@@ -3759,15 +3758,34 @@ function scheduleBatchDraw() {
   }, 250);
 }
 
+// Iterations per second summed over every run of the batch so far.
+function batchItersPerSec(b) {
+  const elapsed = b.running ? (performance.now() - b.startMs) / 1000 : b.wallSec;
+  const iters = b.runs.reduce((s, r) => s + (r.status === "done" ? b.args.iters : Math.max(0, r.it + 1)), 0);
+  return { elapsed, rate: iters / Math.max(elapsed, 1e-6) };
+}
+
 function updateBatchProgress() {
   const b = state.batch;
   if (!b) return;
   const total = b.runs.length;
   const finished = b.runs.filter((r) => r.status !== "queued" && r.status !== "running").length;
-  const elapsed = b.running ? (performance.now() - b.startMs) / 1000 : b.wallSec;
-  const iters = b.runs.reduce((s, r) => s + (r.status === "done" ? b.args.iters : Math.max(0, r.it + 1)), 0);
+  const { elapsed, rate } = batchItersPerSec(b);
   updateProgress(finished, total, `batch ${finished}/${total} runs · ` +
-    `${(iters / Math.max(elapsed, 1e-6)).toFixed(0)} it/s over all runs · ${elapsed.toFixed(1)}s`);
+    `${rate.toFixed(0)} it/s over all runs · ${elapsed.toFixed(1)}s`);
+  updateBatchSummary();
+}
+
+// "123k iter/s · done/total done · mean · median" in the batch bar.
+function updateBatchSummary() {
+  const b = state.batch;
+  if (!b) return;
+  const { rate } = batchItersPerSec(b);
+  const speed = rate >= 1000 ? `${(rate / 1000).toFixed(0)}k` : rate.toFixed(0);
+  const psnrs = batchRunsByPsnr().map((r) => r.final.psnr);
+  ui.batchSummary.textContent = `${speed} iter/s · ${psnrs.length}/${b.runs.length} done` + (psnrs.length
+    ? ` · mean ${(psnrs.reduce((s, v) => s + v, 0) / psnrs.length).toFixed(2)} dB · median ` +
+      `${psnrs[Math.floor(psnrs.length / 2)].toFixed(2)} dB` : "");
 }
 
 function updateBatchBar() {
@@ -3794,10 +3812,7 @@ function updateBatchBar() {
   ui.batchSnapLabel.textContent = run ? `iter ${run.snaps[b.snapIndex].it}` : "—";
   ui.batchRerun.disabled = !idle || !run;
   ui.batchExport.disabled = b.running || !b.runs.some((r) => r.curve.length);
-  const psnrs = done.map((r) => r.final.psnr);
-  ui.batchSummary.textContent = `${done.length}/${b.runs.length} done` + (psnrs.length
-    ? ` · mean ${(psnrs.reduce((s, v) => s + v, 0) / psnrs.length).toFixed(2)} dB · median ` +
-      `${psnrs[Math.floor(psnrs.length / 2)].toFixed(2)} dB` : "");
+  updateBatchSummary();
 }
 
 function clickBatchRun(id) {
