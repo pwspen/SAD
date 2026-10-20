@@ -12,21 +12,23 @@
 // --compare <jobs> also trains every image alone (that many at once, as
 // sweep.mjs --jobs) and reports both runs' speed and PSNR.
 
-import { readFile, readdir, mkdir, writeFile } from "node:fs/promises";
-import { dirname, join, resolve, basename } from "node:path";
+import { mkdir, writeFile } from "node:fs/promises";
+import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
-import { gunzipSync } from "node:zlib";
 
-import { Trainer, buildArgs } from "../trainer/trainer.js?v=codec-20261020";
-import { BatchTrainer, planBatches } from "../trainer/batch.js?v=codec-20261020";
+import { Trainer } from "../trainer/trainer.js?v=codec-20261020";
+import { planBatches } from "../trainer/batch.js?v=codec-20261020";
 import { computePsnr } from "../trainer/io.js?v=20261019";
 import { whiteMaskRgba32Float } from "../trainer/textures.js?v=20261019";
-import { createHeadlessDevice, loadShadersFromDisk, loadJson, loadPngToFloat32 } from "./headless.mjs";
+import { createHeadlessDevice, loadShadersFromDisk } from "./headless.mjs";
+import { DATASET_OPTIONS, loadParams, argsFor, loadImages, trainBatched, mean } from "./common.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
-const HELP = `Usage: node batch.mjs (--mnist <idx3.gz> | --images <dir of PNGs>) [options]
+const HELP = `Usage: node batch.mjs (--mnist <idx3.gz> | --parquet <file> | --images <dir of PNGs>) [options]
+
+  --parquet <file>   Hugging Face parquet with PNG bytes (CIFAR-10's test.parquet).
 
   --from <n>         First image (default 0).
   --count <n>        Images (default 64).
@@ -38,62 +40,6 @@ const HELP = `Usage: node batch.mjs (--mnist <idx3.gz> | --images <dir of PNGs>)
   --compare <jobs>   Also train each image alone, <jobs> at once, and compare.
   --out <jsonl>      Per-image results (default results/batch_<time>.jsonl).
 `;
-
-function parseValue(raw) {
-  const s = String(raw).trim();
-  if (s === "true") return true;
-  if (s === "false") return false;
-  if (/^[A-Za-z][A-Za-z0-9_-]*$/.test(s)) return s;
-  const n = Number(s);
-  if (s === "" || Number.isNaN(n)) throw new Error(`Not a number: "${raw}"`);
-  return n;
-}
-
-// Test-split MNIST digits [from, from + count) as rgba32f images.
-async function loadMnist(path, from, count) {
-  const bytes = gunzipSync(await readFile(path));
-  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  const total = view.getUint32(4), side = view.getUint32(8);
-  const n = side * side;
-  const images = [];
-  for (let i = from; i < Math.min(total, from + count); i += 1) {
-    const data = new Float32Array(n * 4);
-    for (let p = 0; p < n; p += 1) {
-      const v = bytes[16 + i * n + p] / 255;
-      data.set([v, v, v, 1], p * 4);
-    }
-    images.push({ name: `mnist${String(i).padStart(4, "0")}`, data, width: side, height: side });
-  }
-  return images;
-}
-
-async function loadPngDir(dir, from, count, maxDim) {
-  const names = (await readdir(dir)).filter((f) => f.toLowerCase().endsWith(".png")).sort().slice(from, from + count);
-  return Promise.all(names.map(async (f) => ({ name: basename(f, ".png"), ...(await loadPngToFloat32(join(dir, f), maxDim)) })));
-}
-
-async function trainBatched(ctx, images, batches) {
-  const results = new Array(images.length);
-  const t0 = performance.now();
-  for (const idx of batches) {
-    const part = idx.map((i) => images[i]);
-    const bt = new BatchTrainer(ctx.device, ctx.shaders, ctx.args, {
-      onLog: (info) => { if (info.type === "msg" && ctx.verbose) console.error(`  ${info.message}`); },
-    });
-    try {
-      await bt.prepare(part);
-      const l = bt.layout;
-      console.error(`Batch  | ${part.length} image(s) from ${part[0].name}: atlas ${l.width}×${l.height}, ` +
-                    `${l.tilesX}×${l.tilesY} tiles of ${l.tileW}×${l.tileH}, ${l.sitesPerTile} sites each`);
-      await bt.run();
-      const final = await bt.finalize();
-      final.forEach((r, i) => { results[idx[i]] = { name: part[i].name, ...r }; });
-    } finally {
-      bt.destroy();
-    }
-  }
-  return { results, seconds: (performance.now() - t0) / 1000 };
-}
 
 async function trainAlone(ctx, images, jobs) {
   const results = new Array(images.length);
@@ -122,38 +68,20 @@ async function trainAlone(ctx, images, jobs) {
   return { results, seconds: (performance.now() - t0) / 1000 };
 }
 
-const mean = (xs) => xs.reduce((s, v) => s + v, 0) / Math.max(1, xs.length);
-
 async function main() {
   const { values: cli } = parseArgs({
     options: {
-      mnist: { type: "string" }, images: { type: "string" },
-      from: { type: "string", default: "0" }, count: { type: "string", default: "64" },
-      preset: { type: "string" }, set: { type: "string", multiple: true, default: [] },
+      ...DATASET_OPTIONS,
       chunk: { type: "string" }, compare: { type: "string" }, out: { type: "string" },
       verbose: { type: "boolean", default: false }, help: { type: "boolean", short: "h", default: false },
     },
   });
-  if (cli.help || (!cli.mnist && !cli.images)) {
+  if (cli.help || (!cli.mnist && !cli.parquet && !cli.images)) {
     process.stdout.write(HELP);
     process.exit(cli.help ? 0 : 1);
   }
-  const params = cli.preset ? { ...(await loadJson(cli.preset)).args } : {};
-  for (const spec of cli.set) {
-    const eq = spec.indexOf("=");
-    if (eq <= 0) throw new Error(`--set expects key=value (got "${spec}")`);
-    params[spec.slice(0, eq)] = parseValue(spec.slice(eq + 1));
-  }
-  const configPatch = {}, overrides = {};
-  for (const [k, v] of Object.entries(params)) (/^[A-Z0-9_]+$/.test(k) ? configPatch : overrides)[k] = v;
-  const config = { ...(await loadJson(resolve(HERE, "../training_config.json"))), ...configPatch };
-  const args = buildArgs(config, overrides);
-  args.viewerFreq = args.iters + 1; // no previews
-
-  const from = Number(cli.from) | 0, count = Number(cli.count) | 0;
-  const images = cli.mnist
-    ? await loadMnist(cli.mnist, from, count)
-    : await loadPngDir(cli.images, from, count, Number(config.MAX_DIM || 0));
+  const { args, config } = await argsFor(await loadParams(cli.preset, cli.set));
+  const images = await loadImages(cli, Number(config.MAX_DIM || 0));
   let batches = planBatches(images, args.candDownscale);
   const chunk = Number(cli.chunk);
   if (chunk > 0) batches = batches.flatMap((b) => Array.from({ length: Math.ceil(b.length / chunk) }, (_, k) => b.slice(k * chunk, (k + 1) * chunk)));
@@ -164,7 +92,7 @@ async function main() {
   console.error(`Device | ${label}`);
   console.error(`Images | ${images.length} in ${batches.length} atlas(es), ${args.startSites} sites, ${args.iters} iterations`);
 
-  const batched = await trainBatched(ctx, images, batches);
+  const batched = await trainBatched(ctx, images, { batches });
   const its = (n, sec) => (n * args.iters / Math.max(sec, 1e-6)).toFixed(0);
   console.error(`Batched | ${batched.seconds.toFixed(1)}s, ${its(images.length, batched.seconds)} it/s over all ` +
                 `images | mean PSNR ${mean(batched.results.map((r) => r.psnr)).toFixed(2)} dB`);

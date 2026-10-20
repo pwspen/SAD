@@ -144,8 +144,9 @@ export function tileActive(sites, layout, b) {
 export class BatchTrainer {
   // args as for Trainer, with a fixed site count: args.startSites per image
   // (the histogram layer included). onLog gets the Trainer's "msg" events and,
-  // at each log tick, { type: "batchIter", it, iters, psnrs, sitesData, layer,
-  // lrScale, itsPerSec, elapsedSec }; tileSites(sitesData, layout, b) gives
+  // at each log tick, { type: "batchIter", it, iters, psnrs, sitesData, grads,
+  // layer, lrScale, itsPerSec, elapsedSec } (grads: the atlas sites' raw
+  // gradients, 10 per site as Trainer's "iter" event); tileSites(sitesData, layout, b) gives
   // image b's sites, tileActive(sitesData, layout, b) its active count.
   constructor(device, shaders, args, { onLog = null, signal = null } = {}) {
     this.device = device;
@@ -180,7 +181,7 @@ export class BatchTrainer {
     this.onLog({
       type: "batchIter", it: info.it, iters: info.iters,
       psnrs: tilePsnrs(info.renderRgba, this.images, this.layout),
-      sitesData: info.sitesData, layer: this.layerSlot, lrScale: info.lrScale,
+      sitesData: info.sitesData, grads: info.grads, layer: this.layerSlot, lrScale: info.lrScale,
       itsPerSec: info.itsPerSec, elapsedSec: info.elapsedSec,
     });
   }

@@ -38,6 +38,7 @@ per image with its final PSNR and sites in its own pixel coordinates:
 ```bash
 node batch.mjs --mnist ../../comp/data/mnist/t10k-images-idx3-ubyte.gz --count 1000 \
   --preset ../presets/mnist.json --set startSites=8 --set endSites=8
+node batch.mjs --parquet ../../comp/data/cifar10/test.parquet --count 1024 --preset ../presets/mnist.json
 node batch.mjs --images ../../comp/data/kodak --preset ../presets/kodak.json \
   --set startSites=1000 --set endSites=1000 --compare 2
 ```
@@ -48,3 +49,27 @@ node batch.mjs --images ../../comp/data/kodak --preset ../presets/kodak.json \
   runs' speed and the PSNR difference. On an M4 with the MNIST preset at 8 sites,
   256 digits: 9.4× faster than 8 separate trainers, −0.18 dB mean (per-image noise
   ±6 dB). Kodak at 1000 sites: no speedup (one image already fills the GPU), −0.11 dB.
+
+## Auto-tune and diagnostics (batch mode)
+
+`tune.mjs` is train.html's auto-tune without the browser: each evaluation is one batched
+run over the same images, scored by their median PSNR. One setting at a time, in log
+space, it tries × and ÷ the step, plus the peak of a parabola through those three
+medians; it moves to the best point, and when the center stays best the step decays
+(r ← √r) instead of the search stopping, down to `--min-ratio`. Each setting keeps its
+step across `--cycles`. Afterwards the start and tuned settings run on held-out images.
+
+```bash
+node tune.mjs --mnist ../../comp/data/mnist/t10k-images-idx3-ubyte.gz --count 1024 --preset ../presets/mnist.json
+node tune.mjs --parquet ../../comp/data/cifar10/test.parquet --count 1024 --preset ../presets/mnist.json --keys lrMult
+```
+
+`probe.mjs` runs one batch and reports three diagnostics for putting the LR groups in
+common units (header comment for details): E1, candidate units per LR group (the codec
+quantizer step Δ, the median 1/√F of the Gauss–Newton diagonal, the spread σ of the
+values) and how well each explains the LRs; E2, how much of the per-site gradient a
+per-value-bin mean explains, early and late in the run; E3, per-parameter entropy at the
+codec steps against the total correlation a joint model could remove.
+`e1.mjs` tunes the six LR bases on MNIST and CIFAR-10, replaces them with one constant
+× each unit, and scores everything on held-out images, within and across datasets.
+
