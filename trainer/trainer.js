@@ -153,7 +153,7 @@ export function countCapacity(args, start = args.startSites) {
 // takes the background, a rare one starts behind and the gradient decides.
 // Every pixel blends the layer besides its 8 listed candidates (globalCand;
 // it never takes a list slot); it never splits or merges, counts against
-// endSites, and is an ordinary site in the sites file ("# Global site").
+// startSites and endSites, and is an ordinary site in the sites file ("# Global site").
 // A per-site bias from p(color) on every site would not do this: a constant
 // added to -τ(d - r) is exactly a radius change, which the optimizer undoes.
 // MNIST: +0.78 / +3.06 dB at 8 / 32 sites; Kodak at 256 px: -0.13 dB, the
@@ -392,9 +392,10 @@ export class Trainer {
     // (LAYER_MODES) after them; the buffers hold the most the count schedule
     // ever wants. Unused slots are inactive (position.x < 0), which every
     // kernel skips. The schedule runs over the ordinary sites, and the layer
-    // counts against endSites (countArgs).
-    if (!initSites) initSiteCount = args.startSites;
+    // counts against startSites and endSites alike (countArgs), so start =
+    // end holds the count.
     const useLayer = args.layer === "learn";
+    if (!initSites) initSiteCount = useLayer ? Math.max(1, args.startSites - 1) : args.startSites;
     if (useLayer) this.histPeak = colorPeak(targetRgba32f, width * height, this.maskCpu);
     const baseSiteCount = initSiteCount;
     this.layerIndex = useLayer ? baseSiteCount : null;
@@ -932,7 +933,7 @@ export class Trainer {
     else if (target === this.activeEstimate && this._turnsOver(it)) await this._turnover(it, target);
     const catchingUp = this.activeEstimate > target && merged > 0;
     if (step && it >= countHorizon(args) && !catchingUp) {
-      this._endGrowth(it, `count schedule done (${args.countSchedule}, ${this.growStartCount} → ${args.endSites})`);
+      this._endGrowth(it, `count schedule done (${args.countSchedule}, ${layers + this.growStartCount} → ${args.endSites})`);
     }
   }
 

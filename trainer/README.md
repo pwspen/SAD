@@ -35,7 +35,7 @@ the target's color histogram smoothed over ±16 levels (`colorPeak`), with a lea
 constant logit), starting from log(p / (1 − p)) of the peak's mass p. A common color starts in
 front of the sites' edges and takes the background; a rare one starts behind and the gradient
 decides. Every pixel blends it besides its 8 listed candidates (`Params.globalCand`), so it never
-takes a list slot; it never splits or merges, counts against `endSites`, and is an ordinary site
+takes a list slot; it never splits or merges, counts against `startSites` and `endSites`, and is an ordinary site
 in the saved file (`# Global site: k`). A per-site bias from p(color) would not do this: logits
 are −τ(d − r), so a constant is exactly a radius change. On 40 held-out MNIST digits (5 repeats,
 paired against no layer, ± standard error over digits) it gains 0.78 ± 0.28 dB at 8 sites and
