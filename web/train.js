@@ -122,6 +122,7 @@ const state = {
   dragId: null,          // view being dragged in edit mode
   baseConfig: null,      // training_config.json as loaded; state.config adds the preset's UPPER_CASE keys
   showCentroids: true,   // centroid dots over the preview (its card's checkbox)
+  runMode: "batch",      // "batch" (the default on load) or "single"; the Train button follows it
   batch: null,           // the last batch of runs (runBatch): { dataset, args, runs, running, selected, … }
 };
 
@@ -143,6 +144,8 @@ const ui = {
   initLabel: document.getElementById("initLabel"),
   initSitesClear: document.getElementById("initSitesClear"),
   startBtn: document.getElementById("startBtn"),
+  singleModeBtn: document.getElementById("singleModeBtn"),
+  batchModeBtn: document.getElementById("batchModeBtn"),
   stopBtn: document.getElementById("stopBtn"),
   loopToggle: document.getElementById("loopToggle"),
   toggleParamsBtn: document.getElementById("toggleParamsBtn"),
@@ -167,6 +170,7 @@ const ui = {
   batchPopover: document.getElementById("batchPopover"),
   batchFrom: document.getElementById("batchFrom"),
   batchCount: document.getElementById("batchCount"),
+  batchRandom: document.getElementById("batchRandom"),
   batchFill: document.getElementById("batchFill"),
   batchJobs: document.getElementById("batchJobs"),
   batchLogFreq: document.getElementById("batchLogFreq"),
@@ -570,6 +574,12 @@ const VIEWS = {
                 note: "How many runs ended at each PSNR. Each run is one cell, stacked in its bin by PSNR, so " +
                       "hovering picks out a single run; click it to load it once the batch has finished. Final " +
                       "PSNR is measured on the last render, so it can sit below the run's best log tick." },
+  batchDigits: { label: "Batch: PSNR by MNIST digit", kind: "plot", source: "train", on: ["batch"],
+                draw: drawBatchViews, hit: hitBatchDigits, click: clickBatchRun,
+                note: "Final PSNR of each finished run, grouped by the digit it shows (MNIST test split). Each " +
+                      "circle is one run; the box spans the quartiles, the thick line the median and the whiskers " +
+                      "1.5× the interquartile range. Drawn once the batch has finished; hover a run to find it " +
+                      "in the other batch plots, click to load it." },
   clusterMap: { label: `Snap clusters on the image (k = ${SNAP_MAP_K})`, kind: "image", source: "derived",
                 blank: "#f1f1ec", on: ["render"], draw: drawClusterMap,
                 note: "The latest render, washed out, with each site's centroid in its cluster's color from the " +
@@ -614,8 +624,9 @@ const LAYOUTS = {
   },
   batch: {
     label: "Batch",
-    areas: `"batchHist batchPsnr batchPsnr"
-            "preview   target    psnr"`,
+    areas: `"batchHist   batchPsnr batchPsnr"
+            "batchDigits batchDigits batchDigits"
+            "preview     target    psnr"`,
   },
   spectral: {
     label: "Spectral",
@@ -2944,6 +2955,7 @@ const DATASETS = {
       ({ count: this.count, labels: this.labels } = await loadMnist());
     },
     itemName(i) { return `mnist${String(i).padStart(4, "0")}_${this.labels[i]}`; },
+    labelOf(i) { return this.labels?.[i] ?? null; },
     async load(i) {
       const { side, pixels } = await loadMnist();
       const n = side * side;
@@ -2982,6 +2994,7 @@ async function selectDataset(key) {
     ui.itemSelect.add(new Option(dataset.itemName(i), String(i)));
   }
   setStatus(prevStatus);
+  maybeEnableStart();
   return true;
 }
 
@@ -3089,9 +3102,30 @@ function clearInitSites() {
   syncSiteFields();
 }
 
+// Single mode needs a loaded target image; batch mode only needs a dataset.
 function maybeEnableStart() {
-  ui.startBtn.disabled = !(state.device && state.targetImage);
+  const batch = state.runMode === "batch";
+  const datasetReady = (currentDataset()?.count ?? 0) > 0;
+  ui.startBtn.disabled = state.running || !!state.tune || !(state.device && (batch ? datasetReady : state.targetImage));
   ui.batchBtn.disabled = !state.device || state.running;
+  ui.singleModeBtn.disabled = state.running;
+  ui.batchModeBtn.disabled = state.running;
+  syncTuneButtons();
+}
+
+// Batch is the default on every page load: Train runs the batch directly, and
+// only then does the batch-settings button appear.
+function setRunMode(mode) {
+  if (state.running) return;
+  state.runMode = mode === "single" ? "single" : "batch";
+  const batch = state.runMode === "batch";
+  ui.singleModeBtn.setAttribute("aria-pressed", String(!batch));
+  ui.batchModeBtn.setAttribute("aria-pressed", String(batch));
+  ui.startBtn.textContent = batch ? "Run batch" : "Train";
+  ui.batchBtn.hidden = !batch;
+  ui.loopToggle.disabled = batch;
+  if (!batch) ui.batchPopover.classList.add("hidden");
+  maybeEnableStart();
 }
 
 function scaleInitSitesIfNeeded(init, width, height) {
@@ -3131,6 +3165,9 @@ async function startTraining() {
   ui.savePopover.classList.add("hidden");
   ui.startBtn.disabled = true;
   ui.batchBtn.disabled = true;
+  syncTuneButtons();
+  ui.singleModeBtn.disabled = true;
+  ui.batchModeBtn.disabled = true;
   ui.stopBtn.disabled = false;
   setDatasetEnabled(false);
   state.running = true;
@@ -3301,8 +3338,7 @@ async function startTraining() {
     console.error(err);
   } finally {
     state.running = false;
-    ui.startBtn.disabled = false;
-    ui.batchBtn.disabled = false;
+    maybeEnableStart();
     ui.stopBtn.disabled = true;
     setDatasetEnabled(true);
     updateBatchBar();
@@ -3328,23 +3364,42 @@ async function startTraining() {
 // "Re-run with full logging", which trains the image again: GPU float atomics
 // make runs differ slightly, so it is not a replay.
 
-async function runBatch() {
-  if (state.running || !state.device) return;
+// `n` distinct images drawn from [from, total), in random order. Partial
+// Fisher–Yates: one O(dataset) allocation per batch, negligible next to training.
+function randomBatchItems(from, total, n) {
+  const pool = Array.from({ length: total - from }, (_, i) => from + i);
+  for (let i = 0; i < n; i += 1) {
+    const j = i + Math.floor(Math.random() * (pool.length - i));
+    [pool[i], pool[j]] = [pool[j], pool[i]];
+  }
+  return pool.slice(0, n);
+}
+
+// Trains one batch with the current settings. `items` replays a given image
+// list (auto-tune compares settings on the same images); `quiet` skips opening
+// the best run afterwards. Resolves to { median, items }, or null when the
+// batch was stopped or not every run finished.
+async function runBatch({ items: fixedItems = null, quiet = false } = {}) {
+  if (state.running || !state.device) return null;
   ui.batchPopover.classList.add("hidden");
   let args;
   try {
     args = readFormArgs();
   } catch (err) {
     appendLog(`Settings error: ${err.message}`);
-    return;
+    return null;
   }
   const datasetKey = ui.datasetSelect.value;
   const dataset = DATASETS[datasetKey];
-  if (!dataset?.count) return;
+  if (!dataset?.count) return null;
   const int = (el, min, max) => Math.min(max, Math.max(min, Math.floor(Number(el.value)) || min));
   const from = int(ui.batchFrom, 0, dataset.count - 1);
   if (ui.batchFill.checked && ui.batchTiled.checked && canTileBatch(args)) await syncBatchFill();
-  const n = int(ui.batchCount, 1, dataset.count - from);
+  const random = ui.batchRandom.checked;
+  const count = int(ui.batchCount, 1, dataset.count - from);
+  const items = fixedItems ?? (random ? randomBatchItems(from, dataset.count, count)
+                                      : Array.from({ length: count }, (_, i) => from + i));
+  const n = items.length;
   const jobs = int(ui.batchJobs, 1, 256);
   const logFreq = int(ui.batchLogFreq, 1, args.iters);
   const snapCount = int(ui.batchSnaps, 1, 1000);
@@ -3353,10 +3408,10 @@ async function runBatch() {
   const tiled = ui.batchTiled.checked && canTileBatch(runArgs);
   batchVersion += 1;
   const batch = state.batch = {
-    dataset: datasetKey, args: runArgs, from, jobs, snapCount, tiled, running: true,
+    dataset: datasetKey, args: runArgs, from, random, jobs, snapCount, tiled, running: true,
     selected: null, snapIndex: 0, startMs: performance.now(), wallSec: 0,
-    runs: Array.from({ length: n }, (_, i) => ({
-      id: i, item: from + i, name: dataset.itemName(from + i), status: "queued",
+    runs: items.map((item, i) => ({
+      id: i, item, name: dataset.itemName(item), label: dataset.labelOf?.(item) ?? null, status: "queued",
       it: -1, curve: [], snaps: [], final: null, width: 0, height: 0,
     })),
   };
@@ -3366,6 +3421,9 @@ async function runBatch() {
   const signal = state.abortCtrl.signal;
   ui.startBtn.disabled = true;
   ui.batchBtn.disabled = true;
+  syncTuneButtons();
+  ui.singleModeBtn.disabled = true;
+  ui.batchModeBtn.disabled = true;
   ui.stopBtn.disabled = false;
   ui.saveBtn.disabled = true;
   setDatasetEnabled(false);
@@ -3374,7 +3432,9 @@ async function runBatch() {
   state.trainer = null;
   if (state.layoutName !== "batch") await setLayout("batch");
   updateBatchBar();
-  appendLog(`Batch: ${n} ${dataset.label} image(s) ${dataset.itemName(from)}–${dataset.itemName(from + n - 1)}, ` +
+  appendLog(`Batch: ${n} ${random ? "random " : ""}${dataset.label} image(s) ` +
+            (random ? `from ${dataset.itemName(from)}–${dataset.itemName(dataset.count - 1)}`
+                    : `${dataset.itemName(from)}–${dataset.itemName(from + n - 1)}`) + ", " +
             (tiled ? "one atlas per image size" : `${jobs} at once`) +
             `, log every ${logFreq}, ${snapCount} snapshot(s) per run.` +
             (ui.batchTiled.checked && !tiled ? " (Separate trainers: one atlas needs a fixed site count.)" : "") +
@@ -3398,8 +3458,7 @@ async function runBatch() {
     for (const run of batch.runs) if (run.status === "queued") run.status = "skipped";
     batchVersion += 1;
     state.running = false;
-    ui.startBtn.disabled = !state.targetImage;
-    ui.batchBtn.disabled = false;
+    maybeEnableStart();
     ui.stopBtn.disabled = true;
     setDatasetEnabled(true);
   }
@@ -3413,7 +3472,136 @@ async function runBatch() {
   updateBatchProgress();
   updateBatchBar();
   drawBatchViews();
-  if (done.length) await selectBatchRun(done[0].id);
+  if (done.length && !quiet) await selectBatchRun(done[0].id);
+  if (signal.aborted || done.length < n) return null;
+  return { median: medianOf(done.map((r) => r.final.psnr)), items };
+}
+
+function medianOf(values) {
+  const v = [...values].sort((a, b) => a - b);
+  const m = v.length >> 1;
+  return v.length % 2 ? v[m] : (v[m - 1] + v[m]) / 2;
+}
+
+// Auto-tune one float setting on the current batch settings: from the current
+// value, try × and ÷ the tune ratio (each a full batch on the same images),
+// move to whichever raises the median final PSNR most, and repeat from there
+// (values already measured aren't re-run). Halts when neither beats the
+// current value, after tune max rounds, or on stop.
+function tuneSettings() {
+  const ratio = Number(document.getElementById("p-tuneRatio").value);
+  const rounds = Math.floor(Number(document.getElementById("p-tuneRounds").value));
+  if (!(ratio > 1)) throw new Error("tune ratio must be above 1");
+  if (!(rounds >= 1)) throw new Error("tune max rounds must be at least 1");
+  return { up: ratio, down: 1 / ratio, rounds };
+}
+
+function tunableInputs() {
+  return [...ui.paramsPanel.querySelectorAll('input[type="number"]:not([data-no-tune])')]
+    .filter((el) => (el.getAttribute("step") ?? "").includes(".") || el.hasAttribute("data-float"));
+}
+
+function setupAutoTune() {
+  for (const input of tunableInputs()) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "tune-btn";
+    btn.textContent = "tune";
+    btn.title = "Auto-tune: run a batch at this value × and ÷ the tune ratio (under Tuning) with the current batch " +
+                "settings, keep whichever raises the median PSNR, repeat until neither helps. Click again to stop.";
+    btn.addEventListener("click", () => {
+      if (state.tune) {
+        if (state.tune.input === input) state.tune.stop();
+        return;
+      }
+      autoTune(input, btn);
+    });
+    input.after(btn);
+  }
+}
+
+function syncTuneButtons() {
+  for (const btn of ui.paramsPanel.querySelectorAll(".tune-btn")) {
+    const active = state.tune?.btn === btn;
+    btn.textContent = active ? "stop" : "tune";
+    btn.classList.toggle("active", active);
+    btn.disabled = state.tune ? !active : state.running || !state.device;
+  }
+}
+
+function tuneValue(input, v) {
+  const min = input.min === "" ? -Infinity : Number(input.min);
+  const max = input.max === "" ? Infinity : Number(input.max);
+  return Number(Math.min(max, Math.max(min, v)).toPrecision(4));
+}
+
+function setTuneValue(input, v) {
+  input.value = String(v);
+  input.dispatchEvent(new Event("input", { bubbles: true }));
+  input.dispatchEvent(new Event("change", { bubbles: true }));
+}
+
+async function autoTune(input, btn) {
+  if (state.running || state.tune || !state.device) return;
+  const name = input.closest(".row")?.querySelector("label")?.textContent ?? input.id;
+  let stopped = false;
+  state.tune = { input, btn, stop: () => { stopped = true; state.abortCtrl?.abort(); } };
+  syncTuneButtons();
+  maybeEnableStart();
+  let best = Number(input.value);
+  try {
+    let tune;
+    try {
+      tune = tuneSettings();
+    } catch (err) {
+      appendLog(`Auto-tune ${name}: ${err.message}.`);
+      return;
+    }
+    if (!Number.isFinite(best) || best === 0) {
+      appendLog(`Auto-tune ${name}: needs a non-zero value to scale.`);
+      return;
+    }
+    setStatus(`Auto-tune ${name}: baseline ${best}`);
+    const base = await runBatch({ quiet: true });
+    if (!base || stopped) return;
+    const items = base.items;
+    let bestMedian = base.median;
+    const seen = new Map([[best, bestMedian]]); // same images, so no need to re-run a value
+    appendLog(`Auto-tune ${name}: ${best} → median ${bestMedian.toFixed(3)} dB (${items.length} images)`);
+    for (let round = 1; round <= tune.rounds; round += 1) {
+      const center = best;
+      const centerMedian = bestMedian;
+      const tried = [];
+      for (const f of [tune.up, tune.down]) {
+        const v = tuneValue(input, center * f);
+        if (v === center || tried.some((t) => t.v === v)) continue;
+        let median = seen.get(v);
+        if (median === undefined) {
+          setTuneValue(input, v);
+          setStatus(`Auto-tune ${name}: round ${round}, trying ${v} (best ${center} @ ${centerMedian.toFixed(3)} dB)`);
+          const r = await runBatch({ items, quiet: true });
+          if (!r || stopped) return;
+          median = r.median;
+          seen.set(v, median);
+        }
+        tried.push({ v, median });
+        if (median > bestMedian) { best = v; bestMedian = median; }
+      }
+      appendLog(`Auto-tune ${name} round ${round}: ` +
+                tried.map((t) => `${t.v} → ${t.median.toFixed(3)}`).join(", ") +
+                ` vs ${center} → ${centerMedian.toFixed(3)} dB; ` +
+                (best === center ? "neither helps, done." : `moving to ${best}.`));
+      if (best === center) return;
+      if (round === tune.rounds) appendLog(`Auto-tune ${name}: stopped after ${tune.rounds} rounds.`);
+    }
+  } finally {
+    if (Number.isFinite(best)) setTuneValue(input, best);
+    appendLog(`Auto-tune ${name}${stopped ? " stopped" : ""}: kept ${best}.`);
+    setStatus(`Auto-tune ${name}: ${best}`);
+    state.tune = null;
+    syncTuneButtons();
+    maybeEnableStart();
+  }
 }
 
 async function trainBatchRun(batch, run, dataset, signal) {
@@ -3774,9 +3962,9 @@ function exportBatch() {
     trainSeconds: r.final?.seconds ?? null, growStop: r.final?.growStop ?? null, args: b.args,
     curve: r.curve.map(({ it, psnr, sites }) => ({ it, psnr, sites })),
   }));
-  const last = b.from + b.runs.length - 1;
+  const tag = b.random ? `random${b.runs.length}` : `${b.from}-${b.from + b.runs.length - 1}`;
   triggerDownload(new Blob([lines.join("\n") + "\n"], { type: "application/x-ndjson" }),
-    `batch_${b.dataset}_${b.from}-${last}.jsonl`);
+    `batch_${b.dataset}_${tag}.jsonl`);
 }
 
 // Images one atlas holds (atlasCapacity) for the size of the batch's first
@@ -3813,19 +4001,25 @@ async function syncBatchFill() {
   if (n && ui.batchFill.checked) ui.batchCount.value = String(n);
 }
 
-function toggleBatchMenu() {
+function updateBatchNote() {
   const dataset = currentDataset();
+  if (!dataset?.count) return;
+  ui.batchFrom.max = String(dataset.count - 1);
+  ui.batchCount.max = String(dataset.count);
+  let tile = false;
+  try { tile = canTileBatch(readFormArgs()); } catch {}
+  ui.batchNote.textContent = `${dataset.label}: images 0–${dataset.count - 1}. ` +
+    (ui.batchRandom.checked
+      ? `Random: each batch draws its images at random from first image to ${dataset.count - 1}. `
+      : "") +
+    "Every run uses the settings in Advanced, without the mask or init sites. " + (tile
+      ? "The site count is fixed, so one atlas trains them all at once (at once then doesn't apply)."
+      : "The site count changes, so each image gets its own trainer.");
+}
+
+function toggleBatchMenu() {
   syncBatchFill();
-  if (dataset?.count) {
-    ui.batchFrom.max = String(dataset.count - 1);
-    ui.batchCount.max = String(dataset.count);
-    let tile = false;
-    try { tile = canTileBatch(readFormArgs()); } catch {}
-    ui.batchNote.textContent = `${dataset.label}: images 0–${dataset.count - 1}. Every run uses the settings in ` +
-      "Advanced, without the mask or init sites. " + (tile
-        ? "The site count is fixed, so one atlas trains them all at once (at once then doesn't apply)."
-        : "The site count changes, so each image gets its own trainer.");
-  }
+  updateBatchNote();
   ui.batchPopover.classList.toggle("hidden");
 }
 
@@ -3833,12 +4027,14 @@ function toggleBatchMenu() {
 
 const BATCH_RUNNING_COLOR = SERIES_COLORS[0];
 const BATCH_AVG_COLOR = SERIES_COLORS[5];
-const batchHoverRun = () => VIEWS.batchPsnr.hoverKey ?? VIEWS.batchHist.hoverKey ?? null;
+const batchHoverRun = () => VIEWS.batchPsnr.hoverKey ?? VIEWS.batchHist.hoverKey ??
+  VIEWS.batchDigits.hoverKey ?? null;
 
-// Both batch cards share hover and selection, so each draws both.
+// All batch cards share hover and selection, so each draws all three.
 function drawBatchViews() {
   if (VIEWS.batchPsnr.canvas) drawBatchPsnr(VIEWS.batchPsnr);
   if (VIEWS.batchHist.canvas) drawBatchHist(VIEWS.batchHist);
+  if (VIEWS.batchDigits.canvas) drawBatchDigits(VIEWS.batchDigits);
 }
 
 // Bumped whenever a batch's runs change (scheduleBatchDraw, runBatch), so the
@@ -4081,6 +4277,143 @@ function hitBatchHist(g, mx, my) {
   const k = Math.floor((v - g.b0) / g.step);
   const j = Math.floor((g.bottom - my) / g.cellH);
   return g.bins[k]?.[j]?.id ?? null;
+}
+
+// Final PSNR per MNIST digit: one dot per finished run, with a box for the
+// quartiles and whiskers at 1.5× the interquartile range. Nothing is drawn
+// while the batch runs, so the distributions never shift under the reader.
+function batchDigitGroups(runs) {
+  const groups = Array.from({ length: 10 }, () => []);
+  for (const r of runs) {
+    if (r.status !== "done" || r.final == null || r.label == null) continue;
+    if (r.label >= 0 && r.label < groups.length) groups[r.label].push(r);
+  }
+  return groups;
+}
+
+// Quantile of an ascending array, interpolating between the nearest ranks.
+function quantile(sorted, p) {
+  const h = (sorted.length - 1) * p;
+  const lo = Math.floor(h), hi = Math.ceil(h);
+  return sorted[lo] + (sorted[hi] - sorted[lo]) * (h - lo);
+}
+
+// Stable horizontal jitter in [-0.5, 0.5]: a run keeps its dot while the
+// batch grows, and the hover marker lands on the same dot.
+function batchDigitJitter(run) {
+  const x = Math.sin(run.id * 12.9898 + 78.233) * 43758.5453;
+  return x - Math.floor(x) - 0.5;
+}
+
+function drawBatchDigits(view) {
+  const p = beginPlot(view);
+  if (!p) return;
+  const b = state.batch;
+  const g = view.geom = batchLayer(view, p, String(batchVersion), () => {
+    const runs = b?.runs ?? [];
+    let lo = Infinity, hi = -Infinity;
+    for (const r of runs) {
+      if (r.status !== "done" || r.final == null || r.label == null) continue;
+      lo = Math.min(lo, r.final.psnr);
+      hi = Math.max(hi, r.final.psnr);
+    }
+    const g = plotAxes(plotBox(p), { min: -0.6, max: 9.6 }, linRange(lo, hi, [0, 40]));
+    drawAxes(p, g, { xTitle: "MNIST digit", yTitle: "final PSNR (dB)", xLabels: false });
+    // Digits are categorical: label every one, whatever the tick spacing.
+    const { ctx } = p;
+    ctx.font = PLOT_FONT;
+    ctx.fillStyle = p.col.soft;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "top";
+    for (let d = 0; d < 10; d += 1) ctx.fillText(String(d), g.x(d), g.bottom + 6);
+    if (b?.running) {
+      drawEmpty(p, g, "Available when the batch finishes");
+      return { ...g, empty: true };
+    }
+    if (b && b.dataset !== "mnist") {
+      drawEmpty(p, g, "Only MNIST batches have digit labels");
+      return { ...g, empty: true };
+    }
+    const groups = batchDigitGroups(runs);
+    if (!groups.some((group) => group.length)) {
+      drawEmpty(p, g, b ? "No finished runs" : "Run a batch (Batch… in the top bar)");
+      return { ...g, empty: true };
+    }
+    const unit = g.x(1) - g.x(0);
+    const half = Math.max(3, Math.min(unit * 0.3, 26)); // box half-width, px
+    const points = [];
+    for (let d = 0; d < groups.length; d += 1) {
+      const group = groups[d];
+      if (!group.length) continue;
+      const sorted = group.map((r) => r.final.psnr).sort((a, z) => a - z);
+      const q1 = quantile(sorted, 0.25);
+      const med = quantile(sorted, 0.5);
+      const q3 = quantile(sorted, 0.75);
+      const iqr = q3 - q1;
+      const wLo = sorted.find((v) => v >= q1 - 1.5 * iqr) ?? sorted[0];
+      const wHi = [...sorted].reverse().find((v) => v <= q3 + 1.5 * iqr) ?? sorted.at(-1);
+      const cx = g.x(d);
+      const top = g.y(q3), bot = g.y(q1);
+      ctx.save();
+      // Whiskers behind the box, then the box and its median.
+      ctx.strokeStyle = p.col.dim;
+      ctx.lineWidth = 1;
+      ctx.setLineDash([]);
+      ctx.beginPath();
+      ctx.moveTo(cx, g.y(wHi));
+      ctx.lineTo(cx, g.y(wLo));
+      for (const y of [g.y(wHi), g.y(wLo)]) {
+        ctx.moveTo(cx - half * 0.45, y);
+        ctx.lineTo(cx + half * 0.45, y);
+      }
+      ctx.stroke();
+      ctx.fillStyle = SERIES_COLORS[0];
+      ctx.globalAlpha = 0.16;
+      ctx.fillRect(cx - half, top, half * 2, Math.max(1, bot - top));
+      ctx.globalAlpha = 1;
+      ctx.strokeStyle = SERIES_COLORS[0];
+      ctx.strokeRect(cx - half, top, half * 2, Math.max(1, bot - top));
+      ctx.lineWidth = 2.5;
+      ctx.beginPath();
+      ctx.moveTo(cx - half, g.y(med));
+      ctx.lineTo(cx + half, g.y(med));
+      ctx.stroke();
+      // One dot per run, jittered inside the box width.
+      ctx.fillStyle = p.col.soft;
+      ctx.globalAlpha = 0.75;
+      for (const r of group) {
+        const x = d + (batchDigitJitter(r) * half * 1.2) / unit;
+        points.push({ run: r.id, x, psnr: r.final.psnr });
+        ctx.beginPath();
+        ctx.arc(g.x(x), g.y(r.final.psnr), 1.8, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.restore();
+    }
+    return { ...g, points };
+  });
+  if (g.empty || !b) return;
+  const find = (run) => (run ? g.points.find((pt) => pt.run === run.id) : null);
+  const sel = b.selected != null ? b.runs[b.selected] : null;
+  const selPt = find(sel);
+  if (selPt) drawMarker(p, g, selPt.x, selPt.psnr, PSNR_LINE_COLOR, 4);
+  const hov = batchHoverRun() != null ? b.runs[batchHoverRun()] : null;
+  const hovPt = find(hov);
+  if (hovPt) {
+    if (hovPt !== selPt) drawMarker(p, g, hovPt.x, hovPt.psnr, p.col.text, 4);
+    drawTooltip(p, g, g.x(hovPt.x), g.y(hovPt.psnr), batchRunTip(hov));
+  }
+}
+
+// The run dot nearest the cursor, within 10 px.
+function hitBatchDigits(g, mx, my) {
+  if (!g.points) return null;
+  let best = null, bestD = 100;
+  for (const pt of g.points) {
+    const dd = (g.x(pt.x) - mx) ** 2 + (g.y(pt.psnr) - my) ** 2;
+    if (dd < bestD) { bestD = dd; best = pt.run; }
+  }
+  return best;
 }
 
 // Unified metric renderer — PSNR sticks between log ticks so preview updates
@@ -4584,7 +4917,8 @@ function drawCentroids(ctx, cssPx = 1, sites = state.lastSites) {
 }
 
 function stopTraining() {
-  if (state.abortCtrl) state.abortCtrl.abort();
+  if (state.tune) state.tune.stop();
+  else if (state.abortCtrl) state.abortCtrl.abort();
   appendLog("Stop requested.");
 }
 
@@ -4669,17 +5003,24 @@ async function main() {
     document.getElementById(id).addEventListener("change", syncSiteFields);
   }
   ui.paramsPanel.addEventListener("input", updatePlanSummary);
-  ui.startBtn.addEventListener("click", startTraining);
+  ui.startBtn.addEventListener("click", () => {
+    if (state.runMode === "batch") runBatch();
+    else startTraining();
+  });
+  ui.singleModeBtn.addEventListener("click", () => setRunMode("single"));
+  ui.batchModeBtn.addEventListener("click", () => setRunMode("batch"));
   ui.stopBtn.addEventListener("click", stopTraining);
   ui.toggleParamsBtn.addEventListener("click", toggleParams);
   ui.saveBtn.addEventListener("click", toggleSaveMenu);
   ui.savePng.addEventListener("click", exportPng);
   ui.saveTxt.addEventListener("click", exportSites);
   ui.batchBtn.addEventListener("click", toggleBatchMenu);
-  ui.batchRunBtn.addEventListener("click", runBatch);
+  ui.batchRunBtn.addEventListener("click", () => runBatch());
+  setupAutoTune();
   ui.batchFill.addEventListener("change", syncBatchFill);
   ui.batchTiled.addEventListener("change", syncBatchFill);
   ui.batchFrom.addEventListener("change", syncBatchFill);
+  ui.batchRandom.addEventListener("change", updateBatchNote);
   ui.batchRunSelect.addEventListener("change", () => {
     if (ui.batchRunSelect.value) selectBatchRun(Number(ui.batchRunSelect.value));
   });
@@ -4688,6 +5029,7 @@ async function main() {
   ui.batchSnap.addEventListener("input", () => showBatchSnapshot(Number(ui.batchSnap.value)));
   ui.batchRerun.addEventListener("click", rerunBatchRun);
   ui.batchExport.addEventListener("click", exportBatch);
+  setRunMode("batch");
   document.addEventListener("click", (ev) => {
     if (!ui.savePopover.contains(ev.target) && ev.target !== ui.saveBtn) {
       ui.savePopover.classList.add("hidden");
@@ -4711,10 +5053,9 @@ async function main() {
   // Card sizes follow the viewer area (window resize, advanced panel toggle).
   new ResizeObserver(() => updateCanvasLayout()).observe(ui.canvases);
 
-  // Load straight into training on MNIST's first digit.
+  // Load straight into a batch run with the default settings.
   if (!(await datasetReady)) return;
-  await loadItem(0);
-  startTraining();
+  runBatch();
 }
 
 main();

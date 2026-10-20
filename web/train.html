@@ -92,6 +92,34 @@
         user-select: none;
       }
       .loop-toggle input { margin: 0; accent-color: var(--accent); cursor: pointer; }
+      .mode-toggle {
+        display: inline-flex;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        overflow: hidden;
+        background: var(--panel-soft);
+      }
+      .mode-toggle .mode-btn {
+        font: inherit;
+        font-size: 12px;
+        padding: 6px 11px;
+        border: none;
+        background: transparent;
+        color: var(--text-dim);
+        cursor: pointer;
+        transition: background 120ms, color 120ms;
+      }
+      .mode-toggle .mode-btn + .mode-btn { border-left: 1px solid var(--line); }
+      .mode-toggle .mode-btn[aria-pressed="true"] {
+        background: var(--accent);
+        color: var(--accent-contrast);
+        font-weight: 600;
+      }
+      .mode-toggle .mode-btn:not([aria-pressed="true"]):hover:not([disabled]) {
+        background: #ffffff;
+        color: var(--text);
+      }
+      .mode-toggle .mode-btn[disabled] { opacity: 0.45; cursor: not-allowed; }
       .file-btn input { display: none; }
 
       .dataset-nav { display: flex; gap: 4px; }
@@ -235,6 +263,21 @@
         text-align: right;
       }
       .row select { text-align: left; }
+      .tune-btn {
+        flex: none;
+        font: inherit;
+        font-size: 10.5px;
+        padding: 3px 6px;
+        margin-left: -4px;
+        border-radius: 6px;
+        border: 1px solid var(--line);
+        background: var(--panel-soft);
+        color: var(--text-dim);
+        cursor: pointer;
+      }
+      .tune-btn:hover:not(:disabled) { color: var(--text); border-color: var(--accent); }
+      .tune-btn.active { background: var(--accent); border-color: var(--accent); color: var(--accent-contrast); }
+      .tune-btn:disabled { cursor: default; opacity: 0.45; }
       .row input[type="number"]:focus, .row input[type="text"]:focus, .row select:focus {
         outline: none;
         border-color: var(--accent);
@@ -703,17 +746,24 @@
         <button class="btn" id="itemNext" aria-label="Next dataset image">›</button>
       </div>
 
-      <button class="btn btn-primary" id="startBtn" disabled>Train</button>
+      <div class="mode-toggle" role="group" aria-label="Run mode">
+        <button class="mode-btn" id="singleModeBtn" type="button" aria-pressed="false"
+                title="Train the selected dataset image">Single</button>
+        <button class="mode-btn" id="batchModeBtn" type="button" aria-pressed="true"
+                title="Train a range of dataset images">Batch</button>
+      </div>
+      <button class="btn btn-primary" id="startBtn" disabled>Run batch</button>
       <label class="loop-toggle" title="When a run finishes, start again from iteration 0. Stop ends the loop.">
         <input type="checkbox" id="loopToggle" /> Loop
       </label>
       <button class="btn" id="stopBtn" disabled>Stop</button>
 
       <div class="save-menu">
-        <button class="btn" id="batchBtn" disabled title="Train many images of the dataset with the settings in Advanced">Batch…</button>
+        <button class="btn" id="batchBtn" disabled title="Batch range, snapshots and atlas settings">Batch settings</button>
         <div class="save-popover batch-popover hidden" id="batchPopover">
           <div class="batch-field"><label for="batchFrom">first image</label><input id="batchFrom" type="number" min="0" value="0" /></div>
           <div class="batch-field"><label for="batchCount">images</label><input id="batchCount" type="number" min="1" value="500" /></div>
+          <div class="batch-field" title="Draw a fresh random sample each batch, from the first image to the end of the dataset."><label for="batchRandom">random</label><input id="batchRandom" type="checkbox" checked /></div>
           <div class="batch-field" title="Take as many images (from the first one) as one atlas holds: the GPU's texture-size limit and a pixel budget that keeps its buffers near half a gigabyte, e.g. about 5,300 MNIST digits or 10 Kodak images. Needs one atlas (a fixed site count)."><label for="batchFill">fill GPU</label><input id="batchFill" type="checkbox" /></div>
           <div class="batch-field" title="Trainers running at once on the GPU. Measured on an M-series Mac: Measured on this Mac (Dawn, 1000 iterations): MNIST throughput levels off at about 8 (≈7× one at a time), Kodak at 2 (≈1.2×)."><label for="batchJobs">at once</label><input id="batchJobs" type="number" min="1" value="8" /></div>
           <div class="batch-field" title="Iterations between PSNR log ticks (each one reads the render back). Overrides refresh every for batch runs."><label for="batchLogFreq">log every</label><input id="batchLogFreq" type="number" min="1" value="25" /></div>
@@ -833,7 +883,7 @@
           <div class="tip" role="tooltip">How the learning rate changes over the run. <b>cosine</b>: falls from full to 0 on a cosine over the run. <b>fixed</b>: stays at full. <b>decay after growth</b>: stays at full while sites are being added, then falls to 0 on a cosine by the end of the run, so late sites aren't starved and the finished set still gets a cool-down (with fixed site count it equals cosine). The cool-down matters: without it MNIST lost 1–1.5 dB.</div>
         </div>
         <div class="param" data-site-mode="grow">
-          <div class="row"><label>λ (stop)</label><input id="p-growLambda" type="number" step="10" min="0" /></div>
+          <div class="row"><label>λ (stop)</label><input id="p-growLambda" data-float type="number" step="10" min="0" /></div>
           <p class="help"><span class="unit">error per bit: 8-bit levels² (summed over R, G, B and pixels)</span></p>
           <div class="tip" role="tooltip">Only cells whose split would remove more than λ × 128 levels² of error (a site costs 128 bits) are split; a step adds fewer sites if fewer qualify, and growth ends early once none do. Example: λ = 400 → 51,200 levels², e.g. 100 pixels each off by about 13 levels in all three channels. Higher λ stops sooner. 0 = never stop early (any site that helps at all qualifies). The log says which limit ended growth.</div>
         </div>
@@ -905,7 +955,7 @@
           <div class="tip" role="tooltip">How long the running average remembers: 0.95 ≈ the last 20 iterations. Longer memory picks out only error that has stayed for a long time, but reacts later once it's fixed.</div>
         </div>
         <div class="param">
-          <div class="row"><label>persist cap</label><input id="p-errCap" type="number" step="1" min="1" /></div>
+          <div class="row"><label>persist cap</label><input id="p-errCap" data-float type="number" step="1" min="1" /></div>
           <p class="help"><span class="unit">× the mean</span></p>
           <div class="tip" role="tooltip">Largest average error that counts, as a multiple of the image mean. Keeps error that no site can remove (fine texture) from taking the whole loss.</div>
         </div>
@@ -950,6 +1000,18 @@
           <p class="help"><span class="unit">natural log of the aspect ratio per iteration</span></p>
           <div class="tip" role="tooltip">Anisotropy: 0 = round, ±1 ≈ 2.7:1, clamped to ±2 ≈ 7.4:1. Frozen for the first 50 iterations.</div>
         </div>
+
+        <h3 class="has-tip" tabindex="0">Tuning<span class="tip" role="tooltip">How the <b>tune</b> buttons search. Each round runs one batch at the value × <b>tune ratio</b> and one at the value ÷ <b>tune ratio</b>, on the same images as the first batch, and moves to whichever raises the median final PSNR. It stops when neither does, or after <b>tune max rounds</b>. Not training settings: they don't change a run.</span></h3>
+        <div class="param">
+          <div class="row"><label>tune ratio</label><input id="p-tuneRatio" data-no-tune type="number" step="0.1" min="1.01" value="1.5" /></div>
+          <p class="help"><span class="unit">× up, ÷ down per round</span></p>
+          <div class="tip" role="tooltip">Step per round. 1.5 tries 1.5× and 0.667× the value. Bigger steps cover ground faster, smaller ones end closer to the best value but need more batches.</div>
+        </div>
+        <div class="param">
+          <div class="row"><label>tune max rounds</label><input id="p-tuneRounds" data-no-tune type="number" step="1" min="1" value="20" /></div>
+          <p class="help"><span class="unit">rounds (up to 2 batches each)</span></p>
+          <div class="tip" role="tooltip">Stops the search after this many rounds even if it is still improving, so noise can't keep it wandering.</div>
+        </div>
       </aside>
 
       <section class="view">
@@ -990,6 +1052,6 @@
       </section>
     </div>
 
-    <script type="module" src="train.js?v=defaults-20261019"></script>
+    <script type="module" src="train.js?v=autotune-ratio-20261020"></script>
   </body>
 </html>
