@@ -11,7 +11,7 @@
 // tile's, so images should share their long side (MNIST, Kodak's 768 × 512
 // and 512 × 768) to train as they would alone.
 
-import { Trainer } from "./trainer.js?v=defaults-20261019";
+import { Trainer } from "./trainer.js?v=defaults-20261020";
 import { SITE_FLOATS } from "./params.js?v=20261019";
 
 // Default atlas limits: the WebGPU default texture side, and a pixel budget

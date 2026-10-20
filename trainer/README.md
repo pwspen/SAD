@@ -8,14 +8,16 @@ The site count goes from `startSites` (or a loaded sites file's count) to `endSi
 `countEnd` × `iters`, on the `countSchedule` curve, then holds; these are the only settings that
 set it. Every `growEvery` iterations the count moves to the curve's value (`countTarget`):
 
+- `"constant"` (default): `sites` (default `endSites`) throughout; `startSites` and `endSites`
+  are ignored, and a loaded sites file's count holds as it is.
 - `"linear"`: the same number of sites per step.
 - `"exponential"`: the same factor per step.
-- `"sawtooth"` (default): the exponential curve with `sawTeeth` teeth on top, each rising to
+- `"sawtooth"`: the exponential curve with `sawTeeth` teeth on top, each rising to
   (1 + `sawAmp`) × the curve over `sawRatio` / (1 + `sawRatio`) of the tooth, then merging back.
   Swept against exponential (both tuned) and checked on held-out images, it won by about 2 dB on
   MNIST (2 teeth, amplitude 2, 1:1, by 10%: 21.88 vs 19.85 dB for the old exponential preset) and
   0.7 dB on Kodak at 256 px (6 teeth, amplitude 2, 3:1, by 50%, a step every 5: 25.81 vs 25.08);
-  these are the presets, and Kodak's are the defaults. Teeth shorter than a few `growEvery` steps
+  these were the presets. Teeth shorter than a few `growEvery` steps
   never go down (`countPlan` shows it). A step merges at most half the sites, so a big amplitude
   may not be back down by `countEnd`; merging then goes on until the count is at `endSites`.
 

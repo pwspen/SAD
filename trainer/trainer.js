@@ -93,7 +93,10 @@ export function lrSchedule(it, iters, kind = "cosine", growDoneIter = 0) {
 // How the site count moves from startSites to endSites (args.countSchedule).
 // The count reaches endSites at countEnd × iters and holds there; start >
 // end prunes (merges) instead of growing, start = end is a fixed count.
+// "constant" holds one count throughout: buildArgs sets startSites = endSites
+// = sites, and a loaded sites file's count holds as it is.
 export const COUNT_SCHEDULES = {
+  constant: "constant",
   linear: "linear",
   exponential: "exponential",
   sawtooth: "sawtooth",
@@ -122,6 +125,7 @@ export function countTarget(args, it, start = args.startSites) {
 
 // Whether the schedule ever changes the count.
 export function countVaries(args, start = args.startSites) {
+  if (args.countSchedule === "constant") return false;
   return start !== args.endSites || (args.countSchedule === "sawtooth" && args.sawAmp > 0 && args.sawTeeth > 0);
 }
 
@@ -283,11 +287,11 @@ export function buildArgs(config, overrides = {}) {
     // growEvery iterations: up by splitting cells (siteSplit), down by
     // merging the cheapest neighbouring pairs (merge.js). sawTeeth, sawAmp and
     // sawRatio shape "sawtooth" (countTarget). These are the only settings
-    // that set the count; the buffers hold countCapacity sites.
+    // that set the count; the buffers hold countCapacity sites. "constant"
+    // (the default) ignores them and holds `sites` (default endSites).
     startSites: Math.max(1, Math.floor(Number(pick("startSites", "START_SITES", 1)))),
     endSites: Math.max(1, Math.floor(Number(pick("endSites", "END_SITES", 100)))),
-    // Defaults: the Kodak preset's sawtooth (presets/kodak.json).
-    countSchedule: String(pick("countSchedule", "COUNT_SCHEDULE", "sawtooth")),
+    countSchedule: String(pick("countSchedule", "COUNT_SCHEDULE", "constant")),
     countEnd: Math.min(1, Math.max(0, Number(pick("countEnd", "COUNT_END", 0.5)))),
     sawTeeth: Math.max(0, Math.floor(Number(pick("sawTeeth", "SAW_TEETH", 6)))),
     sawAmp: Math.max(0, Number(pick("sawAmp", "SAW_AMP", 2))),
@@ -323,6 +327,8 @@ export function buildArgs(config, overrides = {}) {
   if (!COUNT_SCHEDULES[args.countSchedule]) {
     throw new Error(`countSchedule must be one of ${Object.keys(COUNT_SCHEDULES).join(", ")} (got "${args.countSchedule}")`);
   }
+  args.sites = Math.max(1, Math.floor(Number(pick("sites", "SITES", args.endSites))));
+  if (args.countSchedule === "constant") args.startSites = args.endSites = args.sites;
   if (!(args.lrSchedule in LR_SCHEDULES)) {
     throw new Error(`lrSchedule must be one of ${Object.keys(LR_SCHEDULES).join(", ")} (got "${args.lrSchedule}")`);
   }

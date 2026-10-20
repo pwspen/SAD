@@ -6,7 +6,7 @@
 
 import { loadShaders, tileSlotsForLimit } from "../trainer/shader_loader.js?v=20261019";
 import { requestTrainingDevice } from "../trainer/device.js?v=20261019";
-import { buildArgs } from "../trainer/trainer.js?v=defaults-20261019";
+import { buildArgs } from "../trainer/trainer.js?v=defaults-20261020";
 import { CandidateLists } from "../trainer/candidates.js?v=20261019";
 import { RenderEncoder } from "../trainer/encoders.js?v=20261019";
 import { SITE_FLOATS, createParamsBuffer } from "../trainer/params.js?v=20261019";

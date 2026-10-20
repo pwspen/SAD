@@ -5,11 +5,11 @@
 
 import { loadShaders, tileSlotsForLimit } from "../trainer/shader_loader.js?v=20261019";
 import { requestTrainingDevice } from "../trainer/device.js?v=20261019";
-import { Trainer, buildArgs, GRAD_GROUPS, GRAD_CHANNELS, lrSchedule, LR_SCHEDULES, LOSSES, COUNT_SCHEDULES, LAYER_MODES, countPlan, countVaries, countHorizon } from "../trainer/trainer.js?v=defaults-20261019";
+import { Trainer, buildArgs, GRAD_GROUPS, GRAD_CHANNELS, lrSchedule, LR_SCHEDULES, LOSSES, COUNT_SCHEDULES, LAYER_MODES, countPlan, countVaries, countHorizon } from "../trainer/trainer.js?v=defaults-20261020";
 import { loadImageToFloat32, loadMaskRgba32Float, whiteMaskRgba32Float } from "../trainer/textures.js?v=20261019";
 import { loadSitesFromFile, serializeSitesTxt, triggerDownload, floatImageToRgba8, computeBpp, computePsnr, BITS_PER_SITE } from "../trainer/io.js?v=20261019";
 import { SITE_FLOATS } from "../trainer/params.js?v=20261019";
-import { BatchTrainer, planBatches, tileSites, tileActive, tileSize, atlasCapacity } from "../trainer/batch.js?v=defaults-20261019";
+import { BatchTrainer, planBatches, tileSites, tileActive, tileSize, atlasCapacity } from "../trainer/batch.js?v=defaults-20261020";
 import { COLOR_SPACES } from "../trainer/color_spaces.js?v=20261019";
 import { parquetMetadata, parquetReadObjects } from "./vendor/hyparquet/src/index.js";
 import {
@@ -42,6 +42,7 @@ const MNIST_DIGITS = Array.from({ length: 10 }, (_, d) => String(d));
 // init-sites / mask are pickers inside the panel (not listed here).
 const UI_FIELDS = [
   ["iters", "p-iters"],
+  ["sites", "p-sites"],
   ["startSites", "p-startSites"],
   ["endSites", "p-endSites"],
   ["countSchedule", "p-countSchedule"],
@@ -299,16 +300,19 @@ function updatePlanSummary() {
 }
 
 // Show the count schedule's fields (growth / merge fields only if the count
-// changes, sawtooth's only for sawtooth), and lock start sites to a loaded
+// changes, sawtooth's only for sawtooth, sites instead of start / end sites
+// for constant), and lock start sites and sites to a loaded
 // sites file's count, restoring the typed value once the file is cleared.
 function syncSiteFields() {
-  const el = document.getElementById("p-startSites");
   const lock = state.initSites != null;
-  if (lock && !el.disabled) el.dataset.typed = el.value;
-  if (!lock && el.disabled) el.value = el.dataset.typed ?? el.value;
-  el.disabled = lock;
-  if (lock) el.value = state.initSites.count;
-  el.title = lock ? "Set by the loaded sites file (Clear it to edit)" : "";
+  for (const id of ["p-startSites", "p-sites"]) {
+    const el = document.getElementById(id);
+    if (lock && !el.disabled) el.dataset.typed = el.value;
+    if (!lock && el.disabled) el.value = el.dataset.typed ?? el.value;
+    el.disabled = lock;
+    if (lock) el.value = state.initSites.count;
+    el.title = lock ? "Set by the loaded sites file (Clear it to edit)" : "";
+  }
   let varies = true;
   try { const args = readFormArgs(); varies = countVaries(args, state.initSites?.count ?? args.startSites); } catch {}
   ui.paramsPanel.dataset.siteMode = varies ? "grow" : "fixed";
@@ -5168,7 +5172,7 @@ async function main() {
   ui.maskInput.addEventListener("change", handleMaskInput);
   ui.initSitesInput.addEventListener("change", handleInitSitesInput);
   ui.initSitesClear.addEventListener("click", clearInitSites);
-  for (const id of ["p-startSites", "p-endSites", "p-countSchedule", "p-sawAmp", "p-sawTeeth"]) {
+  for (const id of ["p-sites", "p-startSites", "p-endSites", "p-countSchedule", "p-sawAmp", "p-sawTeeth"]) {
     document.getElementById(id).addEventListener("input", syncSiteFields);
     document.getElementById(id).addEventListener("change", syncSiteFields);
   }
