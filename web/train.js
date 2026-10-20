@@ -5,7 +5,7 @@
 
 import { loadShaders, tileSlotsForLimit } from "../trainer/shader_loader.js?v=20261019";
 import { requestTrainingDevice } from "../trainer/device.js?v=20261019";
-import { Trainer, buildArgs, GRAD_GROUPS, lrSchedule, LR_SCHEDULES, LOSSES, COUNT_SCHEDULES, LAYER_MODES, countPlan, countVaries, countHorizon } from "../trainer/trainer.js?v=20261019";
+import { Trainer, buildArgs, GRAD_GROUPS, GRAD_CHANNELS, lrSchedule, LR_SCHEDULES, LOSSES, COUNT_SCHEDULES, LAYER_MODES, countPlan, countVaries, countHorizon } from "../trainer/trainer.js?v=20261019";
 import { loadImageToFloat32, loadMaskRgba32Float, whiteMaskRgba32Float } from "../trainer/textures.js?v=20261019";
 import { loadSitesFromFile, serializeSitesTxt, triggerDownload, floatImageToRgba8, computeBpp, BITS_PER_SITE } from "../trainer/io.js?v=20261019";
 import { SITE_FLOATS } from "../trainer/params.js?v=20261019";
@@ -85,6 +85,7 @@ const state = {
   lastRender: null,      // { rgba, width, height }
   lastHashed: null,
   lastHeatmap: null,
+  lastOwner: null,       // { rgba, width, height } of renderView("owner"): r = largest-weight site id
   lastSites: null,
   lastSiteCount: 0,
   lastPsnr: null,        // persists between log ticks so preview updates don't blank the PSNR
@@ -94,6 +95,8 @@ const state = {
   psnrIters: 0,
   bppRuns: [],           // [{ sites, bpp, colorSpace, points: [{ it, psnr, sites, bpp }] }] per run on this target; last is current
   gradHistory: [],       // [{ it, stats }] per-param |grad| mean/max from log ticks
+  gradSnapshot: null,    // { grads, siteCount, numPixels } raw per-site grads from the last log tick
+  gradHeatParam: "mag",  // gradient heatmap: "mag" or a channel index into GRAD_CHANNELS
   lrHistory: [],         // [{ it, lr }] LR multiplier (schedule × LR mult) from log ticks
   growthGain: [],        // [{ step, addedAt, measuredAt, points: [{ site, predicted, realized }] }] per growth batch
   mergeEdges: null,      // { it, groups, scales, edgeWeights, mergedWeights } from the last "neighbor" merge step
@@ -397,6 +400,13 @@ const VIEWS = {
   tau:        { label: "Tau heatmap", kind: "image", source: "model", blank: "#0a0a0f", on: ["render"],
                 draw: () => drawGpuView("tau", "heatmap"),
                 note: "Per-site tau as a heatmap (extra GPU render pass)." },
+  gradHeat:   { label: "Gradient heatmap", kind: "image", source: "train", blank: "#00204d",
+                on: ["log", "render"], draw: drawGradHeat, controls: buildGradHeatControls,
+                note: "Each pixel shows the loss gradient of the site with the largest weight there, from the last " +
+                      "log tick, in the units Adam sees (summed grad / pixels). Magnitude is √Σ g² over all ten " +
+                      "parameters (mixed units, so position tends to dominate); or pick one parameter for its |g|. " +
+                      "Color params are the run's color space. Log scale through cividis from the 1st to 99.5th " +
+                      "percentile over sites; black = no owner or masked out. Ownership is an extra GPU render pass." },
   psnr:       { label: "PSNR vs iteration", kind: "plot", source: "train", on: ["log", "run"],
                 draw: drawPsnrPlot, hit: hitPsnr,
                 note: "Masked PSNR the trainer computes at each log tick, with the active site count and each site's LR multiplier (schedule × growth LR decay) on the right axes." },
@@ -496,7 +506,7 @@ const LAYOUTS = {
   images: {
     label: "Images 2×2",
     areas: `"target   preview importance"
-            "residual errEma  ."`,
+            "residual errEma  gradHeat"`,
   },
   sites: {
     label: "Sites & tau",
@@ -619,6 +629,7 @@ function buildCards(name) {
       toggle.append(box, "dots");
       card.append(toggle);
     }
+    if (view.controls) view.controls(card);
     if (view.hit) attachPlotHover(view, card, canvas);
     if (state.editing) {
       attachEditControls(view, id, card, label, grid);
@@ -2648,6 +2659,81 @@ function drawSiteValues(view) {
   putImage(canvas, out, width, height);
 }
 
+// Per-site loss gradients (state.gradSnapshot) painted over the pixels each
+// site owns (renderView("owner")), log scale through cividis.
+const CIVIDIS_LUT = rampLut([
+  "#00204d", "#00336f", "#39486b", "#575c6d", "#707173",
+  "#8a8779", "#a69d75", "#c4b56c", "#e4cf5b", "#ffea46",
+].map((hex, i, all) => [i / (all.length - 1), [1, 3, 5].map((k) => parseInt(hex.slice(k, k + 2), 16))]));
+const GRAD_HEAT_LO_PCT = 0.01;
+const GRAD_HEAT_HI_PCT = 0.995;
+
+function buildGradHeatControls(card) {
+  const box = document.createElement("label");
+  box.className = "overlay-toggle";
+  box.title = "Which gradient to show";
+  const select = document.createElement("select");
+  select.add(new Option("magnitude", "mag"));
+  GRAD_CHANNELS.forEach((name, c) => select.add(new Option(name, String(c))));
+  select.value = state.gradHeatParam;
+  select.addEventListener("change", () => {
+    state.gradHeatParam = select.value;
+    drawGradHeat();
+  });
+  const range = document.createElement("span");
+  box.append(select, range);
+  card.append(box);
+  VIEWS.gradHeat.rangeEl = range;
+}
+
+async function drawGradHeat() {
+  const view = VIEWS.gradHeat;
+  const snap = state.gradSnapshot;
+  if (!view.canvas || !snap || !state.lastRender) return;
+  const img = await ensureRender("owner");
+  if (!img || !view.canvas || state.gradSnapshot !== snap) return;
+  const { grads, siteCount, numPixels } = snap;
+  const param = state.gradHeatParam;
+  const values = new Float32Array(siteCount);
+  for (let i = 0; i < siteCount; i += 1) {
+    const base = i * 10;
+    if (param === "mag") {
+      let sq = 0;
+      for (let c = 0; c < 10; c += 1) sq += grads[base + c] * grads[base + c];
+      values[i] = Math.sqrt(sq) / numPixels;
+    } else {
+      values[i] = Math.abs(grads[base + Number(param)]) / numPixels;
+    }
+  }
+  const sorted = values.filter((v) => v > 0 && Number.isFinite(v)).sort();
+  const pct = (q) => Math.log10(sorted[Math.floor(q * (sorted.length - 1))]);
+  const lo = sorted.length ? pct(GRAD_HEAT_LO_PCT) : 0;
+  const span = sorted.length ? Math.max(pct(GRAD_HEAT_HI_PCT) - lo, 1e-6) : 1;
+  const colors = new Uint8Array(siteCount * 3);
+  for (let i = 0; i < siteCount; i += 1) {
+    const v = values[i];
+    const t = v > 0 ? Math.min(1, Math.max(0, (Math.log10(v) - lo) / span)) : 0;
+    const idx = Math.round(t * 255) * 3;
+    colors.set(CIVIDIS_LUT.subarray(idx, idx + 3), i * 3);
+  }
+  const { rgba, width, height } = img;
+  const mask = state.maskData?.rgba;
+  const out = new Uint8ClampedArray(width * height * 4);
+  for (let p = 0; p < width * height; p += 1) {
+    const o = p * 4;
+    const id = rgba[o];
+    out[o + 3] = 255;
+    if (id < 0 || id >= siteCount || (mask && mask[o] <= 0)) continue;
+    out[o] = colors[id * 3];
+    out[o + 1] = colors[id * 3 + 1];
+    out[o + 2] = colors[id * 3 + 2];
+  }
+  putImage(view.canvas, out, width, height);
+  if (view.rangeEl) {
+    view.rangeEl.textContent = sorted.length ? `${fmtExp(10 ** lo)} – ${fmtExp(10 ** (lo + span))}` : "no gradient";
+  }
+}
+
 // Multi-scale importance map (see IMPORTANCE in analysis.js), cached per
 // target + mask.
 const IMPORTANCE_DISPLAY_PCT = 0.995; // map this percentile to the top of the ramp
@@ -2831,6 +2917,7 @@ async function setTarget(file, name, token = ++state.targetToken) {
     state.lastSites = null;
     state.lastHashed = null;
     state.lastHeatmap = null;
+    state.lastOwner = null;
     ui.saveBtn.disabled = true;
     invalidateAnalysis();
     blankRenderViews(img.width, img.height);
@@ -2930,6 +3017,7 @@ async function startTraining() {
   const signal = state.abortCtrl.signal;
   state.lastHashed = null;
   state.lastHeatmap = null;
+  state.lastOwner = null;
   // The previous run's trainer only served site-ID / tau renders of its last
   // state; free its GPU buffers so repeated (or looped) runs don't pile up.
   await state.snapAnalysis?.promise; // it renders with the old trainer
@@ -2955,6 +3043,7 @@ async function startTraining() {
   state.lastLrScale = null;
   state.psnrIters = args.iters;
   state.gradHistory = [];
+  state.gradSnapshot = null;
   state.bandHistory = [];
   state.growthGain = [];
   state.mergeEdges = null;
@@ -3012,10 +3101,14 @@ async function startTraining() {
           run.points.push({ it: info.it, psnr: info.psnr, sites: run.sites, bpp: run.bpp });
         }
         if (info.gradStats) state.gradHistory.push({ it: info.it, stats: info.gradStats });
+        if (info.grads) {
+          state.gradSnapshot = { grads: info.grads, siteCount: info.totalSites, numPixels: info.width * info.height };
+        }
         if (Number.isFinite(info.lrScale)) state.lrHistory.push({ it: info.it, lr: info.lrScale });
         recordBandSnr(info.it);
         state.lastHashed = null;
         state.lastHeatmap = null;
+        state.lastOwner = null;
         updateProgress(info.it + 1, info.iters,
           `log iter ${info.it + 1}/${info.iters} · ${info.itsPerSec.toFixed(1)} it/s · ${info.elapsedSec.toFixed(1)}s`);
         renderMetrics(info);
@@ -3031,6 +3124,7 @@ async function startTraining() {
         recordBandSnr(info.it);
         state.lastHashed = null;
         state.lastHeatmap = null;
+        state.lastOwner = null;
         updateProgress(info.it + 1, info.iters,
           `image iter ${info.it + 1}/${info.iters} · ${info.itsPerSec.toFixed(1)} it/s · ${info.elapsedSec.toFixed(1)}s`);
         renderMetrics(info);
@@ -3046,6 +3140,7 @@ async function startTraining() {
         state.lastSiteCount = info.totalSites;
         state.lastHashed = null;
         state.lastHeatmap = null;
+        state.lastOwner = null;
         updateProgress(info.it + 1, info.iters,
           `sites iter ${info.it + 1}/${info.iters} · ${info.itsPerSec.toFixed(1)} it/s · ${info.elapsedSec.toFixed(1)}s`);
         renderMetrics(info);
@@ -3072,6 +3167,7 @@ async function startTraining() {
     state.lastSiteCount = final.count;
     state.lastHashed = null;
     state.lastHeatmap = null;
+    state.lastOwner = null;
     recordBandSnr(args.iters);
     await refreshViews("render");
     appendLog(`Done. Best PSNR: ${final.bestPsnr.toFixed(2)} dB | time: ${final.trainSeconds.toFixed(2)} s | active: ${final.activeSites ?? final.count}`);
@@ -3544,6 +3640,7 @@ async function commitEdits() {
     state.trainer.setLastSites(state.lastSites);
     state.lastHashed = null;
     state.lastHeatmap = null;
+    state.lastOwner = null;
     if (editor.psnr != null) state.lastPsnr = editor.psnr;
     await refreshViews("render");
     drawCentroidOverlay();
@@ -3555,12 +3652,14 @@ async function ensureRender(mode) {
   if (!state.trainer) return null;
   if (mode === "hashed" && state.lastHashed) return state.lastHashed;
   if (mode === "heatmap" && state.lastHeatmap) return state.lastHeatmap;
+  if (mode === "owner" && state.lastOwner) return state.lastOwner;
   try {
     if (state.lastSites) state.trainer.setLastSites(state.lastSites);
     const rgba = await state.trainer.renderView(mode);
     const out = { rgba, width: state.lastRender.width, height: state.lastRender.height };
     if (mode === "hashed") state.lastHashed = out;
     else if (mode === "heatmap") state.lastHeatmap = out;
+    else if (mode === "owner") state.lastOwner = out;
     return out;
   } catch (err) {
     appendLog(`View render failed: ${err.message}`);

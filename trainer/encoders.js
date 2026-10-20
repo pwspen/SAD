@@ -160,11 +160,13 @@ export class CandidatePackEncoder {
 }
 
 // hashIds: color each site by hashColor(id) instead of its color (the
-// cell-id view).
+// cell-id view). ownerIds: write each pixel's largest-weight site id (f32,
+// r channel) instead of a color.
 export class RenderEncoder {
-  constructor(device, shaders, { hashIds = false } = {}) {
+  constructor(device, shaders, { hashIds = false, ownerIds = false } = {}) {
     this.device = device;
-    this.pipeline = makePipeline(device, shaders.RENDER, "main", { HASH_IDS: hashIds ? 1 : 0 });
+    this.pipeline = makePipeline(device, shaders.RENDER, "main",
+      { HASH_IDS: hashIds ? 1 : 0, OWNER_IDS: ownerIds ? 1 : 0 });
     this._views = new Map();
     this._bgs = new Map();
   }

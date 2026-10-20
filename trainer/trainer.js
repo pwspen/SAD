@@ -342,6 +342,7 @@ export class Trainer {
     this.initEnc = new InitGradientEncoder(device, shaders);
     this.renderEnc = new RenderEncoder(device, shaders);
     this.renderIdsEnc = new RenderEncoder(device, shaders, { hashIds: true });
+    this.renderOwnerEnc = new RenderEncoder(device, shaders, { ownerIds: true });
     this.renderTauEnc = new RenderTauHeatmapEncoder(device, shaders);
     this.gradsEnc = new GradientsEncoder(device, shaders, { loss: LOSSES[args.loss].id });
     this.adamEnc = new AdamEncoder(device, shaders);
@@ -639,8 +640,8 @@ export class Trainer {
         const sitesData = await this._readSitesRgb(siteCount);
         this._lastSitesCpu = sitesData;
         await gradStaging.mapAsync(GPUMapMode.READ);
-        const gradStats = computeGradStats(new Float32Array(gradStaging.getMappedRange()),
-          siteCount, this.width * this.height);
+        const grads = new Float32Array(gradStaging.getMappedRange()).slice();
+        const gradStats = computeGradStats(grads, siteCount, this.width * this.height);
         gradStaging.unmap();
         gradStaging.destroy();
         const psnr = computePsnrSafe(rgba, this.target, this.width, this.height, this.maskCpu, this.maskSum);
@@ -654,6 +655,7 @@ export class Trainer {
             lrScale,
             psnr,
             gradStats,
+            grads,
             activeSites,
             totalSites: siteCount,
             growDoneIter: this.growDoneIter,
@@ -1133,16 +1135,17 @@ export class Trainer {
   }
 
   // On-demand render using the current site + candidate state. `mode` is one
-  // of "render" (color), "hashed" (cell-id hashColor blend) or "heatmap"
-  // (tau centroid heatmap).
+  // of "render" (color), "hashed" (cell-id hashColor blend), "heatmap"
+  // (tau centroid heatmap) or "owner" (largest-weight site id in r, -1 for
+  // none).
   async renderView(mode) {
     const device = this.device;
     const queue = device.queue;
     updateParamsBuffer(queue, this.renderParams, this._paramsArgs(this.actualSites, 0, 0));
 
     const encoder = device.createCommandEncoder();
-    if (mode === "hashed") {
-      this.renderIdsEnc.encode(encoder,
+    if (mode === "hashed" || mode === "owner") {
+      (mode === "owner" ? this.renderOwnerEnc : this.renderIdsEnc).encode(encoder,
         this.sitesBuf, this.renderParams,
         this.cands.cand0, this.cands.cand1, this.renderTex, this.width, this.height);
     } else if (mode === "heatmap") {
@@ -1413,6 +1416,11 @@ export function siteSplit(stats, i) {
 
 const SITE_STAT_CH = 18; // channels per site in site_stats.wgsl's output
 
+
+// Names of the ten grads[idx*10+ch] channels (colors are the run's color-space
+// params, not necessarily RGB).
+export const GRAD_CHANNELS = ["x", "y", "log τ", "radius", "color 0", "color 1", "color 2",
+  "direction x", "direction y", "log aniso"];
 
 // Gradient groups over the consolidated grads[idx*10+ch] channels. Multi-channel
 // groups use the vector magnitude (e.g. |(dx, dy)| for position).
