@@ -26,12 +26,13 @@ export function createPackedCandidatesBuffer(device, capacity) {
   });
 }
 
-export function createSeedCounter(device) {
+// init_gradient's sample counters: one per tile (batch.js), one untiled.
+export function createSeedCounter(device, tiles = 1) {
   const buf = device.createBuffer({
-    size: 4,
+    size: tiles * 4,
     usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
   });
-  device.queue.writeBuffer(buf, 0, new Uint32Array([0]));
+  device.queue.writeBuffer(buf, 0, new Uint32Array(tiles));
   return buf;
 }
 

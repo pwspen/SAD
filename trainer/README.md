@@ -59,6 +59,8 @@ There is no LR warmup. `lrSchedule` is `"cosine"` (1 to 0 over `iters`), `"fixed
 - `trainer.js` - training loop, site-count schedule (growth by splitting, merging) and epilogue.
 - `candidates.js` - per-pixel candidate lists (`CandidateLists`), shared with the viewer.
 - `merge.js` - neighbouring-cell merges and the CPU copy of the site logit.
+- `batch.js` - batched training (`BatchTrainer`): images of one size packed as tiles of an atlas, a fixed
+  site count per tile, trained as one run (`Tiling` in `sad_shared.wgsl` keeps each site in its tile).
 - `shader_loader.js` - fetches and assembles the WGSL in `shaders/`.
 - `device.js` - adapter/device setup.
 - `params.js` - uniform buffer writers and `packJumpStep`.

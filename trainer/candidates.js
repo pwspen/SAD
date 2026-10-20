@@ -12,8 +12,8 @@
 import {
   createParamsBuffer,
   updateParamsBuffer,
-  createClearParamsBuffer,
-  updateClearParamsBuffer,
+  createPackParamsBuffer,
+  updatePackParamsBuffer,
   packJumpStep,
 } from "./params.js?v=20261019";
 import { createPackedCandidatesBuffer } from "./buffers.js?v=20261019";
@@ -25,7 +25,9 @@ const NO_SITE = 0xffffffff;
 export class CandidateLists {
   // opts: width, height (image), capacity (sites the buffers hold), and the
   // search settings candDownscale, candUpdatePasses, candRadiusScale,
-  // candRadiusProbes, candInjectCount (as in buildArgs).
+  // candRadiusProbes, candInjectCount (as in buildArgs). opts.tiling: batched
+  // training's atlas layout (trainer/batch.js); lists stay within a tile, and
+  // jumps and scale follow the tile.
   constructor(device, shaders, opts) {
     this.device = device;
     this.width = opts.width;
@@ -34,6 +36,10 @@ export class CandidateLists {
     this.downscale = Math.max(1, opts.candDownscale || 1);
     this.candWidth = Math.max(1, Math.ceil(this.width / this.downscale));
     this.candHeight = Math.max(1, Math.ceil(this.height / this.downscale));
+    this.tiling = opts.tiling ?? null;
+    // The grid the jump flood spans: one tile's cells when tiled.
+    this.jumpWidth = this.tiling ? Math.ceil(this.tiling.tileW / this.downscale) : this.candWidth;
+    this.jumpHeight = this.tiling ? Math.ceil(this.tiling.tileH / this.downscale) : this.candHeight;
     this.updatePasses = Math.max(1, opts.candUpdatePasses || 1);
     this.globalCand = NO_SITE; // the site every pixel blends besides its list
     this.jumpPassIndex = 0;
@@ -43,7 +49,7 @@ export class CandidateLists {
     this.packEnc = new CandidatePackEncoder(device, shaders);
     this.tex = [0, 1, 2, 3].map(() => createCandidateTexture(device, this.candWidth, this.candHeight));
     this.packed = createPackedCandidatesBuffer(device, opts.capacity);
-    this.packParams = createClearParamsBuffer(device, 0, this._invScale());
+    this.packParams = createPackParamsBuffer(device);
     this.passParams = [];   // one per pass encoded before a submit
   }
 
@@ -51,7 +57,9 @@ export class CandidateLists {
   get cand0() { return this.tex[0]; }
   get cand1() { return this.tex[1]; }
 
-  _invScale() { return 1 / Math.max(this.width, this.height); }
+  _invScale() {
+    return 1 / (this.tiling ? Math.max(this.tiling.tileW, this.tiling.tileH) : Math.max(this.width, this.height));
+  }
 
   _swap() {
     const [a0, a1, b0, b1] = this.tex;
@@ -65,7 +73,7 @@ export class CandidateLists {
       width: this.width, height: this.height, siteCount, step, seed,
       radiusScale: o.candRadiusScale, radiusProbes: o.candRadiusProbes, injectCount: o.candInjectCount,
       candDownscale: this.downscale, candWidth: this.candWidth, candHeight: this.candHeight,
-      globalCand: this.globalCand,
+      globalCand: this.globalCand, tiling: this.tiling,
     };
   }
 
@@ -76,11 +84,11 @@ export class CandidateLists {
     return this.passParams[k];
   }
 
-  _stages() { return Math.max(1, Math.ceil(Math.log2(Math.max(this.candWidth, this.candHeight, 2)))); }
+  _stages() { return Math.max(1, Math.ceil(Math.log2(Math.max(this.jumpWidth, this.jumpHeight, 2)))); }
 
   // Repacks sites [0, n) for the search.
   _encodePack(encoder, sitesBuf, n) {
-    updateClearParamsBuffer(this.device.queue, this.packParams, n, this._invScale());
+    updatePackParamsBuffer(this.device.queue, this.packParams, n, this._invScale(), this.tiling);
     this.packEnc.encode(encoder, sitesBuf, this.packed, this.packParams, n);
   }
 
@@ -102,7 +110,7 @@ export class CandidateLists {
     this._encodePack(encoder, sitesBuf, n);
     for (let r = 0; r < rounds; r += 1) {
       for (let st = 0; st < this._stages(); st += 1) {
-        this._encodePass(encoder, this._params(k++, this.paramsArgs(n, packJumpStep(st, this.candWidth, this.candHeight))));
+        this._encodePass(encoder, this._params(k++, this.paramsArgs(n, packJumpStep(st, this.jumpWidth, this.jumpHeight))));
       }
     }
     return k;
@@ -134,7 +142,7 @@ export class CandidateLists {
     for (let p = 0; p < this.updatePasses; p += 1) {
       const i = this.jumpPassIndex++;
       this._encodePass(encoder, this._params(p, this.paramsArgs(n,
-        packJumpStep(i, this.candWidth, this.candHeight), (i >>> 16) & 0xffff)));
+        packJumpStep(i, this.jumpWidth, this.jumpHeight), (i >>> 16) & 0xffff)));
     }
   }
 

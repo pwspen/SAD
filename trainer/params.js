@@ -20,24 +20,40 @@ function f32View(buffer, offsetBytes, nF32) {
 //   u32 width, u32 height, u32 siteCount, u32 step,
 //   f32 invScaleSq, u32 seed, f32 radiusScale, u32 radiusProbes,
 //   u32 injectCount, u32 candDownscale, u32 candWidth, u32 candHeight,
-//   u32 globalCand, u32 _pad × 3   (total 16*4 = 64 bytes)
+//   u32 globalCand, u32 _pad × 3, Tiling   (total 20*4 = 80 bytes)
 // globalCand: a site id vpt offers to every pixel each pass (default none).
+// tiling: batched training's atlas layout (writeTiling), or null for one image.
 // ---------------------------------------------------------------------------
 
-export const PARAMS_SIZE = 64;
+export const PARAMS_SIZE = 80;
+
+// Tiling (sad_shared.wgsl), 4 u32 at word `at` of `u`: { tileW, tileH,
+// sitesPerTile, tilesX } (trainer/batch.js), or zeros for one image. Every
+// struct declares it @align(16), so it starts at the next 16-byte offset.
+function writeTiling(u, at, tiling) {
+  u[at] = tiling ? tiling.tileW >>> 0 : 0;
+  u[at + 1] = tiling ? tiling.tileH >>> 0 : 0;
+  u[at + 2] = tiling ? tiling.sitesPerTile >>> 0 : 0;
+  u[at + 3] = tiling ? tiling.tilesX >>> 0 : 0;
+}
+
+// 1 / scale² of the logit's distance: per image, i.e. per tile when tiled.
+export function invScaleSqFor(width, height, tiling = null) {
+  const scale = tiling ? Math.max(tiling.tileW, tiling.tileH) : Math.max(width, height);
+  return 1.0 / (scale * scale);
+}
 
 export function writeParams(
   view,
   { width, height, siteCount, step = 0, seed = 0,
     radiusScale, radiusProbes, injectCount,
     candDownscale,
-    candWidth, candHeight, globalCand = 0xffffffff },
+    candWidth, candHeight, globalCand = 0xffffffff, tiling = null },
 ) {
-  const scale = Math.max(width, height);
-  const invScaleSq = 1.0 / (scale * scale);
+  const invScaleSq = invScaleSqFor(width, height, tiling);
   const cd = Math.max(1, candDownscale | 0);
-  const u = new Uint32Array(view.buffer, view.byteOffset, 16);
-  const f = new Float32Array(view.buffer, view.byteOffset, 16);
+  const u = new Uint32Array(view.buffer, view.byteOffset, 20);
+  const f = new Float32Array(view.buffer, view.byteOffset, 20);
   u[0] = width >>> 0;
   u[1] = height >>> 0;
   u[2] = siteCount >>> 0;
@@ -51,6 +67,7 @@ export function writeParams(
   u[10] = candWidth >>> 0;
   u[11] = candHeight >>> 0;
   u[12] = globalCand >>> 0;
+  writeTiling(u, 16, tiling);
 }
 
 export function createParamsBuffer(device, opts) {
@@ -70,26 +87,27 @@ export function updateParamsBuffer(queue, buffer, opts) {
 
 // ---------------------------------------------------------------------------
 // InitParams (init_gradient.wgsl):
-//   u32 numSites, f32 gradThreshold, u32 maxAttempts, u32 _pad,
-//   f32 initLogTau, f32 initRadius, u32 _pad1, u32 _pad2  (32 bytes)
+//   u32 numSites, f32 gradThreshold, u32 maxAttempts, u32 skipSlot,
+//   f32 initLogTau, f32 initRadius, u32 _pad1, u32 _pad2, Tiling  (48 bytes)
 // Python equivalent: struct "<IfIIffII" in train_wgpu.main()
 // ---------------------------------------------------------------------------
 
 export function createInitParamsBuffer(device, numSites, gradThreshold, maxAttempts,
-                                       initLogTau, initRadius) {
-  const bytes = new ArrayBuffer(32);
+                                       initLogTau, initRadius, tiling = null, skipSlot = 0xffffffff) {
+  const bytes = new ArrayBuffer(48);
   const u = new Uint32Array(bytes);
   const f = new Float32Array(bytes);
   u[0] = numSites >>> 0;
   f[1] = gradThreshold;
   u[2] = maxAttempts >>> 0;
-  u[3] = 0;
+  u[3] = skipSlot >>> 0;
   f[4] = initLogTau;
   f[5] = initRadius;
   u[6] = 0;
   u[7] = 0;
+  writeTiling(u, 8, tiling);
   const buf = device.createBuffer({
-    size: 32,
+    size: 48,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
   device.queue.writeBuffer(buf, 0, bytes);
@@ -100,24 +118,25 @@ export function createInitParamsBuffer(device, numSites, gradThreshold, maxAttem
 // GradParams (gradients_tiled.wgsl):
 //   u32 siteCount, u32 globalCand, u32 emaSlot, u32 _pad0,
 //   f32 invScaleSq, f32 emaKeep, f32 emaAlpha, f32 emaCap,
-//   f32 emaInvCount, f32 _pad1, f32 _pad2, f32 _pad3      (48 bytes)
+//   f32 emaInvCount, f32 _pad1, f32 _pad2, f32 _pad3, Tiling      (64 bytes)
 // globalCand: the site every pixel blends besides its list (none by default).
 // ema: the persistent-error weighting, { slot, keep, alpha, cap, invCount }
 // (see gradients_tiled.wgsl); alpha 0 = off.
 // ---------------------------------------------------------------------------
 
-export function createGradParamsBuffer(device, siteCount, invScaleSq, globalCand = 0xffffffff, ema = {}) {
+export function createGradParamsBuffer(device, siteCount, invScaleSq, globalCand = 0xffffffff, ema = {}, tiling = null) {
   const buf = device.createBuffer({
-    size: 48,
+    size: 64,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
-  updateGradParamsBuffer(device.queue, buf, siteCount, invScaleSq, globalCand, ema);
+  updateGradParamsBuffer(device.queue, buf, siteCount, invScaleSq, globalCand, ema, tiling);
   return buf;
 }
 
 export function updateGradParamsBuffer(queue, buffer, siteCount, invScaleSq, globalCand = 0xffffffff,
-                                       { slot = 0, keep = 0, alpha = 0, cap = 1, invCount = 0 } = {}) {
-  const bytes = new ArrayBuffer(48);
+                                       { slot = 0, keep = 0, alpha = 0, cap = 1, invCount = 0 } = {},
+                                       tiling = null) {
+  const bytes = new ArrayBuffer(64);
   const u = new Uint32Array(bytes);
   const f = new Float32Array(bytes);
   u[0] = siteCount >>> 0;
@@ -129,26 +148,28 @@ export function updateGradParamsBuffer(queue, buffer, siteCount, invScaleSq, glo
   f[6] = alpha;
   f[7] = cap;
   f[8] = invCount;
+  writeTiling(u, 12, tiling);
   queue.writeBuffer(buffer, 0, bytes);
 }
 
 // ---------------------------------------------------------------------------
 // AdamParams (adam.wgsl):
 //   f32 lrPos, lrTau, lrRadius, lrColor, lrDir, lrAniso, beta1, beta2, eps,
-//   u32 t, u32 width, u32 height, u32 layerSite, u32 _pad × 3 (64 bytes).
+//   u32 t, u32 width, u32 height, u32 layerSite, u32 _pad × 3, Tiling (80 bytes).
+// Tiled, width and height are the tile's.
 // ---------------------------------------------------------------------------
 
 export function createAdamParamsBuffer(device, opts) {
-  const buf = device.createBuffer({ size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  const buf = device.createBuffer({ size: 80, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
   updateAdamParamsBuffer(device.queue, buf, opts);
   return buf;
 }
 
 export function updateAdamParamsBuffer(queue, buffer, {
   lrPos = 0, lrTau = 0, lrRadius = 0, lrColor = 0, lrDir = 0, lrAniso = 0,
-  beta1 = 0.9, beta2 = 0.999, eps = 1e-8, t = 1, width, height, layerSite = 0xffffffff,
+  beta1 = 0.9, beta2 = 0.999, eps = 1e-8, t = 1, width, height, layerSite = 0xffffffff, tiling = null,
 }) {
-  const bytes = new ArrayBuffer(64);
+  const bytes = new ArrayBuffer(80);
   const f = new Float32Array(bytes);
   const u = new Uint32Array(bytes);
   f.set([lrPos, lrTau, lrRadius, lrColor, lrDir, lrAniso, beta1, beta2, eps], 0);
@@ -156,6 +177,7 @@ export function updateAdamParamsBuffer(queue, buffer, {
   u[10] = width >>> 0;
   u[11] = height >>> 0;
   u[12] = layerSite >>> 0;
+  writeTiling(u, 16, tiling);
   queue.writeBuffer(buffer, 0, bytes);
 }
 
@@ -181,6 +203,20 @@ export function updateCountParamsBuffer(queue, buffer, count, invScale = 0) {
   new Float32Array(bytes)[1] = invScale;
   u[2] = 0;
   u[3] = 0;
+  queue.writeBuffer(buffer, 0, bytes);
+}
+
+// PackParams (candidate_pack.wgsl): u32 count, f32 invScale, pad × 2, Tiling (32 bytes).
+export function createPackParamsBuffer(device) {
+  return device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+}
+
+export function updatePackParamsBuffer(queue, buffer, count, invScale, tiling = null) {
+  const bytes = new ArrayBuffer(32);
+  const u = new Uint32Array(bytes);
+  u[0] = count >>> 0;
+  new Float32Array(bytes)[1] = invScale;
+  writeTiling(u, 4, tiling);
   queue.writeBuffer(buffer, 0, bytes);
 }
 

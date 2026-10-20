@@ -28,3 +28,23 @@ node sweep.mjs --image /path/to/image.png --grid grid.json --repeat 3 --save-dir
 - `--jobs N` runs N trainers at once on one device. On an M4 at 768×512 the GPU is
   already saturated by one run, so total throughput stays the same. Parallelism
   only pays off across GPUs or machines.
+
+## Batched training
+
+`batch.mjs` trains many images with one fixed site count as a single run
+(`trainer/batch.js`: one tile per image in a shared atlas), and writes one JSON line
+per image with its final PSNR and sites in its own pixel coordinates:
+
+```bash
+node batch.mjs --mnist ../../comp/data/mnist/t10k-images-idx3-ubyte.gz --count 1000 \
+  --preset ../presets/mnist.json --set startSites=8 --set endSites=8
+node batch.mjs --images ../../comp/data/kodak --preset ../presets/kodak.json \
+  --set startSites=1000 --set endSites=1000 --compare 2
+```
+
+- The count must be fixed (`startSites` = `endSites`, not sawtooth, no turnover).
+  Images of one size share an atlas; others get their own.
+- `--compare <jobs>` also trains every image alone (`<jobs>` at once) and prints both
+  runs' speed and the PSNR difference. On an M4 with the MNIST preset at 8 sites,
+  256 digits: 9.4× faster than 8 separate trainers, −0.18 dB mean (per-image noise
+  ±6 dB). Kodak at 1000 sites: no speedup (one image already fills the GPU), −0.11 dB.

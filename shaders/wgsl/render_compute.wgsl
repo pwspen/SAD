@@ -20,7 +20,8 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   let inv_scale = sqrt(params.invScaleSq);
   let candCoord = candidateCoord(vec2<u32>(gid.xy), vec2<u32>(w, h), vec2<u32>(params.candWidth, params.candHeight));
   let candXY = vec2<i32>(i32(candCoord.x), i32(candCoord.y));
-  let candIds = cand_ids(textureLoad(inCand0, candXY, 0), textureLoad(inCand1, candXY, 0), params.globalCand);
+  let global = tile_global(params.tiling, tile_of_pixel(params.tiling, gid.xy), params.globalCand);
+  let candIds = cand_ids(textureLoad(inCand0, candXY, 0), textureLoad(inCand1, candXY, 0), global);
 
   var logits : array<f32, NCAND>;
   for (var i = 0u; i < NCAND; i = i + 1u) {

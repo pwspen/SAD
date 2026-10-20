@@ -158,7 +158,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>,
     let candCoord = candidateCoord(vec2<u32>(gid.xy), dims, candSize);
     let c0 = textureLoad(inCand0, vec2<i32>(candCoord), 0);
     let c1 = textureLoad(inCand1, vec2<i32>(candCoord), 0);
-    let candIds = cand_ids(c0, c1, params.globalCand);
+    let candIds = cand_ids(c0, c1, tile_global(params.tiling, tile_of_pixel(params.tiling, gid.xy), params.globalCand));
 
     var logits : array<f32, NCAND>;
     for (var i = 0u; i < NCAND; i = i + 1u) {

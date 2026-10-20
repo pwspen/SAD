@@ -1,6 +1,8 @@
 // Adam step over the interleaved f32-bit `grads` buffer (layout in
 // gradients_tiled.wgsl); clears each site's gradients after use.
-// The histogram layer (params.layer_site) only changes its depth.
+// The histogram layer (params.layer_site) only changes its depth. Tiled
+// (Tiling), width and height are a tile's, the layer is that slot of every
+// tile, and positions clamp to the site's own tile.
 
 @group(0) @binding(0) var<storage, read_write> sites : array<Site>;
 @group(0) @binding(1) var<storage, read_write> adam : array<f32>;
@@ -34,7 +36,13 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   if (is_bad(g_log_aniso)) { g_log_aniso = 0.0; }
 
   if (sites[idx].position.x < 0.0) { return; }
-  if (idx == params.layer_site) {
+  var slot = idx;
+  var origin = vec2<f32>(0.0);
+  if (tiled(params.tiling)) {
+    slot = idx % params.tiling.sitesPerTile;
+    origin = site_tile_origin(params.tiling, idx);
+  }
+  if (slot == params.layer_site) {
     // The histogram layer (trainer.js, LAYER_MODES): only its depth
     // β = τ · radius · inv_scale moves, at the log-τ LR (logit units), with
     // dL/dβ = dL/dradius / (τ · inv_scale) and Adam moments in the radius slots.
@@ -93,7 +101,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   let v_hat_pos = v_pos_scalar * b2t_corr;
   let step_pos = params.lr_pos * m_hat_pos / (sqrt(v_hat_pos) + params.eps);
   sites[idx].position = clamp(sites[idx].position - step_pos,
-    vec2<f32>(0.0), vec2<f32>(f32(params.width - 1u), f32(params.height - 1u)));
+    origin, origin + vec2<f32>(f32(params.width - 1u), f32(params.height - 1u)));
   v_pos = vec2<f32>(v_pos_scalar, v_pos_scalar);
 
   m_log_tau = params.beta1 * m_log_tau + (1.0 - params.beta1) * g_log_tau;

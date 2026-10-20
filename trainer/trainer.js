@@ -15,6 +15,7 @@ import {
   updateAdamParamsBuffer,
   createClearParamsBuffer,
   updateGradParamsBuffer,
+  invScaleSqFor,
   createUniform32,
 } from "./params.js?v=20261019";
 
@@ -165,6 +166,25 @@ export const LAYER_MODES = {
 // τ of the layer and its depth range; β is stored as radius β / (τ · inv_scale).
 const LEARN_LOG_TAU = -4;
 const LAYER_BETA_MAX = 8; // also in adam.wgsl
+// colorPeak of each image tile of an atlas (batch.js) of width `width`.
+function tilePeaks(target, mask, width, tiling) {
+  const { tileW, tileH, tilesX, count } = tiling;
+  const n = tileW * tileH;
+  const sub = new Float32Array(n * 4);
+  const subMask = mask ? new Float32Array(n) : null;
+  const peaks = [];
+  for (let b = 0; b < count; b += 1) {
+    const ox = (b % tilesX) * tileW, oy = Math.floor(b / tilesX) * tileH;
+    for (let y = 0; y < tileH; y += 1) {
+      const row = (oy + y) * width + ox;
+      sub.set(target.subarray(row * 4, (row + tileW) * 4), y * tileW * 4);
+      if (subMask) subMask.set(mask.subarray(row, row + tileW), y * tileW);
+    }
+    peaks.push(colorPeak(sub, n, subMask));
+  }
+  return peaks;
+}
+
 // Color bins (8-bit levels per bin and channel) of colorPeak's histogram.
 const PEAK_BIN = 16;
 
@@ -350,13 +370,16 @@ export class Trainer {
     this.statsEnc = new SiteStatsEncoder(device, shaders);
   }
 
-  async prepare({ width, height, targetRgba32f, maskRgba32f, maskSum, initSites, initSiteCount }) {
+  // `tiling` (batch.js) trains an atlas of images in one run: a fixed count
+  // of args.startSites sites per tile (the layer included), no init sites.
+  async prepare({ width, height, targetRgba32f, maskRgba32f, maskSum, initSites, initSiteCount, tiling = null }) {
     const args = this.args;
     const device = this.device;
     const shaders = this.shaders;
 
     this.width = width;
     this.height = height;
+    this.tiling = tiling;
     this.target = targetRgba32f; // keep a CPU copy for PSNR
     this.maskSum = maskSum;
     this.maskCpu = null;
@@ -396,36 +419,52 @@ export class Trainer {
     // counts against startSites and endSites alike (countArgs), so start =
     // end holds the count.
     const useLayer = args.layer === "learn";
-    if (!initSites) initSiteCount = useLayer ? Math.max(1, args.startSites - 1) : args.startSites;
-    if (useLayer) this.histPeak = colorPeak(targetRgba32f, width * height, this.maskCpu);
-    const baseSiteCount = initSiteCount;
-    this.layerIndex = useLayer ? baseSiteCount : null;
-    if (useLayer) initSiteCount += 1;
-    this.countArgs = useLayer ? { ...args, endSites: Math.max(1, args.endSites - 1) } : args;
-    this.usesGrow = countVaries(this.countArgs, baseSiteCount) || args.turnover > 0;
-    this.bufferCapacity = (this.usesGrow ? countCapacity(this.countArgs, baseSiteCount) : baseSiteCount) + (useLayer ? 1 : 0);
-    // Turnover's merges leave holes and its splits append, so leave room for
-    // 8 steps between compactions (_growTo).
-    if (args.turnover > 0) this.bufferCapacity += 8 * Math.max(1, Math.ceil(args.turnover * this.bufferCapacity));
+    let baseSiteCount;
+    if (tiling) {
+      // Every tile's sitesPerTile slots are placed at once; the layer is the
+      // last slot of each tile (kernels map the slot to the pixel's tile).
+      if (initSites) throw new Error("Batched training starts from the gradient init, not init sites");
+      if (countVaries(args, args.startSites) || args.turnover > 0) {
+        throw new Error("Batched training needs a fixed site count (start sites = end sites, no sawtooth, no turnover)");
+      }
+      const n = tiling.sitesPerTile;
+      if (useLayer) this.histPeaks = tilePeaks(targetRgba32f, this.maskCpu, width, tiling);
+      this.layerIndex = useLayer ? n - 1 : null;
+      this.countArgs = args;
+      this.usesGrow = false;
+      this.bufferCapacity = initSiteCount = baseSiteCount = tiling.tiles * n;
+    } else {
+      if (!initSites) initSiteCount = useLayer ? Math.max(1, args.startSites - 1) : args.startSites;
+      if (useLayer) this.histPeak = colorPeak(targetRgba32f, width * height, this.maskCpu);
+      baseSiteCount = initSiteCount;
+      this.layerIndex = useLayer ? baseSiteCount : null;
+      if (useLayer) initSiteCount += 1;
+      this.countArgs = useLayer ? { ...args, endSites: Math.max(1, args.endSites - 1) } : args;
+      this.usesGrow = countVaries(this.countArgs, baseSiteCount) || args.turnover > 0;
+      this.bufferCapacity = (this.usesGrow ? countCapacity(this.countArgs, baseSiteCount) : baseSiteCount) + (useLayer ? 1 : 0);
+      // Turnover's merges leave holes and its splits append, so leave room for
+      // 8 steps between compactions (_growTo).
+      if (args.turnover > 0) this.bufferCapacity += 8 * Math.max(1, Math.ceil(args.turnover * this.bufferCapacity));
+    }
     this.siteCount = initSiteCount;
 
     // Buffers
     this.sitesBuf = createSitesBuffer(device, this.bufferCapacity);
     this.adamBuf = createAdamBuffer(device, this.bufferCapacity);
-    this.seedCounter = createSeedCounter(device);
+    this.seedCounter = createSeedCounter(device, tiling ? tiling.tiles : 1);
     this.grads = createGradsBuffer(device, this.bufferCapacity);
 
     // Candidate lists (candidates.js)
-    this.cands = new CandidateLists(device, shaders, { ...args, width, height, capacity: this.bufferCapacity });
+    this.cands = new CandidateLists(device, shaders, { ...args, width, height, capacity: this.bufferCapacity, tiling });
     this.candWidth = this.cands.candWidth;
     this.candHeight = this.cands.candHeight;
 
     // Render texture and param buffers
     this.renderTex = createRgba32FloatTexture(device, width, height, { storage: true, copyDst: false, copySrc: true });
     this.renderParams = createParamsBuffer(device, this._paramsArgs(initSiteCount));
-    this.invScaleSq = 1.0 / Math.pow(Math.max(width, height), 2);
-    this.gradParams = createGradParamsBuffer(device, initSiteCount, this.invScaleSq, this._globalCand(), this._gradEma());
-    this.adamParams = createAdamParamsBuffer(device, { width, height, layerSite: this._globalCand() });
+    this.invScaleSq = invScaleSqFor(width, height, tiling);
+    this.gradParams = createGradParamsBuffer(device, initSiteCount, this.invScaleSq, this._globalCand(), this._gradEma(), tiling);
+    this.adamParams = createAdamParamsBuffer(device, { ...this._adamSize(), layerSite: this._globalCand() });
     this.gradCountParams = createClearParamsBuffer(device, this.bufferCapacity * 10);
 
     if (this.bufferCapacity > initSiteCount) {
@@ -464,7 +503,8 @@ export class Trainer {
     } else {
       const gradThreshold = 0.01;
       const initParamsBuf = createInitParamsBuffer(device, baseSiteCount, gradThreshold, 256,
-                                                    args.initLogTau, args.initRadius);
+                                                    args.initLogTau, args.initRadius, tiling,
+                                                    tiling ? this._globalCand() : undefined);
       const encoder = device.createCommandEncoder();
       this.initEnc.encode(encoder, this.sitesBuf, this.seedCounter, initParamsBuf,
                            this.targetTex, this.maskTex, baseSiteCount);
@@ -479,7 +519,9 @@ export class Trainer {
       }
       this._log(`Initialized sites: ${initSiteCount} (active ${this.activeEstimate})`);
     }
-    if (useLayer) {
+    if (useLayer && tiling) {
+      this._log(`Histogram layer: slot ${this.layerIndex} of each of ${tiling.count} tiles, from each image's own peak`);
+    } else if (useLayer) {
       const c = this.histPeak.color.map((v) => Math.round(v * 255)).join(", ");
       this._log(`Histogram layer: rgb(${c}) covers ${(100 * this.histPeak.mass).toFixed(1)}% of pixels → ` +
                 `site ${this.layerIndex}, depth β starts at ${this._layerBeta0().toFixed(2)}`);
@@ -524,7 +566,7 @@ export class Trainer {
   // index changed.
   _updateCountParams(n) {
     const queue = this.device.queue;
-    updateGradParamsBuffer(queue, this.gradParams, n, this.invScaleSq, this._globalCand(), this._gradEma());
+    updateGradParamsBuffer(queue, this.gradParams, n, this.invScaleSq, this._globalCand(), this._gradEma(), this.tiling);
     this.cands.globalCand = this._globalCand();
   }
 
@@ -534,30 +576,45 @@ export class Trainer {
     return { slot: this.errSlot, keep: this.errKeep, alpha: a.errWeight, cap: a.errCap, invCount: this.errInvCount };
   }
 
+  // AdamParams' size fields: the image's, or a tile's with the tiling.
+  _adamSize() {
+    const t = this.tiling;
+    return t ? { width: t.tileW, height: t.tileH, tiling: t } : { width: this.width, height: this.height };
+  }
+
   _log(msg) { if (this.onLog) this.onLog({ type: "msg", message: msg }); }
 
   // The histogram layer as a site at layerIndex: the peak color, logit
   // -e^LEARN_LOG_TAU · (d - r) ≈ β everywhere (isotropic, image center).
+  // Tiled: one per image tile, at its slot of the tile, from the tile's peak.
   _writeLayerSite() {
-    const site = new Float32Array(SITE_FLOATS);
-    site[0] = (this.width - 1) / 2;
-    site[1] = (this.height - 1) / 2;
-    site[2] = LEARN_LOG_TAU;
-    // Logit -τ(d - r·inv_scale) at d = 0 is the depth β.
-    site[3] = this._layerBeta0() * Math.max(this.width, this.height) / Math.exp(LEARN_LOG_TAU);
-    site.set(this.histPeak.color, 4);
-    site[7] = 1;
-    site[8] = 0;
-    site[9] = 0;
-    this.device.queue.writeBuffer(this.sitesBuf, this.layerIndex * SITE_FLOATS * 4,
-      encodeSiteColors(site, 1, this.colorSpace));
+    const t = this.tiling;
+    const tiles = t ? t.count : 1;
+    const data = new Float32Array(SITE_FLOATS);
+    for (let b = 0; b < tiles; b += 1) {
+      const peak = t ? this.histPeaks[b] : this.histPeak;
+      const ox = t ? (b % t.tilesX) * t.tileW : 0, oy = t ? Math.floor(b / t.tilesX) * t.tileH : 0;
+      const w = t ? t.tileW : this.width, h = t ? t.tileH : this.height;
+      const site = data;
+      site[0] = ox + (w - 1) / 2;
+      site[1] = oy + (h - 1) / 2;
+      site[2] = LEARN_LOG_TAU;
+      // Logit -τ(d - r·inv_scale) at d = 0 is the depth β.
+      site[3] = this._layerBeta0(peak) * Math.max(w, h) / Math.exp(LEARN_LOG_TAU);
+      site.set(peak.color, 4);
+      site[7] = 1;
+      site[8] = 0;
+      site[9] = 0;
+      const idx = t ? b * t.sitesPerTile + this.layerIndex : this.layerIndex;
+      this.device.queue.writeBuffer(this.sitesBuf, idx * SITE_FLOATS * 4, encodeSiteColors(site, 1, this.colorSpace));
+    }
   }
 
   // The layer's starting depth: the log-odds of its color's peak mass. The
   // start carries the prior: on MNIST, starting at β = -6 instead of from p
   // cost 1.4 dB at 32 sites (β only climbed back to -4, vs +3.4).
-  _layerBeta0() {
-    const p = Math.min(1 - 1e-3, Math.max(1e-3, this.histPeak.mass));
+  _layerBeta0(peak = this.histPeak) {
+    const p = Math.min(1 - 1e-3, Math.max(1e-3, peak.mass));
     return Math.max(-LAYER_BETA_MAX, Math.min(LAYER_BETA_MAX, Math.log(p / (1 - p))));
   }
 
@@ -587,7 +644,7 @@ export class Trainer {
         lrDir: it >= ANI_START_ITER ? args.lrDirBase * lrScale : 0,
         lrAniso: it >= ANI_START_ITER ? args.lrAnisoBase * lrScale : 0,
         beta1: args.beta1, beta2: args.beta2, eps: args.eps, t: it + 1,
-        width: this.width, height: this.height, layerSite: this._globalCand(),
+        ...this._adamSize(), layerSite: this._globalCand(),
       });
 
       const shouldLog = (it % logFreq === 0) || (it === iters - 1);
@@ -599,7 +656,7 @@ export class Trainer {
       // The error EWMA's decay, ramped in so step t averages its t + 1
       // residuals until that reaches errBeta.
       this.errKeep = Math.min(args.errBeta, it / (it + 1));
-      updateGradParamsBuffer(queue, this.gradParams, siteCount, this.invScaleSq, this._globalCand(), this._gradEma());
+      updateGradParamsBuffer(queue, this.gradParams, siteCount, this.invScaleSq, this._globalCand(), this._gradEma(), this.tiling);
 
       const encoder = device.createCommandEncoder();
       if (it % candUpdateFreq === 0) this.cands.encodeUpdate(encoder, this.sitesBuf, siteCount);
@@ -1318,7 +1375,7 @@ export class Trainer {
   // The histogram layer at the end of a run: { peakMass, beta (its depth),
   // area (fraction of masked pixels it owns) }, or null without one.
   async _layerStats(sitesRgb) {
-    if (this.layerIndex === null) return null;
+    if (this.layerIndex === null || this.tiling) return null;
     const b = this.layerIndex * SITE_FLOATS;
     const moments = cellMoments({
       width: this.width, height: this.height, sites: sitesRgb, n: this.actualSites, cand: await this._readCandidates(),

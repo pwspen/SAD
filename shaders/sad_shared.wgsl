@@ -83,20 +83,56 @@ struct Params {
   candWidth : u32,
   candHeight : u32,
   globalCand : u32, // the global site (cand_ids); none if >= siteCount
-  _pad0 : u32,
-  _pad1 : u32,
-  _pad2 : u32,
+  @align(16) tiling : Tiling,
+}
+
+// Batched training (trainer/batch.js): the image is an atlas of tiles, one
+// image each, tile b at column b % tilesX, row b / tilesX. Tile b owns sites
+// [b·sitesPerTile, (b + 1)·sitesPerTile) and a site only ever blends inside
+// its own tile. A global site id (the histogram layer) is then a slot within
+// each tile. sitesPerTile = 0: one image, no tiles.
+struct Tiling {
+  tileW : u32,
+  tileH : u32,
+  sitesPerTile : u32,
+  tilesX : u32,
+}
+
+fn tiled(t : Tiling) -> bool { return t.sitesPerTile > 0u; }
+
+// The tile holding pixel p (0 when untiled).
+fn tile_of_pixel(t : Tiling, p : vec2<u32>) -> u32 {
+  if (!tiled(t)) { return 0u; }
+  return (p.y / t.tileH) * t.tilesX + p.x / t.tileW;
+}
+
+// Whether site `idx` may blend in tile `tile`.
+fn site_in_tile(t : Tiling, idx : u32, tile : u32) -> bool {
+  return !tiled(t) || idx / t.sitesPerTile == tile;
+}
+
+// The global site of `tile`: `global` itself untiled, else that slot of the tile.
+fn tile_global(t : Tiling, tile : u32, global : u32) -> u32 {
+  if (!tiled(t) || global == NO_SITE) { return global; }
+  return tile * t.sitesPerTile + global;
+}
+
+// Top-left pixel of the tile holding site `idx`.
+fn site_tile_origin(t : Tiling, idx : u32) -> vec2<f32> {
+  let b = idx / t.sitesPerTile;
+  return vec2<f32>(f32((b % t.tilesX) * t.tileW), f32((b / t.tilesX) * t.tileH));
 }
 
 struct InitParams {
   numSites : u32,
   gradThreshold : f32,
   maxAttempts : u32,
-  _pad0 : u32,
+  skipSlot : u32, // tiled: the slot left for the histogram layer (none: NO_SITE)
   initLogTau : f32,
   initRadius : f32,
   _pad1 : u32,
   _pad2 : u32,
+  @align(16) tiling : Tiling,
 }
 
 // ema*: the persistent-error weighting (gradients_tiled.wgsl). emaSlot is the
@@ -115,6 +151,7 @@ struct GradParams {
   _pad1 : f32,
   _pad2 : f32,
   _pad3 : f32,
+  @align(16) tiling : Tiling,
 }
 
 struct AdamParams {
@@ -130,10 +167,13 @@ struct AdamParams {
   t : u32,
   width : u32,
   height : u32,
-  layer_site : u32, // the histogram layer's index (trainer.js), or none
+  layer_site : u32, // the histogram layer's index (trainer.js), or none; a slot per tile when tiled
   _pad0 : u32,
   _pad1 : u32,
   _pad2 : u32,
+  // Tiled: width / height above are the tile's, and positions clamp to the
+  // site's own tile.
+  @align(16) tiling : Tiling,
 }
 
 struct ClearParams {
