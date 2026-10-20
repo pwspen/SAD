@@ -140,7 +140,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   let v_hat_aniso = v_log_aniso * b2t_corr;
   let step_aniso = params.lr_aniso * m_hat_aniso / (sqrt(v_hat_aniso) + params.eps);
   sites[idx].log_aniso = sites[idx].log_aniso - step_aniso;
-  sites[idx].log_aniso = clamp(sites[idx].log_aniso, -2.0, 2.0);
+  sites[idx].log_aniso = clamp(sites[idx].log_aniso, -5.0, 5.0);
 
   adam[base + 0u] = m_pos.x;
   adam[base + 1u] = m_pos.y;
