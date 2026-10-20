@@ -22,6 +22,10 @@ const CONFIG_URL = "../training_config.json";
 const PRESET_DIR = "../presets/";
 const PRESETS = { "": "defaults", kodak: "Kodak", mnist: "MNIST" };
 const DEFAULTS_NOTE = "training_config.json and the trainer's built-in defaults.";
+// "Save as defaults": the form's args (and the config patch) as a preset that
+// replaces "defaults", in this browser only.
+const DEFAULTS_STORAGE_KEY = "sad.train.defaults";
+const SAVED_DEFAULTS_NOTE = "Your saved defaults (Save as defaults, this browser only).";
 const DEMO_MAX_IMAGE_SIDE = 2048;
 const VALUE_BINS = 24; // bins per panel of the site parameter values view
 const MI_ROUND_ANISO = 0.05; // |log_aniso| below this, a site has no orientation (site MI view)
@@ -126,6 +130,8 @@ const ui = {
   datasetSelect: document.getElementById("datasetSelect"),
   presetSelect: document.getElementById("presetSelect"),
   presetNote: document.getElementById("presetNote"),
+  saveDefaultsBtn: document.getElementById("saveDefaultsBtn"),
+  resetDefaultsBtn: document.getElementById("resetDefaultsBtn"),
   itemSelect: document.getElementById("itemSelect"),
   itemPrev: document.getElementById("itemPrev"),
   itemNext: document.getElementById("itemNext"),
@@ -191,7 +197,8 @@ function applyConfigToForm(config, overrides = {}) {
   syncSiteFields();
 }
 
-function readFormArgs() {
+// The advanced panel's fields as buildArgs overrides.
+function readFormOverrides() {
   const overrides = {};
   for (const [key, elId] of UI_FIELDS) {
     const el = document.getElementById(elId);
@@ -203,7 +210,11 @@ function readFormArgs() {
     else overrides[key] = Number(el.value);
   }
   if (overrides.logFreq !== undefined) overrides.viewerFreq = overrides.logFreq;
-  return buildArgs(state.config, overrides);
+  return overrides;
+}
+
+function readFormArgs() {
+  return buildArgs(state.config, readFormOverrides());
 }
 
 // The Schedule section's summary: what the current fields will do (run
@@ -295,7 +306,7 @@ async function applyPreset(key) {
   if (!state.baseConfig) return;
   ui.presetSelect.value = key;
   const token = ++presetToken;
-  let preset = { _note: DEFAULTS_NOTE, args: {} };
+  let preset = savedDefaults() || { _note: DEFAULTS_NOTE, args: {} };
   if (key) {
     try {
       const res = await fetch(new URL(`${PRESET_DIR}${key}.json`, import.meta.url), { cache: "no-cache" });
@@ -317,6 +328,46 @@ async function applyPreset(key) {
   applyConfigToForm(state.config, overrides);
   ui.presetNote.textContent = `Fills every field below; picking a dataset switches to its preset. ${preset._note || ""}`;
   updatePlanSummary();
+}
+
+function savedDefaults() {
+  try {
+    const args = JSON.parse(localStorage.getItem(DEFAULTS_STORAGE_KEY));
+    return args ? { _note: SAVED_DEFAULTS_NOTE, args } : null;
+  } catch { return null; }
+}
+
+// Saves the current fields, plus the config keys the preset patched (they
+// have no field), as the "defaults" preset.
+function saveDefaults() {
+  const args = {};
+  for (const [k, v] of Object.entries(state.config || {})) {
+    if (/^[A-Z0-9_]+$/.test(k) && JSON.stringify(v) !== JSON.stringify(state.baseConfig[k])) args[k] = v;
+  }
+  const overrides = readFormOverrides();
+  delete overrides.viewerFreq; // follows logFreq
+  Object.assign(args, overrides);
+  try {
+    localStorage.setItem(DEFAULTS_STORAGE_KEY, JSON.stringify(args));
+  } catch (err) {
+    setStatus(`Save as defaults failed: ${err.message}`);
+    return;
+  }
+  ui.presetSelect.value = "";
+  ui.presetNote.textContent = `Fills every field below; picking a dataset switches to its preset. ${SAVED_DEFAULTS_NOTE}`;
+  syncDefaultsButtons();
+  setStatus("Saved as defaults");
+}
+
+function resetDefaults() {
+  try { localStorage.removeItem(DEFAULTS_STORAGE_KEY); } catch {}
+  syncDefaultsButtons();
+  if (ui.presetSelect.value === "") applyPreset("");
+  setStatus("Defaults reset");
+}
+
+function syncDefaultsButtons() {
+  ui.resetDefaultsBtn.hidden = !savedDefaults();
 }
 
 async function loadConfig() {
@@ -3754,6 +3805,9 @@ async function main() {
   ui.imageInput.addEventListener("change", handleImageInput);
   for (const [key, label] of Object.entries(PRESETS)) ui.presetSelect.add(new Option(label, key));
   ui.presetSelect.addEventListener("change", () => applyPreset(ui.presetSelect.value));
+  ui.saveDefaultsBtn.addEventListener("click", saveDefaults);
+  ui.resetDefaultsBtn.addEventListener("click", resetDefaults);
+  syncDefaultsButtons();
   for (const [key, dataset] of Object.entries(DATASETS)) ui.datasetSelect.add(new Option(dataset.label, key));
   const datasetReady = selectDataset("mnist");
   ui.datasetSelect.addEventListener("change", () => selectDataset(ui.datasetSelect.value));

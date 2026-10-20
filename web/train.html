@@ -724,6 +724,16 @@
           <div class="row"><label>preset</label><select id="presetSelect" aria-label="Settings preset"></select></div>
           <div class="tip" role="tooltip" id="presetNote"></div>
         </div>
+        <div class="param">
+          <div class="row">
+            <label></label>
+            <div class="file-inline">
+              <button class="file-btn" id="saveDefaultsBtn">Save as defaults</button>
+              <button class="file-btn" id="resetDefaultsBtn" hidden>Reset</button>
+            </div>
+          </div>
+          <div class="tip" role="tooltip">Saves every field above (and the preset's settings that have no field) in this browser as the <b>defaults</b> preset. <b>Reset</b> goes back to training_config.json and the trainer's built-in defaults.</div>
+        </div>
 
         <h3>Input</h3>
         <div class="param">
