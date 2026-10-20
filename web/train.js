@@ -183,6 +183,8 @@ const ui = {
   batchNext: document.getElementById("batchNext"),
   batchSnap: document.getElementById("batchSnap"),
   batchSnapLabel: document.getElementById("batchSnapLabel"),
+  tuneProgress: document.getElementById("tuneProgress"),
+  tuneProgressFill: document.getElementById("tuneProgressFill"),
   batchRerun: document.getElementById("batchRerun"),
   batchExport: document.getElementById("batchExport"),
   batchSummary: document.getElementById("batchSummary"),
@@ -3482,6 +3484,7 @@ async function runBatch({ items: fixedItems = null, quiet = false } = {}) {
             `(${(iters / Math.max(batch.wallSec, 1e-6)).toFixed(0)} it/s over all runs)` +
             (done.length ? ` | final PSNR mean ${mean.toFixed(2)} dB, ` +
               `${done.at(-1).final.psnr.toFixed(2)}–${done[0].final.psnr.toFixed(2)} dB` : ""));
+  if (state.tune?.progress) state.tune.progress.batches += 1;
   updateBatchProgress();
   updateBatchBar();
   drawBatchViews();
@@ -3618,6 +3621,8 @@ async function optimizeAll(btn) {
       return;
     }
     const inputs = tunableInputs();
+    state.tune.progress = { units: 1 + cycles * inputs.length, done: -1 };
+    nextTuneUnit(true);
     setStatus("Optimize all: baseline");
     const base = await runBatch({ quiet: true });
     if (!base || stopped) return;
@@ -3627,6 +3632,7 @@ async function optimizeAll(btn) {
               `${baseline.toFixed(3)} dB (${items.length} images)`);
     for (let cycle = 1; cycle <= cycles; cycle += 1) {
       for (const [i, input] of inputs.entries()) {
+        nextTuneUnit();
         const name = tuneName(input);
         const start = Number(input.value);
         if (!Number.isFinite(start) || start === 0) {
@@ -3661,6 +3667,7 @@ async function optimizeAll(btn) {
       setStatus(`Optimize all: ${fmtDb(current - baseline)}`);
     }
     state.tune = null;
+    updateTuneProgress();
     syncTuneButtons();
     maybeEnableStart();
   }
@@ -3698,11 +3705,14 @@ async function autoTune(input, btn) {
       appendLog(`Auto-tune ${name}: needs a non-zero value to scale.`);
       return;
     }
+    state.tune.progress = { units: 2, done: -1 };
+    nextTuneUnit(true);
     setStatus(`Auto-tune ${name}: baseline ${best}`);
     const base = await runBatch({ quiet: true });
     if (!base || stopped) return;
     appendLog(`Auto-tune ${name}: ${best} → median ${base.median.toFixed(3)} dB (${base.items.length} images)`);
     const t = { best, bestMedian: base.median };
+    nextTuneUnit();
     try {
       await climbSetting(input, t, tune, base.items, () => stopped);
     } finally {
@@ -3713,6 +3723,7 @@ async function autoTune(input, btn) {
     appendLog(`Auto-tune ${name}${stopped ? " stopped" : ""}: kept ${best}.`);
     setStatus(`Auto-tune ${name}: ${best}`);
     state.tune = null;
+    updateTuneProgress();
     syncTuneButtons();
     maybeEnableStart();
   }
@@ -3874,10 +3885,35 @@ function scheduleBatchDraw() {
 }
 
 // Iterations per second summed over every run of the batch so far.
+function batchItersDone(b) {
+  return b.runs.reduce((s, r) => s + (r.status === "done" ? b.args.iters : Math.max(0, r.it + 1)), 0);
+}
+
 function batchItersPerSec(b) {
   const elapsed = b.running ? (performance.now() - b.startMs) / 1000 : b.wallSec;
-  const iters = b.runs.reduce((s, r) => s + (r.status === "done" ? b.args.iters : Math.max(0, r.it + 1)), 0);
-  return { elapsed, rate: iters / Math.max(elapsed, 1e-6) };
+  return { elapsed, rate: batchItersDone(b) / Math.max(elapsed, 1e-6) };
+}
+
+// The green bar across the top while auto-tune or optimize all runs. Progress
+// is in units (the baseline batch, then each setting tuned); a setting's batch
+// count isn't known ahead, so after k batches it shows k / (k + 2) of its unit.
+function updateTuneProgress() {
+  const p = state.tune?.progress;
+  ui.tuneProgress.classList.toggle("hidden", !p);
+  if (!p) return;
+  const b = state.batch;
+  const k = p.batches + (b?.running ? Math.min(1, batchItersDone(b) / Math.max(1, b.runs.length * b.args.iters)) : 0);
+  const unit = p.baseline ? Math.min(1, k) : k / (k + 2);
+  ui.tuneProgressFill.style.width = `${(100 * Math.min(1, (p.done + unit) / p.units)).toFixed(2)}%`;
+}
+
+// Moves the tune bar on to the next unit (`baseline`: it is the one baseline batch).
+function nextTuneUnit(baseline = false) {
+  const p = state.tune.progress;
+  p.done += 1;
+  p.batches = 0;
+  p.baseline = baseline;
+  updateTuneProgress();
 }
 
 function updateBatchProgress() {
@@ -3889,6 +3925,7 @@ function updateBatchProgress() {
   updateProgress(finished, total, `batch ${finished}/${total} runs · ` +
     `${rate.toFixed(0)} it/s over all runs · ${elapsed.toFixed(1)}s`);
   updateBatchSummary();
+  updateTuneProgress();
 }
 
 // "123k iter/s · done/total done · mean · median" in the batch bar.

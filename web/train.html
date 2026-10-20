@@ -278,6 +278,23 @@
       .tune-btn:hover:not(:disabled) { color: var(--text); border-color: var(--accent); }
       .tune-btn.active { background: var(--accent); border-color: var(--accent); color: var(--accent-contrast); }
       .tune-btn:disabled { cursor: default; opacity: 0.45; }
+      /* Auto-tune / optimize-all progress (train.js: updateTuneProgress). */
+      .tune-progress {
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        height: 3px;
+        z-index: 1000;
+        pointer-events: none;
+      }
+      .tune-progress.hidden { display: none; }
+      .tune-progress-fill {
+        height: 100%;
+        width: 0;
+        background: #22a85a;
+        transition: width 0.25s ease-out;
+      }
       .row input[type="number"]:focus, .row input[type="text"]:focus, .row select:focus {
         outline: none;
         border-color: var(--accent);
@@ -739,6 +756,7 @@
     </style>
   </head>
   <body>
+    <div class="tune-progress hidden" id="tuneProgress"><div class="tune-progress-fill" id="tuneProgressFill"></div></div>
     <div class="top">
       <div class="brand">SAD Demo</div>
 
