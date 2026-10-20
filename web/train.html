@@ -1009,7 +1009,7 @@
           <div class="tip" role="tooltip">Anisotropy: 0 = round, ±1 ≈ 2.7:1, clamped to ±2 ≈ 7.4:1. Frozen for the first 50 iterations.</div>
         </div>
 
-        <h3 class="has-tip" tabindex="0">Tuning<span class="tip" role="tooltip">How the <b>tune</b> buttons search. Each round runs one batch at the value × <b>tune ratio</b> and one at the value ÷ <b>tune ratio</b>, on the same images as the first batch, and moves to whichever raises the median final PSNR. It stops when neither does, or after <b>tune max rounds</b>. Not training settings: they don't change a run.</span></h3>
+        <h3 class="has-tip" tabindex="0">Tuning<span class="tip" role="tooltip"><b>optimize all</b> tunes every setting in turn. How the <b>tune</b> buttons search. Each round runs one batch at the value × <b>tune ratio</b> and one at the value ÷ <b>tune ratio</b>, on the same images as the first batch, and moves to whichever raises the median final PSNR. It stops when neither does, or after <b>tune max rounds</b>. Not training settings: they don't change a run.</span></h3>
         <div class="param">
           <div class="row"><label>tune ratio</label><input id="p-tuneRatio" data-no-tune type="number" step="0.1" min="1.01" value="1.5" /></div>
           <p class="help"><span class="unit">× up, ÷ down per round</span></p>
@@ -1019,6 +1019,16 @@
           <div class="row"><label>tune max rounds</label><input id="p-tuneRounds" data-no-tune type="number" step="1" min="1" value="20" /></div>
           <p class="help"><span class="unit">rounds (up to 2 batches each)</span></p>
           <div class="tip" role="tooltip">Stops the search after this many rounds even if it is still improving, so noise can't keep it wandering.</div>
+        </div>
+        <div class="param">
+          <div class="row"><label>optimize cycles</label><input id="p-tuneCycles" data-no-tune type="number" step="1" min="1" value="1" /></div>
+          <p class="help"><span class="unit">passes over every tunable setting</span></p>
+          <div class="tip" role="tooltip">How many times <b>optimize all</b> goes through the settings. A later pass can help because each setting was tuned with the ones after it still at their old values.</div>
+        </div>
+        <div class="param">
+          <div class="row"><label></label><button type="button" class="btn" id="optimizeAllBtn" disabled>optimize all</button></div>
+          <p class="help"><span class="unit">tunes each setting in turn on the same images</span></p>
+          <div class="tip" role="tooltip">Runs <b>tune</b> on every setting that has a tune button, top to bottom, for <b>optimize cycles</b> passes, all on the same batch images. The log reports the median PSNR gain per setting and overall. Click again to stop; the best values found so far are kept.</div>
         </div>
       </aside>
 

@@ -3531,14 +3531,138 @@ function setupAutoTune() {
     });
     input.after(btn);
   }
+  const all = document.getElementById("optimizeAllBtn");
+  all.addEventListener("click", () => {
+    if (state.tune) {
+      if (state.tune.btn === all) state.tune.stop();
+      return;
+    }
+    optimizeAll(all);
+  });
 }
 
 function syncTuneButtons() {
-  for (const btn of ui.paramsPanel.querySelectorAll(".tune-btn")) {
+  const all = document.getElementById("optimizeAllBtn");
+  for (const btn of [...ui.paramsPanel.querySelectorAll(".tune-btn"), all]) {
     const active = state.tune?.btn === btn;
-    btn.textContent = active ? "stop" : "tune";
+    btn.textContent = active ? "stop" : btn === all ? "optimize all" : "tune";
     btn.classList.toggle("active", active);
     btn.disabled = state.tune ? !active : state.running || !state.device;
+  }
+}
+
+function tuneName(input) {
+  return input.closest(".row")?.querySelector("label")?.textContent ?? input.id;
+}
+
+const fmtDb = (db) => `${db >= 0 ? "+" : ""}${db.toFixed(3)} dB`;
+
+// Hill-climbs one setting from `t.best` (median `t.bestMedian`, measured on
+// `items`), updating `t` as it goes so the caller can keep the best value even
+// when stopped. Resolves to false when stopped or a batch didn't finish.
+async function climbSetting(input, t, tune, items, isStopped, prefix = "") {
+  const name = tuneName(input);
+  const seen = new Map([[t.best, t.bestMedian]]); // same images, so no need to re-run a value
+  for (let round = 1; round <= tune.rounds; round += 1) {
+    const center = t.best;
+    const centerMedian = t.bestMedian;
+    const tried = [];
+    for (const f of [tune.up, tune.down]) {
+      const v = tuneValue(input, center * f);
+      if (v === center || tried.some((x) => x.v === v)) continue;
+      let median = seen.get(v);
+      if (median === undefined) {
+        setTuneValue(input, v);
+        setStatus(`${prefix}Auto-tune ${name}: round ${round}, trying ${v} (best ${center} @ ${centerMedian.toFixed(3)} dB)`);
+        const r = await runBatch({ items, quiet: true });
+        if (!r || isStopped()) return false;
+        median = r.median;
+        seen.set(v, median);
+      }
+      tried.push({ v, median });
+      if (median > t.bestMedian) { t.best = v; t.bestMedian = median; }
+    }
+    appendLog(`Auto-tune ${name} round ${round}: ` +
+              tried.map((x) => `${x.v} → ${x.median.toFixed(3)}`).join(", ") +
+              ` vs ${center} → ${centerMedian.toFixed(3)} dB; ` +
+              (t.best === center ? "neither helps, done." : `moving to ${t.best}.`));
+    if (t.best === center) return true;
+    if (round === tune.rounds) appendLog(`Auto-tune ${name}: stopped after ${tune.rounds} rounds.`);
+  }
+  return true;
+}
+
+// Auto-tunes every setting with a tune button, top to bottom, for `optimize
+// cycles` passes, all on the images of one baseline batch. Each setting starts
+// from the median the previous one ended on. Logs the median gain per setting
+// and overall.
+async function optimizeAll(btn) {
+  if (state.running || state.tune || !state.device) return;
+  let stopped = false;
+  const isStopped = () => stopped;
+  state.tune = { input: null, btn, stop: () => { stopped = true; state.abortCtrl?.abort(); } };
+  syncTuneButtons();
+  maybeEnableStart();
+  const gains = []; // { cycle, name, from, to, gain }
+  let baseline = null;
+  let current = null;
+  try {
+    let tune;
+    let cycles;
+    try {
+      tune = tuneSettings();
+      cycles = Math.floor(Number(document.getElementById("p-tuneCycles").value));
+      if (!(cycles >= 1)) throw new Error("optimize cycles must be at least 1");
+    } catch (err) {
+      appendLog(`Optimize all: ${err.message}.`);
+      return;
+    }
+    const inputs = tunableInputs();
+    setStatus("Optimize all: baseline");
+    const base = await runBatch({ quiet: true });
+    if (!base || stopped) return;
+    const items = base.items;
+    baseline = current = base.median;
+    appendLog(`Optimize all: ${inputs.length} settings × ${cycles} cycle(s), baseline median ` +
+              `${baseline.toFixed(3)} dB (${items.length} images)`);
+    for (let cycle = 1; cycle <= cycles; cycle += 1) {
+      for (const [i, input] of inputs.entries()) {
+        const name = tuneName(input);
+        const start = Number(input.value);
+        if (!Number.isFinite(start) || start === 0) {
+          appendLog(`Optimize all: skipping ${name} (needs a non-zero value to scale).`);
+          continue;
+        }
+        const t = { best: start, bestMedian: current };
+        const prefix = `Optimize all ${cycle}/${cycles}, ${i + 1}/${inputs.length}: `;
+        let ok;
+        try {
+          ok = await climbSetting(input, t, tune, items, isStopped, prefix);
+        } finally {
+          setTuneValue(input, t.best);
+          gains.push({ cycle, name, from: start, to: t.best, gain: t.bestMedian - current });
+          current = t.bestMedian;
+        }
+        appendLog(`Optimize all: ${name} ${start} → ${t.best}, ${fmtDb(gains.at(-1).gain)}`);
+        if (!ok) return;
+      }
+    }
+  } finally {
+    if (baseline !== null) {
+      const perSetting = new Map();
+      for (const g of gains) perSetting.set(g.name, (perSetting.get(g.name) ?? 0) + g.gain);
+      const changed = [...perSetting].filter(([, g]) => g > 0).sort((a, b) => b[1] - a[1]);
+      appendLog(`Optimize all${stopped ? " stopped" : " done"}: median ${baseline.toFixed(3)} → ` +
+                `${current.toFixed(3)} dB, ${fmtDb(current - baseline)} overall. ` +
+                (changed.length ? "Gains: " + changed.map(([n, g]) => `${n} ${fmtDb(g)}`).join(", ") + "."
+                                : "No setting helped."));
+      console.table(gains.map((g) => ({ ...g, gain: Number(g.gain.toFixed(4)) })));
+      console.log(`Optimize all: ${fmtDb(current - baseline)} overall (${baseline.toFixed(3)} → ${current.toFixed(3)} dB)`);
+      setStatus(`Optimize all: ${fmtDb(current - baseline)}`);
+    }
+    state.tune = null;
+    syncTuneButtons();
+    maybeEnableStart();
   }
 }
 
@@ -3556,7 +3680,7 @@ function setTuneValue(input, v) {
 
 async function autoTune(input, btn) {
   if (state.running || state.tune || !state.device) return;
-  const name = input.closest(".row")?.querySelector("label")?.textContent ?? input.id;
+  const name = tuneName(input);
   let stopped = false;
   state.tune = { input, btn, stop: () => { stopped = true; state.abortCtrl?.abort(); } };
   syncTuneButtons();
@@ -3577,35 +3701,12 @@ async function autoTune(input, btn) {
     setStatus(`Auto-tune ${name}: baseline ${best}`);
     const base = await runBatch({ quiet: true });
     if (!base || stopped) return;
-    const items = base.items;
-    let bestMedian = base.median;
-    const seen = new Map([[best, bestMedian]]); // same images, so no need to re-run a value
-    appendLog(`Auto-tune ${name}: ${best} → median ${bestMedian.toFixed(3)} dB (${items.length} images)`);
-    for (let round = 1; round <= tune.rounds; round += 1) {
-      const center = best;
-      const centerMedian = bestMedian;
-      const tried = [];
-      for (const f of [tune.up, tune.down]) {
-        const v = tuneValue(input, center * f);
-        if (v === center || tried.some((t) => t.v === v)) continue;
-        let median = seen.get(v);
-        if (median === undefined) {
-          setTuneValue(input, v);
-          setStatus(`Auto-tune ${name}: round ${round}, trying ${v} (best ${center} @ ${centerMedian.toFixed(3)} dB)`);
-          const r = await runBatch({ items, quiet: true });
-          if (!r || stopped) return;
-          median = r.median;
-          seen.set(v, median);
-        }
-        tried.push({ v, median });
-        if (median > bestMedian) { best = v; bestMedian = median; }
-      }
-      appendLog(`Auto-tune ${name} round ${round}: ` +
-                tried.map((t) => `${t.v} → ${t.median.toFixed(3)}`).join(", ") +
-                ` vs ${center} → ${centerMedian.toFixed(3)} dB; ` +
-                (best === center ? "neither helps, done." : `moving to ${best}.`));
-      if (best === center) return;
-      if (round === tune.rounds) appendLog(`Auto-tune ${name}: stopped after ${tune.rounds} rounds.`);
+    appendLog(`Auto-tune ${name}: ${best} → median ${base.median.toFixed(3)} dB (${base.items.length} images)`);
+    const t = { best, bestMedian: base.median };
+    try {
+      await climbSetting(input, t, tune, base.items, () => stopped);
+    } finally {
+      best = t.best;
     }
   } finally {
     if (Number.isFinite(best)) setTuneValue(input, best);
