@@ -7,8 +7,9 @@ import { loadShaders, tileSlotsForLimit } from "../trainer/shader_loader.js?v=20
 import { requestTrainingDevice } from "../trainer/device.js?v=20261019";
 import { Trainer, buildArgs, GRAD_GROUPS, GRAD_CHANNELS, lrSchedule, LR_SCHEDULES, LOSSES, COUNT_SCHEDULES, LAYER_MODES, countPlan, countVaries, countHorizon } from "../trainer/trainer.js?v=20261019";
 import { loadImageToFloat32, loadMaskRgba32Float, whiteMaskRgba32Float } from "../trainer/textures.js?v=20261019";
-import { loadSitesFromFile, serializeSitesTxt, triggerDownload, floatImageToRgba8, computeBpp, BITS_PER_SITE } from "../trainer/io.js?v=20261019";
+import { loadSitesFromFile, serializeSitesTxt, triggerDownload, floatImageToRgba8, computeBpp, computePsnr, BITS_PER_SITE } from "../trainer/io.js?v=20261019";
 import { SITE_FLOATS } from "../trainer/params.js?v=20261019";
+import { BatchTrainer, planBatches, tileSites, tileActive, tileSize, atlasCapacity } from "../trainer/batch.js?v=20261019";
 import { COLOR_SPACES } from "../trainer/color_spaces.js?v=20261019";
 import {
   luma, maskWeights, laplacianBands, maskLevels, bandEnergies, IMPORTANCE, importanceMap,
@@ -121,6 +122,7 @@ const state = {
   dragId: null,          // view being dragged in edit mode
   baseConfig: null,      // training_config.json as loaded; state.config adds the preset's UPPER_CASE keys
   showCentroids: true,   // centroid dots over the preview (its card's checkbox)
+  batch: null,           // the last batch of runs (runBatch): { dataset, args, runs, running, selected, … }
 };
 
 const ui = {
@@ -161,6 +163,26 @@ const ui = {
   progressFill: document.getElementById("progressFill"),
   progressText: document.getElementById("progressText"),
   log: document.getElementById("logPanel"),
+  batchBtn: document.getElementById("batchBtn"),
+  batchPopover: document.getElementById("batchPopover"),
+  batchFrom: document.getElementById("batchFrom"),
+  batchCount: document.getElementById("batchCount"),
+  batchFill: document.getElementById("batchFill"),
+  batchJobs: document.getElementById("batchJobs"),
+  batchLogFreq: document.getElementById("batchLogFreq"),
+  batchSnaps: document.getElementById("batchSnaps"),
+  batchNote: document.getElementById("batchNote"),
+  batchRunBtn: document.getElementById("batchRunBtn"),
+  batchTiled: document.getElementById("batchTiled"),
+  batchBar: document.getElementById("batchBar"),
+  batchRunSelect: document.getElementById("batchRunSelect"),
+  batchPrev: document.getElementById("batchPrev"),
+  batchNext: document.getElementById("batchNext"),
+  batchSnap: document.getElementById("batchSnap"),
+  batchSnapLabel: document.getElementById("batchSnapLabel"),
+  batchRerun: document.getElementById("batchRerun"),
+  batchExport: document.getElementById("batchExport"),
+  batchSummary: document.getElementById("batchSummary"),
 };
 
 function setStatus(msg) { ui.status.textContent = msg; }
@@ -420,7 +442,7 @@ const SOURCES = {
   train:   { badge: "Training", desc: "Training: reported by the trainer while it optimizes." },
   derived: { badge: "Viz only", desc: "Viz only: computed in the viewer (CPU) for display. The optimizer never sees it." },
 };
-const VIEW_EVENTS = ["target", "render", "log", "run"];
+const VIEW_EVENTS = ["target", "render", "log", "run", "batch"];
 
 const VIEWS = {
   target:     { label: "Target", kind: "image", source: "input", on: ["target"], draw: drawTarget,
@@ -537,6 +559,16 @@ const VIEWS = {
                       "error by about F·δ². Units differ per group (pixels for position, log units for τ and " +
                       "anisotropy), so compare sites within a panel, not across panels. Sites with F = 0 (no " +
                       "pixels, or not reachable) are counted in the title." },
+  batchPsnr:  { label: "Batch: PSNR vs iteration", kind: "plot", source: "train", on: ["batch"],
+                draw: drawBatchViews, hit: hitBatchPsnr, click: clickBatchRun,
+                note: "Every run of the last batch, from its PSNR log ticks (log every in the Batch menu). Grey: " +
+                      "finished; blue: still running; orange: the selected run. Hover a curve to find its run; " +
+                      "once the batch has finished, click it to load the run into the other views." },
+  batchHist:  { label: "Batch: final PSNR", kind: "plot", source: "train", on: ["batch"],
+                draw: drawBatchViews, hit: hitBatchHist, click: clickBatchRun,
+                note: "How many runs ended at each PSNR. Each run is one cell, stacked in its bin by PSNR, so " +
+                      "hovering picks out a single run; click it to load it once the batch has finished. Final " +
+                      "PSNR is measured on the last render, so it can sit below the run's best log tick." },
   clusterMap: { label: `Snap clusters on the image (k = ${SNAP_MAP_K})`, kind: "image", source: "derived",
                 blank: "#f1f1ec", on: ["render"], draw: drawClusterMap,
                 note: "The latest render, washed out, with each site's centroid in its cluster's color from the " +
@@ -578,6 +610,11 @@ const LAYOUTS = {
     label: "Site editor",
     areas: `"editor target   residual"
             "editor siteIds  tau"`,
+  },
+  batch: {
+    label: "Batch",
+    areas: `"batchHist batchPsnr batchPsnr"
+            "preview   target    psnr"`,
   },
   spectral: {
     label: "Spectral",
@@ -1347,20 +1384,38 @@ function nearestX(g, items, getX, mx) {
 
 function attachPlotHover(view, card, canvas) {
   card.classList.add("hoverable");
+  // At most one hit test and redraw per frame, for the latest position.
+  let pending = null;
   canvas.addEventListener("mousemove", (ev) => {
-    if (!view.geom) return;
-    const rect = canvas.getBoundingClientRect();
-    const key = view.hit(view.geom, ev.clientX - rect.left, ev.clientY - rect.top);
-    if (key !== view.hoverKey) {
-      view.hoverKey = key;
-      view.draw(view);
-    }
+    const first = !pending;
+    pending = ev;
+    if (!first) return;
+    requestAnimationFrame(() => {
+      const e = pending;
+      pending = null;
+      if (!e || !view.geom) return;
+      const rect = canvas.getBoundingClientRect();
+      const key = view.hit(view.geom, e.clientX - rect.left, e.clientY - rect.top);
+      if (key !== view.hoverKey) {
+        view.hoverKey = key;
+        view.draw(view);
+      }
+    });
   });
   canvas.addEventListener("mouseleave", () => {
+    pending = null;
     if (view.hoverKey == null) return;
     view.hoverKey = null;
     view.draw(view);
   });
+  if (view.click) {
+    canvas.addEventListener("click", (ev) => {
+      if (!view.geom) return;
+      const rect = canvas.getBoundingClientRect();
+      const key = view.hit(view.geom, ev.clientX - rect.left, ev.clientY - rect.top);
+      if (key != null) view.click(key);
+    });
+  }
 }
 
 // ---- PSNR vs iteration ----
@@ -3035,6 +3090,7 @@ function clearInitSites() {
 
 function maybeEnableStart() {
   ui.startBtn.disabled = !(state.device && state.targetImage);
+  ui.batchBtn.disabled = !state.device || state.running;
 }
 
 function scaleInitSitesIfNeeded(init, width, height) {
@@ -3073,6 +3129,7 @@ async function startTraining() {
   ui.saveBtn.disabled = true;
   ui.savePopover.classList.add("hidden");
   ui.startBtn.disabled = true;
+  ui.batchBtn.disabled = true;
   ui.stopBtn.disabled = false;
   setDatasetEnabled(false);
   state.running = true;
@@ -3244,8 +3301,10 @@ async function startTraining() {
   } finally {
     state.running = false;
     ui.startBtn.disabled = false;
+    ui.batchBtn.disabled = false;
     ui.stopBtn.disabled = true;
     setDatasetEnabled(true);
+    updateBatchBar();
     drawEditor(); // editing opens once the run has stopped
   }
   // The snap analysis waits for training to stop; looping runs skip it.
@@ -3256,6 +3315,718 @@ async function startTraining() {
     appendLog("Loop: starting again from iteration 0.");
     setTimeout(startTraining, 0);
   }
+}
+
+// ---- Batch: many dataset images with one set of settings ----
+// A pool of `jobs` trainers shares the GPU. Each run keeps only its log-tick
+// scalars (PSNR, sites, LR, gradient stats) and up to `snaps` site snapshots
+// plus its final sites; no images. Selecting a finished run reloads its target
+// and puts its snapshots on a viewer-only trainer (Trainer.showSites), so
+// every view drawn from the render or the sites works on them. Views that need
+// training state (gradient heatmap, persistent error, merge edges) need
+// "Re-run with full logging", which trains the image again: GPU float atomics
+// make runs differ slightly, so it is not a replay.
+
+async function runBatch() {
+  if (state.running || !state.device) return;
+  ui.batchPopover.classList.add("hidden");
+  let args;
+  try {
+    args = readFormArgs();
+  } catch (err) {
+    appendLog(`Settings error: ${err.message}`);
+    return;
+  }
+  const datasetKey = ui.datasetSelect.value;
+  const dataset = DATASETS[datasetKey];
+  if (!dataset?.count) return;
+  const int = (el, min, max) => Math.min(max, Math.max(min, Math.floor(Number(el.value)) || min));
+  const from = int(ui.batchFrom, 0, dataset.count - 1);
+  if (ui.batchFill.checked && ui.batchTiled.checked && canTileBatch(args)) await syncBatchFill();
+  const n = int(ui.batchCount, 1, dataset.count - from);
+  const jobs = int(ui.batchJobs, 1, 256);
+  const logFreq = int(ui.batchLogFreq, 1, args.iters);
+  const snapCount = int(ui.batchSnaps, 1, 1000);
+  // No previews: a batch only reads back at its log ticks.
+  const runArgs = { ...args, logFreq, viewerFreq: args.iters + 1 };
+  const tiled = ui.batchTiled.checked && canTileBatch(runArgs);
+  batchVersion += 1;
+  const batch = state.batch = {
+    dataset: datasetKey, args: runArgs, from, jobs, snapCount, tiled, running: true,
+    selected: null, snapIndex: 0, startMs: performance.now(), wallSec: 0,
+    runs: Array.from({ length: n }, (_, i) => ({
+      id: i, item: from + i, name: dataset.itemName(from + i), status: "queued",
+      it: -1, curve: [], snaps: [], final: null, width: 0, height: 0,
+    })),
+  };
+
+  state.running = true;
+  state.abortCtrl = new AbortController();
+  const signal = state.abortCtrl.signal;
+  ui.startBtn.disabled = true;
+  ui.batchBtn.disabled = true;
+  ui.stopBtn.disabled = false;
+  ui.saveBtn.disabled = true;
+  setDatasetEnabled(false);
+  await state.snapAnalysis?.promise; // it renders with the old trainer
+  state.trainer?.destroy();
+  state.trainer = null;
+  if (state.layoutName !== "batch") await setLayout("batch");
+  updateBatchBar();
+  appendLog(`Batch: ${n} ${dataset.label} image(s) ${dataset.itemName(from)}–${dataset.itemName(from + n - 1)}, ` +
+            (tiled ? "one atlas per image size" : `${jobs} at once`) +
+            `, log every ${logFreq}, ${snapCount} snapshot(s) per run.` +
+            (ui.batchTiled.checked && !tiled ? " (Separate trainers: one atlas needs a fixed site count.)" : "") +
+            (state.maskData || state.initSites ? " The mask and init sites are ignored." : ""));
+  drawBatchViews();
+
+  let next = 0;
+  const worker = async () => {
+    while (next < n && !signal.aborted) {
+      const run = batch.runs[next++];
+      await trainBatchRun(batch, run, dataset, signal);
+      scheduleBatchDraw();
+    }
+  };
+  try {
+    if (tiled) await trainTiledBatch(batch, dataset, signal);
+    else await Promise.all(Array.from({ length: Math.min(jobs, n) }, worker));
+  } finally {
+    batch.running = false;
+    batch.wallSec = (performance.now() - batch.startMs) / 1000;
+    for (const run of batch.runs) if (run.status === "queued") run.status = "skipped";
+    batchVersion += 1;
+    state.running = false;
+    ui.startBtn.disabled = !state.targetImage;
+    ui.batchBtn.disabled = false;
+    ui.stopBtn.disabled = true;
+    setDatasetEnabled(true);
+  }
+  const done = batchRunsByPsnr();
+  const iters = done.length * runArgs.iters;
+  const mean = done.reduce((s, r) => s + r.final.psnr, 0) / Math.max(1, done.length);
+  appendLog(`Batch done: ${done.length}/${n} ok in ${batch.wallSec.toFixed(1)}s ` +
+            `(${(iters / Math.max(batch.wallSec, 1e-6)).toFixed(0)} it/s over all runs)` +
+            (done.length ? ` | final PSNR mean ${mean.toFixed(2)} dB, ` +
+              `${done.at(-1).final.psnr.toFixed(2)}–${done[0].final.psnr.toFixed(2)} dB` : ""));
+  updateBatchProgress();
+  updateBatchBar();
+  drawBatchViews();
+  if (done.length) await selectBatchRun(done[0].id);
+}
+
+async function trainBatchRun(batch, run, dataset, signal) {
+  const args = batch.args;
+  run.status = "running";
+  let trainer = null;
+  try {
+    const img = await loadImageToFloat32(await dataset.load(run.item), DEMO_MAX_IMAGE_SIDE);
+    const { width, height } = img;
+    run.width = width;
+    run.height = height;
+    // Snapshots at the first log tick past each of snapCount even steps; the
+    // final sites are added after the run.
+    const snapEvery = args.iters / batch.snapCount;
+    let nextSnap = 0;
+    trainer = new Trainer(state.device, state.shaders, args, {
+      signal,
+      onLog: (info) => {
+        if (info.type !== "iter") return;
+        run.it = info.it;
+        if (Number.isFinite(info.psnr)) {
+          run.curve.push({ it: info.it, psnr: info.psnr, sites: info.activeSites, lr: info.lrScale, grads: info.gradStats });
+        }
+        if (info.it >= nextSnap && info.it < args.iters - 1) {
+          run.snaps.push({ it: info.it, sites: info.sitesData, count: info.totalSites, layer: info.layerIndex ?? null });
+          nextSnap = (Math.floor(info.it / snapEvery) + 1) * snapEvery;
+        }
+        scheduleBatchDraw();
+      },
+    });
+    await trainer.prepare({
+      width, height,
+      targetRgba32f: img.data,
+      maskRgba32f: whiteMaskRgba32Float(width, height).rgba,
+      maskSum: width * height,
+      initSites: null,
+      initSiteCount: args.startSites,
+    });
+    await trainer.run();
+    if (signal.aborted) {
+      run.status = "stopped";
+      return;
+    }
+    const final = await trainer.finalize();
+    run.snaps.push({ it: args.iters, sites: final.sites, count: final.count,
+                     layer: final.globalSite >= 0 ? final.globalSite : null });
+    run.final = {
+      psnr: computePsnr(final.renderRgba, img.data, width, height),
+      bestPsnr: final.bestPsnr,
+      activeSites: final.activeSites ?? final.count,
+      seconds: final.trainSeconds,
+      growDoneIter: final.growDoneIter,
+      growStop: final.growStop,
+      growthGain: final.growthGain,
+    };
+    run.status = "done";
+  } catch (err) {
+    run.status = "error";
+    run.error = err.message;
+    appendLog(`Batch ${run.name}: ${err.message}`);
+    console.error(err);
+  } finally {
+    trainer?.destroy();
+  }
+}
+
+// Whether a batch with these args can share atlases (BatchTrainer): a fixed
+// site count.
+function canTileBatch(args) {
+  return !countVaries(args, args.startSites) && !(args.turnover > 0);
+}
+
+// The batch as atlases of one image size each (batch.js), one after another.
+// Each image keeps the same record a separate trainer gives it: log-tick
+// curve, snapshots in its own coordinates, final sites.
+async function trainTiledBatch(batch, dataset, signal) {
+  const args = batch.args;
+  const images = [];
+  for (const run of batch.runs) {
+    if (signal.aborted) return;
+    const img = await loadImageToFloat32(await dataset.load(run.item), DEMO_MAX_IMAGE_SIDE);
+    run.width = img.width;
+    run.height = img.height;
+    images.push(img);
+  }
+  const snapEvery = args.iters / batch.snapCount;
+  for (const idx of planBatches(images, args.candDownscale)) {
+    if (signal.aborted) break;
+    const runs = idx.map((i) => batch.runs[i]);
+    for (const run of runs) run.status = "running";
+    let nextSnap = 0;
+    const bt = new BatchTrainer(state.device, state.shaders, args, {
+      signal,
+      onLog: (info) => {
+        if (info.type !== "batchIter") return;
+        const snap = info.it >= nextSnap && info.it < args.iters - 1;
+        if (snap) nextSnap = (Math.floor(info.it / snapEvery) + 1) * snapEvery;
+        runs.forEach((run, b) => {
+          run.it = info.it;
+          run.curve.push({ it: info.it, psnr: info.psnrs[b], sites: tileActive(info.sitesData, bt.layout, b),
+                           lr: info.lrScale });
+          if (snap) {
+            run.snaps.push({ it: info.it, sites: tileSites(info.sitesData, bt.layout, b),
+                             count: bt.layout.sitesPerTile, layer: info.layer });
+          }
+        });
+        scheduleBatchDraw();
+      },
+    });
+    try {
+      await bt.prepare(idx.map((i) => images[i]));
+      const l = bt.layout;
+      appendLog(`Batch atlas: ${idx.length} image(s) of ${l.tileW}×${l.tileH} as ${l.tilesX}×${l.tilesY} tiles, ` +
+                `${l.width}×${l.height} px.`);
+      await bt.run();
+      if (signal.aborted) {
+        for (const run of runs) run.status = "stopped";
+        break;
+      }
+      const finals = await bt.finalize();
+      finals.forEach((f, b) => {
+        const run = runs[b];
+        run.snaps.push({ it: args.iters, sites: f.sites, count: f.count, layer: f.layer });
+        run.final = {
+          psnr: f.psnr, bestPsnr: Math.max(f.psnr, ...run.curve.map((d) => d.psnr)), activeSites: f.activeSites,
+          seconds: f.trainSeconds, growDoneIter: 0, growStop: null, growthGain: [],
+        };
+        run.status = "done";
+      });
+    } catch (err) {
+      for (const run of runs) { run.status = "error"; run.error = err.message; }
+      appendLog(`Batch atlas: ${err.message}`);
+      console.error(err);
+    } finally {
+      bt.destroy();
+    }
+    scheduleBatchDraw();
+  }
+}
+
+// Finished runs, best final PSNR first.
+function batchRunsByPsnr() {
+  return (state.batch?.runs ?? []).filter((r) => r.status === "done").sort((a, b) => b.final.psnr - a.final.psnr);
+}
+
+// Live drawing is throttled: every log tick of every run asks for a redraw.
+let batchDrawTimer = null;
+function scheduleBatchDraw() {
+  batchVersion += 1;
+  if (batchDrawTimer) return;
+  batchDrawTimer = setTimeout(() => {
+    batchDrawTimer = null;
+    drawBatchViews();
+    updateBatchProgress();
+  }, 250);
+}
+
+function updateBatchProgress() {
+  const b = state.batch;
+  if (!b) return;
+  const total = b.runs.length;
+  const finished = b.runs.filter((r) => r.status !== "queued" && r.status !== "running").length;
+  const elapsed = b.running ? (performance.now() - b.startMs) / 1000 : b.wallSec;
+  const iters = b.runs.reduce((s, r) => s + (r.status === "done" ? b.args.iters : Math.max(0, r.it + 1)), 0);
+  updateProgress(finished, total, `batch ${finished}/${total} runs · ` +
+    `${(iters / Math.max(elapsed, 1e-6)).toFixed(0)} it/s over all runs · ${elapsed.toFixed(1)}s`);
+}
+
+function updateBatchBar() {
+  const b = state.batch;
+  ui.batchBar.classList.toggle("hidden", !b);
+  if (!b) return;
+  const done = batchRunsByPsnr();
+  const select = ui.batchRunSelect;
+  // Thousands of options: rebuilt only when the batch's runs changed.
+  const listKey = `${batchVersion}|${b.running}`;
+  if (select.dataset.key !== listKey) {
+    select.dataset.key = listKey;
+    select.replaceChildren(new Option(b.running ? "running…" : done.length ? "pick a run…" : "no finished runs", ""));
+    for (const r of done) select.add(new Option(`${r.name} · ${r.final.psnr.toFixed(2)} dB`, String(r.id)));
+  }
+  select.value = b.selected != null ? String(b.selected) : "";
+  const idle = !b.running && !state.running;
+  select.disabled = !idle || !done.length;
+  ui.batchPrev.disabled = ui.batchNext.disabled = select.disabled;
+  const run = b.selected != null ? b.runs[b.selected] : null;
+  ui.batchSnap.disabled = !idle || !run;
+  ui.batchSnap.max = String(Math.max(0, (run?.snaps.length ?? 1) - 1));
+  ui.batchSnap.value = String(b.snapIndex);
+  ui.batchSnapLabel.textContent = run ? `iter ${run.snaps[b.snapIndex].it}` : "—";
+  ui.batchRerun.disabled = !idle || !run;
+  ui.batchExport.disabled = b.running || !b.runs.some((r) => r.curve.length);
+  const psnrs = done.map((r) => r.final.psnr);
+  ui.batchSummary.textContent = `${done.length}/${b.runs.length} done` + (psnrs.length
+    ? ` · mean ${(psnrs.reduce((s, v) => s + v, 0) / psnrs.length).toFixed(2)} dB · median ` +
+      `${psnrs[Math.floor(psnrs.length / 2)].toFixed(2)} dB` : "");
+}
+
+function clickBatchRun(id) {
+  const b = state.batch;
+  if (!b) return;
+  if (b.running) {
+    setStatus("Runs can be opened once the batch has finished");
+    return;
+  }
+  selectBatchRun(id);
+}
+
+// Loads a finished run: its target, its log-tick histories, and a viewer-only
+// trainer holding its snapshots (showBatchSnapshot), at the final one.
+async function selectBatchRun(id) {
+  const b = state.batch;
+  const run = b?.runs[id];
+  if (!run || run.status !== "done" || b.running || state.running) return;
+  const token = ++state.targetToken;
+  b.selected = id;
+  b.snapIndex = run.snaps.length - 1;
+  updateBatchBar();
+  drawBatchViews();
+  setStatus(`Loading ${run.name}…`);
+  const img = await loadImageToFloat32(await DATASETS[b.dataset].load(run.item), DEMO_MAX_IMAGE_SIDE);
+  if (token !== state.targetToken) return;
+  const { width, height } = img;
+  if (ui.datasetSelect.value === b.dataset) ui.itemSelect.value = String(run.item);
+  ui.imageInput.value = "";
+  ui.imageLabel.textContent = run.name;
+  state.targetImage = img;
+  state.maskData = null;
+  ui.maskLabel.textContent = "none";
+  invalidateAnalysis();
+
+  const args = b.args;
+  const varies = countVaries(args, args.startSites);
+  state.psnrHistory = run.curve.map((d) => ({ it: d.it, psnr: d.psnr, sites: d.sites }));
+  state.psnrIters = args.iters;
+  state.lrHistory = run.curve.filter((d) => Number.isFinite(d.lr)).map((d) => ({ it: d.it, lr: d.lr }));
+  state.gradHistory = run.curve.filter((d) => d.grads).map((d) => ({ it: d.it, stats: d.grads }));
+  state.gradSnapshot = null;
+  state.bandHistory = [];
+  state.growthGain = run.final.growthGain ?? [];
+  state.mergeEdges = null;
+  state.snapAnalysis = null;
+  state.runSiteMode = varies ? "grow" : "fixed";
+  state.lastGrowth = null;
+  state.lrPlan = { iters: args.iters, lrMult: args.lrMult, kind: args.lrSchedule,
+                   growDoneIter: run.final.growDoneIter ?? (varies ? countHorizon(args) : 0) };
+  state.bppRuns = [{
+    sites: run.final.activeSites, bpp: computeBpp(run.final.activeSites, width, height), colorSpace: args.colorSpace,
+    points: run.curve.map((d) => ({ it: d.it, psnr: d.psnr, sites: d.sites, bpp: computeBpp(d.sites, width, height) })),
+  }];
+  for (const view of Object.values(VIEWS)) if (view.on.includes("run")) view.hoverKey = null;
+
+  // A fixed-count trainer with room for the largest snapshot; showSites puts
+  // each snapshot (and its layer slot) on it.
+  await state.snapAnalysis?.promise;
+  state.trainer?.destroy();
+  state.trainer = null;
+  const slots = Math.max(...run.snaps.map((s) => s.count));
+  const trainer = new Trainer(state.device, state.shaders, {
+    ...args, layer: "off", startSites: slots, endSites: slots, countSchedule: "linear", turnover: 0,
+  });
+  await trainer.prepare({
+    width, height,
+    targetRgba32f: img.data,
+    maskRgba32f: whiteMaskRgba32Float(width, height).rgba,
+    maskSum: width * height,
+    initSites: null,
+    initSiteCount: slots,
+  });
+  if (token !== state.targetToken) {
+    trainer.destroy();
+    return;
+  }
+  state.trainer = trainer;
+  blankRenderViews(width, height);
+  await refreshViews("target", "log", "run", "growth", "merge");
+  updateCanvasLayout(width, height);
+  await showBatchSnapshot(b.snapIndex);
+  ui.saveBtn.disabled = false;
+  ui.startBtn.disabled = false;
+  setStatus(`${run.name}: final ${run.final.psnr.toFixed(2)} dB, ${run.final.activeSites} sites, ` +
+            `${run.final.seconds.toFixed(1)}s ${b.tiled ? "for its atlas" : "in the batch"}`);
+}
+
+// Shows snapshot k of the selected run on the viewer trainer. Scrubbing
+// faster than renders finish keeps only the latest request.
+let batchSnapBusy = null;
+async function showBatchSnapshot(k) {
+  const b = state.batch;
+  const run = b?.runs[b.selected];
+  const trainer = state.trainer;
+  if (!run || !trainer || state.running) return;
+  b.snapIndex = k;
+  ui.batchSnapLabel.textContent = `iter ${run.snaps[k].it}`;
+  if (batchSnapBusy) return;
+  batchSnapBusy = true;
+  try {
+    let shown;
+    do {
+      shown = b.snapIndex;
+      const snap = run.snaps[shown];
+      trainer.showSites(snap.sites, snap.count, snap.layer);
+      const rgba = await trainer.renderView("render");
+      if (state.trainer !== trainer) return;
+      state.lastRender = { rgba, width: run.width, height: run.height };
+      state.lastSites = snap.sites;
+      state.lastSiteCount = snap.count;
+      state.lastHashed = null;
+      state.lastHeatmap = null;
+      state.lastOwner = null;
+      let active = 0;
+      for (let i = 0; i < snap.count; i += 1) if (snap.sites[i * SITE_FLOATS] >= 0) active += 1;
+      state.lastActiveSites = active;
+      state.lastPsnr = computePsnr(rgba, state.targetImage.data, run.width, run.height);
+      ui.metricRow.innerHTML =
+        `<span>snapshot <strong>iter ${snap.it}/${b.args.iters}</strong></span>` +
+        `<span>PSNR <strong>${state.lastPsnr.toFixed(2)} dB</strong></span>` +
+        `<span>active <strong>${active}</strong>/${snap.count}</span>`;
+      await refreshViews("render");
+      drawCentroidOverlay();
+    } while (shown !== b.snapIndex);
+    drawEditor();
+    drawSnapViews();
+  } finally {
+    batchSnapBusy = null;
+  }
+}
+
+function stepBatchRun(delta) {
+  const done = batchRunsByPsnr();
+  if (!done.length) return;
+  const i = done.findIndex((r) => r.id === state.batch.selected);
+  const j = i < 0 ? 0 : (i + delta + done.length) % done.length;
+  selectBatchRun(done[j].id);
+}
+
+// Re-trains the selected run's image with the form's settings and every view
+// live (the batch's settings unless the form changed since).
+function rerunBatchRun() {
+  const b = state.batch;
+  const run = b?.runs[b.selected];
+  if (!run || state.running) return;
+  let args;
+  try { args = readFormArgs(); } catch { args = null; }
+  const changed = args && Object.keys(b.args).filter((k) => k !== "logFreq" && k !== "viewerFreq" &&
+    JSON.stringify(args[k]) !== JSON.stringify(b.args[k]));
+  if (changed?.length) appendLog(`Re-run uses the form's settings, which differ from the batch's in: ${changed.join(", ")}.`);
+  startTraining();
+}
+
+function exportBatch() {
+  const b = state.batch;
+  if (!b) return;
+  const lines = b.runs.filter((r) => r.curve.length || r.final).map((r) => JSON.stringify({
+    name: r.name, dataset: b.dataset, item: r.item, status: r.status, width: r.width, height: r.height,
+    finalPsnr: r.final?.psnr ?? null, bestPsnr: r.final?.bestPsnr ?? null, sites: r.final?.activeSites ?? null,
+    bpp: r.final ? computeBpp(r.final.activeSites, r.width, r.height) : null, bitsPerSite: BITS_PER_SITE,
+    trainSeconds: r.final?.seconds ?? null, growStop: r.final?.growStop ?? null, args: b.args,
+    curve: r.curve.map(({ it, psnr, sites }) => ({ it, psnr, sites })),
+  }));
+  const last = b.from + b.runs.length - 1;
+  triggerDownload(new Blob([lines.join("\n") + "\n"], { type: "application/x-ndjson" }),
+    `batch_${b.dataset}_${b.from}-${last}.jsonl`);
+}
+
+// Images one atlas holds (atlasCapacity) for the size of the batch's first
+// image, from there to the end of the dataset; null if it can't be loaded.
+async function batchFillCount(dataset, from, candDownscale) {
+  try {
+    const bitmap = await createImageBitmap(await dataset.load(from));
+    let { width, height } = bitmap;
+    bitmap.close();
+    const scale = Math.min(1, DEMO_MAX_IMAGE_SIDE / Math.max(width, height));
+    width = Math.max(1, Math.floor(width * scale));
+    height = Math.max(1, Math.floor(height * scale));
+    const { tileW, tileH } = tileSize([{ width, height }], candDownscale);
+    return Math.min(dataset.count - from, atlasCapacity(tileW, tileH));
+  } catch (err) {
+    console.error(err);
+    return null;
+  }
+}
+
+// "fill GPU": the images field shows (and is locked to) one atlas's worth.
+// Only with one atlas (its checkbox, and a fixed site count).
+async function syncBatchFill() {
+  const dataset = currentDataset();
+  let args = null;
+  try { args = readFormArgs(); } catch {}
+  const can = Boolean(args && dataset?.count && ui.batchTiled.checked && canTileBatch(args));
+  ui.batchFill.disabled = !can;
+  const fill = can && ui.batchFill.checked;
+  ui.batchCount.disabled = fill;
+  if (!fill) return;
+  const from = Math.min(dataset.count - 1, Math.max(0, Math.floor(Number(ui.batchFrom.value)) || 0));
+  const n = await batchFillCount(dataset, from, args.candDownscale);
+  if (n && ui.batchFill.checked) ui.batchCount.value = String(n);
+}
+
+function toggleBatchMenu() {
+  const dataset = currentDataset();
+  syncBatchFill();
+  if (dataset?.count) {
+    ui.batchFrom.max = String(dataset.count - 1);
+    ui.batchCount.max = String(dataset.count);
+    let tile = false;
+    try { tile = canTileBatch(readFormArgs()); } catch {}
+    ui.batchNote.textContent = `${dataset.label}: images 0–${dataset.count - 1}. Every run uses the settings in ` +
+      "Advanced, without the mask or init sites. " + (tile
+        ? "The site count is fixed, so one atlas trains them all at once (at once then doesn't apply)."
+        : "The site count changes, so each image gets its own trainer.");
+  }
+  ui.batchPopover.classList.toggle("hidden");
+}
+
+// ---- Batch plots ----
+
+const BATCH_RUNNING_COLOR = SERIES_COLORS[0];
+const batchHoverRun = () => VIEWS.batchPsnr.hoverKey ?? VIEWS.batchHist.hoverKey ?? null;
+
+// Both batch cards share hover and selection, so each draws both.
+function drawBatchViews() {
+  if (VIEWS.batchPsnr.canvas) drawBatchPsnr(VIEWS.batchPsnr);
+  if (VIEWS.batchHist.canvas) drawBatchHist(VIEWS.batchHist);
+}
+
+// Bumped whenever a batch's runs change (scheduleBatchDraw, runBatch), so the
+// plots' cached layers (batchLayer) know to redraw.
+let batchVersion = 0;
+
+// The batch plots' expensive part (axes and thousands of curves or cells) is
+// drawn by `draw` only when `key` or the canvas size changes, and kept as an
+// offscreen copy; hovering copies it back and draws just the highlight on top.
+// Redrawing thousands of strokes per mouse move made hovering lag (Firefox
+// especially). Returns what `draw` returned (the plot's geometry).
+function batchLayer(view, p, key, draw) {
+  const c = view.canvas;
+  const cache = view.batchLayer;
+  if (cache && cache.key === key && cache.canvas.width === c.width && cache.canvas.height === c.height) {
+    p.ctx.save();
+    p.ctx.setTransform(1, 0, 0, 1, 0, 0);
+    p.ctx.drawImage(cache.canvas, 0, 0);
+    p.ctx.restore();
+    return cache.info;
+  }
+  const info = draw();
+  const copy = cache?.canvas ?? document.createElement("canvas");
+  copy.width = c.width;
+  copy.height = c.height;
+  copy.getContext("2d").drawImage(c, 0, 0);
+  view.batchLayer = { key, canvas: copy, info };
+  return info;
+}
+
+function batchRunTip(run) {
+  const cells = [run.name];
+  if (run.final) cells.push(`final ${run.final.psnr.toFixed(2)} dB`, `${run.final.activeSites} sites`);
+  else if (run.curve.length) cells.push(`${run.curve.at(-1).psnr.toFixed(2)} dB @ ${run.curve.at(-1).it}`, run.status);
+  else cells.push(run.status);
+  return { rows: [{ cells }], footer: state.batch.running ? undefined : "click to open" };
+}
+
+// Curves per stroke in the faint layer: one stroke each is thousands of
+// strokes; one for all would paint overlaps once and lose the band's density.
+const BATCH_CURVES_PER_STROKE = 16;
+
+function drawBatchPsnr(view) {
+  const p = beginPlot(view);
+  if (!p) return;
+  const b = state.batch;
+  const runs = b?.runs ?? [];
+  const g = view.geom = batchLayer(view, p, String(batchVersion), () => {
+    let lo = Infinity, hi = -Infinity;
+    for (const r of runs) for (const d of r.curve) { lo = Math.min(lo, d.psnr); hi = Math.max(hi, d.psnr); }
+    const g = plotAxes(plotBox(p), { min: 0, max: Math.max(1, b?.args.iters ?? 1) }, linRange(lo, hi, [0, 40]));
+    drawAxes(p, g, { xTitle: "iteration", yTitle: "PSNR (dB)", xFmt: fmtIter });
+    if (!Number.isFinite(lo)) {
+      drawEmpty(p, g, b?.running ? "Waiting for the first log ticks…" : "Run a batch (Batch… in the top bar)");
+      return { ...g, empty: true };
+    }
+    // Faint lines so thousands of overlapping runs still read as a band.
+    const { ctx } = p;
+    ctx.save();
+    ctx.globalAlpha = Math.max(0.12, Math.min(0.7, 4 / Math.sqrt(runs.length)));
+    ctx.lineWidth = 1;
+    ctx.lineJoin = "round";
+    const groups = [[p.col.dim, runs.filter((r) => r.status !== "running")],
+                    [BATCH_RUNNING_COLOR, runs.filter((r) => r.status === "running")]];
+    for (const [color, list] of groups) {
+      ctx.strokeStyle = color;
+      for (let s = 0; s < list.length; s += BATCH_CURVES_PER_STROKE) {
+        ctx.beginPath();
+        for (const r of list.slice(s, s + BATCH_CURVES_PER_STROKE)) {
+          r.curve.forEach((d, i) => (i ? ctx.lineTo(g.x(d.it), g.y(d.psnr)) : ctx.moveTo(g.x(d.it), g.y(d.psnr))));
+        }
+        ctx.stroke();
+      }
+    }
+    ctx.restore();
+    return g;
+  });
+  if (g.empty) return;
+  const pts = (r) => r.curve.map((d) => [d.it, d.psnr]);
+  const hover = batchHoverRun();
+  const sel = b.selected != null ? runs[b.selected] : null;
+  if (sel) drawLine(p, g, pts(sel), PSNR_LINE_COLOR, { width: 2 });
+  const hov = hover != null ? runs[hover] : null;
+  if (hov && hov !== sel) drawLine(p, g, pts(hov), p.col.text, { width: 2 });
+  if (hov?.curve.length) {
+    const last = hov.curve.at(-1);
+    drawMarker(p, g, last.it, last.psnr, hov === sel ? PSNR_LINE_COLOR : p.col.text);
+    drawTooltip(p, g, g.x(last.it), g.y(last.psnr), batchRunTip(hov));
+  }
+}
+
+// The run whose curve passes nearest the cursor (within 10 px). Only each
+// curve's segments around the cursor's iteration can be that close.
+function hitBatchPsnr(g, mx, my) {
+  if (g.empty) return null;
+  const it = g.xr.min + ((mx - g.left) / (g.right - g.left)) * (g.xr.max - g.xr.min);
+  let best = null, bestD = 100;
+  for (const r of state.batch?.runs ?? []) {
+    const c = r.curve;
+    if (!c.length) continue;
+    let lo = 0, hi = c.length - 1; // first point at or past `it`
+    while (lo < hi) {
+      const m = (lo + hi) >> 1;
+      if (c[m].it < it) lo = m + 1; else hi = m;
+    }
+    for (let k = Math.max(0, lo - 2); k <= Math.min(c.length - 1, lo + 1); k += 1) {
+      const x = g.x(c[k].it), y = g.y(c[k].psnr);
+      let dd = (x - mx) ** 2 + (y - my) ** 2;
+      if (k > 0) {
+        const px = g.x(c[k - 1].it), py = g.y(c[k - 1].psnr);
+        const vx = x - px, vy = y - py;
+        const t = Math.max(0, Math.min(1, ((mx - px) * vx + (my - py) * vy) / (vx * vx + vy * vy || 1)));
+        dd = (px + t * vx - mx) ** 2 + (py + t * vy - my) ** 2;
+      }
+      if (dd < bestD) { bestD = dd; best = r.id; }
+    }
+  }
+  return best;
+}
+
+// Bin width giving about 20 bins over [lo, hi], on a 1-2-2.5-5 step.
+function batchBinStep(lo, hi) {
+  const raw = Math.max(hi - lo, 0.5) / 20;
+  const mag = 10 ** Math.floor(Math.log10(raw));
+  const norm = raw / mag;
+  return (norm <= 1 ? 1 : norm <= 2 ? 2 : norm <= 2.5 ? 2.5 : norm <= 5 ? 5 : 10) * mag;
+}
+
+function drawBatchHist(view) {
+  const p = beginPlot(view);
+  if (!p) return;
+  const b = state.batch;
+  const g = view.geom = batchLayer(view, p, String(batchVersion), () => {
+    const done = batchRunsByPsnr().reverse(); // ascending, so each bin stacks low to high
+    if (!done.length) {
+      const g = plotAxes(plotBox(p), { min: 0, max: 40 }, { min: 0, max: 1 });
+      drawAxes(p, g, { xTitle: "final PSNR (dB)", yTitle: "runs" });
+      drawEmpty(p, g, b?.running ? "Waiting for the first finished run…" : "Run a batch (Batch… in the top bar)");
+      return { ...g, empty: true };
+    }
+    const lo = done[0].final.psnr, hi = done.at(-1).final.psnr;
+    const step = batchBinStep(lo, hi);
+    const b0 = Math.floor(lo / step) * step;
+    const nb = Math.max(1, Math.floor((hi - b0) / step) + 1);
+    const bins = Array.from({ length: nb }, () => []);
+    for (const r of done) bins[Math.min(nb - 1, Math.floor((r.final.psnr - b0) / step))].push(r);
+    const maxStack = Math.max(...bins.map((bin) => bin.length));
+    const g = plotAxes(plotBox(p), { min: b0, max: b0 + nb * step }, { min: 0, max: maxStack });
+    drawAxes(p, g, { xTitle: "final PSNR (dB)", yTitle: "runs", yFmt: (v) => (Number.isInteger(v) ? String(v) : ""),
+                     xFmt: (v) => String(Number(v.toFixed(2))) });
+    const geom = { ...g, b0, step, bins, cellH: (g.bottom - g.top) / maxStack, binW: g.x(b0 + step) - g.x(b0) };
+    p.ctx.fillStyle = SERIES_COLORS[0];
+    bins.forEach((bin, k) => bin.forEach((r, j) => batchCell(p, geom, k, j)));
+    return geom;
+  });
+  if (g.empty) return;
+  // The selected and hovered runs on top of the cached cells.
+  const at = (run) => {
+    if (!run?.final) return null;
+    const k = Math.min(g.bins.length - 1, Math.floor((run.final.psnr - g.b0) / g.step));
+    const j = g.bins[k].indexOf(run);
+    return j >= 0 ? [k, j] : null;
+  };
+  const sel = b.selected != null ? b.runs[b.selected] : null;
+  const selAt = at(sel);
+  if (selAt) {
+    p.ctx.fillStyle = PSNR_LINE_COLOR;
+    batchCell(p, g, ...selAt);
+  }
+  const hov = batchHoverRun() != null ? b.runs[batchHoverRun()] : null;
+  const hovAt = at(hov);
+  if (hovAt) {
+    p.ctx.fillStyle = hov === sel ? PSNR_LINE_COLOR : p.col.text;
+    batchCell(p, g, ...hovAt);
+    drawTooltip(p, g, g.x(g.b0 + (hovAt[0] + 0.5) * g.step), g.bottom - (hovAt[1] + 1) * g.cellH, batchRunTip(hov));
+  }
+}
+
+// Fills run j (from the bottom) of bin k of the histogram.
+function batchCell(p, g, k, j) {
+  p.ctx.fillRect(g.x(g.b0 + k * g.step) + 1, g.bottom - (j + 1) * g.cellH,
+                 Math.max(1, g.binW - 2), Math.max(1, g.cellH - (g.cellH >= 4 ? 1 : 0)));
+}
+
+function hitBatchHist(g, mx, my) {
+  if (!g.bins) return null;
+  const v = g.xr.min + ((mx - g.left) / (g.right - g.left)) * (g.xr.max - g.xr.min);
+  const k = Math.floor((v - g.b0) / g.step);
+  const j = Math.floor((g.bottom - my) / g.cellH);
+  return g.bins[k]?.[j]?.id ?? null;
 }
 
 // Unified metric renderer — PSNR sticks between log ticks so preview updates
@@ -3850,9 +4621,25 @@ async function main() {
   ui.saveBtn.addEventListener("click", toggleSaveMenu);
   ui.savePng.addEventListener("click", exportPng);
   ui.saveTxt.addEventListener("click", exportSites);
+  ui.batchBtn.addEventListener("click", toggleBatchMenu);
+  ui.batchRunBtn.addEventListener("click", runBatch);
+  ui.batchFill.addEventListener("change", syncBatchFill);
+  ui.batchTiled.addEventListener("change", syncBatchFill);
+  ui.batchFrom.addEventListener("change", syncBatchFill);
+  ui.batchRunSelect.addEventListener("change", () => {
+    if (ui.batchRunSelect.value) selectBatchRun(Number(ui.batchRunSelect.value));
+  });
+  ui.batchPrev.addEventListener("click", () => stepBatchRun(1));
+  ui.batchNext.addEventListener("click", () => stepBatchRun(-1));
+  ui.batchSnap.addEventListener("input", () => showBatchSnapshot(Number(ui.batchSnap.value)));
+  ui.batchRerun.addEventListener("click", rerunBatchRun);
+  ui.batchExport.addEventListener("click", exportBatch);
   document.addEventListener("click", (ev) => {
     if (!ui.savePopover.contains(ev.target) && ev.target !== ui.saveBtn) {
       ui.savePopover.classList.add("hidden");
+    }
+    if (!ui.batchPopover.contains(ev.target) && ev.target !== ui.batchBtn) {
+      ui.batchPopover.classList.add("hidden");
     }
   });
   ui.layoutSelect.addEventListener("change", () => setLayout(ui.layoutSelect.value));

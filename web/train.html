@@ -130,6 +130,53 @@
       }
       .save-opt:hover { background: var(--accent-soft); }
 
+      .batch-popover { min-width: 220px; padding: 10px; gap: 6px; }
+      .batch-field { display: flex; justify-content: space-between; align-items: center; gap: 10px; font-size: 12px; color: var(--text-dim); }
+      .batch-field input {
+        width: 76px;
+        font: inherit;
+        font-size: 12px;
+        padding: 4px 6px;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        text-align: right;
+        font-variant-numeric: tabular-nums;
+      }
+      .batch-note { margin: 2px 0; font-size: 11px; line-height: 1.4; color: var(--text-soft); }
+
+      .batch-bar {
+        flex: none;
+        padding: 8px 16px;
+        border-bottom: 1px solid var(--line);
+        background: var(--panel-soft);
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        flex-wrap: wrap;
+        font-size: 12px;
+      }
+      .batch-bar.hidden { display: none; }
+      .batch-bar-title {
+        font-size: 10.5px;
+        text-transform: uppercase;
+        letter-spacing: 0.12em;
+        color: var(--text-soft);
+      }
+      .batch-bar select {
+        font: inherit;
+        font-size: 12px;
+        padding: 5px 8px;
+        border: 1px solid var(--line);
+        background: #ffffff;
+        color: var(--text);
+        border-radius: 6px;
+        max-width: 260px;
+      }
+      .batch-bar .btn { padding: 5px 10px; }
+      .batch-snap { display: flex; align-items: center; gap: 6px; color: var(--text-dim); font-variant-numeric: tabular-nums; }
+      .batch-snap input { accent-color: var(--accent); width: 160px; }
+      .batch-summary { margin-left: auto; color: var(--text-dim); font-variant-numeric: tabular-nums; }
+
       .status-chip {
         font-size: 11px;
         color: var(--text-dim);
@@ -662,6 +709,21 @@
       </label>
       <button class="btn" id="stopBtn" disabled>Stop</button>
 
+      <div class="save-menu">
+        <button class="btn" id="batchBtn" disabled title="Train many images of the dataset with the settings in Advanced">Batch…</button>
+        <div class="save-popover batch-popover hidden" id="batchPopover">
+          <div class="batch-field"><label for="batchFrom">first image</label><input id="batchFrom" type="number" min="0" value="0" /></div>
+          <div class="batch-field"><label for="batchCount">images</label><input id="batchCount" type="number" min="1" value="32" /></div>
+          <div class="batch-field" title="Take as many images (from the first one) as one atlas holds: the GPU's texture-size limit and a pixel budget that keeps its buffers near half a gigabyte, e.g. about 5,300 MNIST digits or 10 Kodak images. Needs one atlas (a fixed site count)."><label for="batchFill">fill GPU</label><input id="batchFill" type="checkbox" /></div>
+          <div class="batch-field" title="Trainers running at once on the GPU. Measured on an M-series Mac: Measured on this Mac (Dawn, 1000 iterations): MNIST throughput levels off at about 8 (≈7× one at a time), Kodak at 2 (≈1.2×)."><label for="batchJobs">at once</label><input id="batchJobs" type="number" min="1" value="8" /></div>
+          <div class="batch-field" title="Iterations between PSNR log ticks (each one reads the render back). Overrides refresh every for batch runs."><label for="batchLogFreq">log every</label><input id="batchLogFreq" type="number" min="1" value="25" /></div>
+          <div class="batch-field" title="Site snapshots kept per run, evenly spaced, plus the final sites. Selecting a run lets you scrub through them."><label for="batchSnaps">snapshots</label><input id="batchSnaps" type="number" min="1" value="20" /></div>
+          <div class="batch-field" title="Train every image of one size in a single run, one tile per image of a shared atlas: a dispatch covers them all. Needs a fixed site count (start sites = end sites, not sawtooth, no turnover); otherwise each image gets its own trainer. On MNIST about 10× faster than 8 separate trainers at the same PSNR; Kodak-sized images gain nothing."><label for="batchTiled">one atlas</label><input id="batchTiled" type="checkbox" checked /></div>
+          <p class="batch-note" id="batchNote"></p>
+          <button class="btn btn-primary" id="batchRunBtn">Run batch</button>
+        </div>
+      </div>
+
       <div class="spacer"></div>
 
       <button class="btn" id="toggleParamsBtn">Advanced</button>
@@ -902,6 +964,20 @@
             <button class="btn" id="removeColBtn" title="Removes the last column (must be empty)">− Column</button>
           </span>
           <div class="metric-row" id="metricRow"></div>
+        </div>
+
+        <div class="batch-bar hidden" id="batchBar">
+          <span class="batch-bar-title">batch</span>
+          <select id="batchRunSelect" aria-label="Batch run"></select>
+          <button class="btn" id="batchPrev" aria-label="Next lower-PSNR run">‹</button>
+          <button class="btn" id="batchNext" aria-label="Next higher-PSNR run">›</button>
+          <label class="batch-snap" title="Saved site snapshots of the selected run">
+            <input id="batchSnap" type="range" min="0" max="0" value="0" disabled />
+            <span id="batchSnapLabel">—</span>
+          </label>
+          <button class="btn" id="batchRerun" disabled title="Train the selected image again with the settings in Advanced and every view live. Not a replay: GPU float atomics make no two runs identical.">Re-run with full logging</button>
+          <button class="btn" id="batchExport" disabled title="One JSON line per run: final PSNR, sites, time, settings and the PSNR curve">Export JSONL</button>
+          <span class="batch-summary" id="batchSummary"></span>
         </div>
 
         <div class="canvases" id="canvases"></div>

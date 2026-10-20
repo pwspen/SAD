@@ -721,6 +721,7 @@ export class Trainer {
             elapsedSec: elapsed,
             renderRgba: rgba,
             sitesData,
+            layerIndex: this.layerIndex,
             width: this.width,
             height: this.height,
           });
@@ -1292,6 +1293,24 @@ export class Trainer {
     const encoder = device.createCommandEncoder();
     this.cands.encodeAdded(encoder, this.sitesBuf, i, i + 1, n);
     queue.submit([encoder.finish()]);
+  }
+
+  // Viewer only: replaces every site with `rgbSites` (count · SITE_FLOATS,
+  // decoded colors; inactive slots have x < 0) and rebuilds the candidate
+  // lists, e.g. to show a saved snapshot of another run on this target.
+  // `layerIndex` is the histogram layer's slot in it, or null. The buffers
+  // must hold `count` sites (prepare with startSites = endSites ≥ count).
+  showSites(rgbSites, count, layerIndex = null) {
+    if (count > this.bufferCapacity) throw new Error(`${count} sites exceed the buffers (${this.bufferCapacity})`);
+    this.device.queue.writeBuffer(this.sitesBuf, 0,
+      encodeSiteColors(Float32Array.from(rgbSites.subarray(0, count * SITE_FLOATS)), count, this.colorSpace));
+    this.siteCount = this.actualSites = count;
+    this.activeEstimate = 0;
+    for (let i = 0; i < count; i += 1) if (rgbSites[i * SITE_FLOATS] >= 0) this.activeEstimate += 1;
+    this.layerIndex = layerIndex;
+    if (layerIndex !== null) this.histPeak ??= colorPeak(this.target, this.width * this.height, this.maskCpu);
+    this._updateCountParams(count);
+    this._rebuildCandidates(count);
   }
 
   // Renders the current (edited) sites. Returns { rgba, psnr }, PSNR masked as
