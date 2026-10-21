@@ -41,17 +41,18 @@ import {
   GradientsEncoder,
   AdamEncoder,
   RateEncoder,
+  QuantNoiseEncoder,
   ClearBufferEncoder,
   SiteStatsEncoder,
-} from "./encoders.js?v=rate-20261020";
+} from "./encoders.js?v=qat-20261021";
 
 import { BITS_PER_SITE } from "./io.js?v=20261019";
 import {
   cellMoments, pickMerges, mergedSite, mergePrecision, sitePrecision, candidateEdges, neighborMerge, EDGE_GROUPS,
 } from "./merge.js?v=20261019";
-import { CandidateLists } from "./candidates.js?v=20261019";
+import { CandidateLists } from "./candidates.js?v=qat-20261021";
 import { codecSteps } from "./codec.js?v=shared-20261020";
-import { RATE_FLOATS, fitRateModel, rateBits, rateBuffer } from "./rate.js?v=rate-20261020";
+import { RATE_FLOATS, fitRateModel, rateBits, rateBuffer, QNOISE_FLOATS, quantNoiseBuffer } from "./rate.js?v=qat-20261021";
 import {
   colorSpaceFor,
   pcaBasis,
@@ -300,6 +301,12 @@ export function buildArgs(config, overrides = {}) {
     rateEvery: Math.max(1, Math.floor(Number(pick("rateEvery", "RATE_EVERY", 10)))),
     rateStart: Math.min(1, Math.max(0, Number(pick("rateStart", "RATE_START", 0)))),
     rateComponents: Math.min(8, Math.max(1, Math.floor(Number(pick("rateComponents", "RATE_COMPONENTS", 4))))),
+    // Quantization-aware training (qnoise.wgsl): the gradient pass sees the
+    // sites perturbed by uniform noise of quantNoise × the codec's step per
+    // coded plane (the rate model's steps at rateLossDb, refit on the rate
+    // schedule even when rateLambda is 0); Adam updates the clean values.
+    // 0 = off.
+    quantNoise: Math.max(0, Number(pick("quantNoise", "QUANT_NOISE", 0))),
     lrPosBase: Number(pick("lrPosBase", "LR_POS_BASE", 0.05)),
     lrTauBase: Number(pick("lrTauBase", "LR_TAU_BASE", 0.01)),
     lrRadiusBase: Number(pick("lrRadiusBase", "LR_RADIUS_BASE", 0.02)),
@@ -418,6 +425,7 @@ export class Trainer {
     this.clearI32Enc = new ClearBufferEncoder(device, shaders, { useI32: true });
     this.statsEnc = new SiteStatsEncoder(device, shaders);
     this.rateEnc = new RateEncoder(device, shaders);
+    this.qnoiseEnc = new QuantNoiseEncoder(device, shaders);
   }
 
   // `tiling` (batch.js) trains an atlas of images in one run: a fixed count
@@ -721,14 +729,16 @@ export class Trainer {
       updateGradParamsBuffer(queue, this.gradParams, siteCount, this.invScaleSq, this._globalCand(), this._gradEma(), this.tiling);
 
       const rateFrom = Math.floor(args.rateStart * iters);
-      if (args.rateLambda > 0 && it >= rateFrom && (it - rateFrom) % args.rateEvery === 0) await this._rateRefit(siteCount);
+      if ((args.rateLambda > 0 || args.quantNoise > 0) && it >= rateFrom && (it - rateFrom) % args.rateEvery === 0) await this._rateRefit(siteCount);
 
       const encoder = device.createCommandEncoder();
       if (it % candUpdateFreq === 0) this.cands.encodeUpdate(encoder, this.sitesBuf, siteCount);
       encoder.clearBuffer(this.errEmaSumBuf, (1 - this.errSlot) * 4, 4);
+      const noisy = args.quantNoise > 0 && this.rateModel ? this._encodeQuantNoise(encoder, siteCount, it) : null;
       this.gradsEnc.encode(encoder, this.sitesBuf, this.gradParams,
         this.cands.cand0, this.cands.cand1, this.targetTex, this.maskBuf,
         this.grads, this.errEmaBuf, this.errEmaSumBuf, this.width, this.height);
+      if (noisy) encoder.copyBufferToBuffer(this._qnClean, 0, this.sitesBuf, 0, noisy);
       this.errSlot = 1 - this.errSlot;
 
       // Snapshot the accumulated gradients on log ticks — Adam zeroes them.
@@ -1481,6 +1491,26 @@ export class Trainer {
     }));
   }
 
+  // Copies the clean sites aside and perturbs sitesBuf by the quantization
+  // noise (qnoise.wgsl) at the rate model's steps × args.quantNoise; the
+  // caller copies the returned byte count back after the gradient pass.
+  _encodeQuantNoise(encoder, siteCount, it) {
+    const bytes = Math.max(1, siteCount) * SITE_FLOATS * 4;
+    if (!this._qnClean || this._qnClean.size < bytes) {
+      this._qnClean?.destroy();
+      this._qnClean = this.device.createBuffer({ size: this.sitesBuf.size, usage: GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
+      this._qnBuf ??= this.device.createBuffer({ size: QNOISE_FLOATS * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+      this._qnSeed = (Math.random() * 0x7fffffff) >>> 0;
+    }
+    this.device.queue.writeBuffer(this._qnBuf, 0, quantNoiseBuffer(this.rateModel.steps, this.rateBasis, {
+      scale: this.args.quantNoise, siteCount, layerSlot: this.layerIndex, seed: (this._qnSeed + it * 0x9e3779b9) >>> 0,
+      width: this.width, height: this.height, tiling: this.tiling,
+    }));
+    encoder.copyBufferToBuffer(this.sitesBuf, 0, this._qnClean, 0, bytes);
+    this.qnoiseEnc.encode(encoder, this.sitesBuf, this._qnBuf, siteCount);
+    return bytes;
+  }
+
   // Site readback with colors decoded to RGB, so nothing outside the trainer
   // sees color-space params.
   async _readSitesRgb(count) {
@@ -1538,7 +1568,7 @@ export class Trainer {
       this.sitesBuf, this.adamBuf, this.seedCounter, this.grads, this.rateBuf,
       this.renderParams, this.gradParams, this.adamParams, this.gradCountParams,
       this._tauHeatBuf, this._gnBuf, this.siteStatsParams, this.siteStatsBuf, this.maskBuf,
-      this.errEmaBuf, this.errEmaSumBuf,
+      this.errEmaBuf, this.errEmaSumBuf, this._qnClean, this._qnBuf,
     ];
     for (const res of owned) res?.destroy();
     this.cands?.destroy();

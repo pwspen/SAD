@@ -258,6 +258,24 @@ export class RateEncoder {
   }
 }
 
+// Quantization noise (qnoise.wgsl): perturbs the sites in place.
+export class QuantNoiseEncoder {
+  constructor(device, shaders) {
+    this.device = device;
+    this.pipeline = makePipeline(device, shaders.QNOISE);
+    this._bgs = new Map();
+  }
+  encode(encoder, sitesBuffer, noiseBuffer, siteCount) {
+    const entries = [
+      { binding: 0, resource: { buffer: sitesBuffer } },
+      { binding: 1, resource: { buffer: noiseBuffer } },
+    ];
+    const layout = this.pipeline.getBindGroupLayout(0);
+    const bg = getBindGroup(this.device, this._bgs, layout, entries);
+    dispatch1D(encoder, this.pipeline, bg, Math.ceil(siteCount / 256));
+  }
+}
+
 export class ClearBufferEncoder {
   constructor(device, shaders, { useI32 = false } = {}) {
     this.device = device;

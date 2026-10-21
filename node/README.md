@@ -90,6 +90,13 @@ compares held-out PSNR and codec bits.
 KLT of the target. `rate.mjs` checks the estimate against the real codec per plane and
 sweeps λ against the site count by median PSNR vs measured bits per pixel.
 
+`quantNoise` > 0 trains quantization-aware (`shaders/wgsl/qnoise.wgsl`): each gradient pass
+sees the sites perturbed by uniform noise U(−Δ/2, Δ/2) × `quantNoise` per coded plane, Δ the
+rate model's codec steps at `rateLossDb` (refit every `rateEvery` iterations, with or without
+the rate term): positions on their grid step, log τ, radius and log aniso on theirs, colors
+along the codec's basis axes, θ by each site's level step π / m. The clean sites are copied
+aside and back around the gradient pass, so Adam updates the clean values (`qnoise_test.mjs`).
+
 ## LR bases for a new dataset (units_init.mjs)
 
 `units_init.mjs` sets the six LR bases from one probe batch instead of tuning them: every
