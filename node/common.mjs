@@ -9,8 +9,8 @@ import { fileURLToPath } from "node:url";
 import { gunzipSync } from "node:zlib";
 import { PNG } from "pngjs";
 
-import { buildArgs } from "../trainer/trainer.js?v=m3-20261020";
-import { BatchTrainer, planBatches } from "../trainer/batch.js?v=m3-20261020";
+import { buildArgs } from "../trainer/trainer.js?v=lra-20261021";
+import { BatchTrainer, planBatches } from "../trainer/batch.js?v=lra-20261021";
 import { parquetMetadata, parquetReadObjects } from "../web/vendor/hyparquet/src/index.js";
 import { loadJson, loadPngToFloat32 } from "./headless.mjs";
 

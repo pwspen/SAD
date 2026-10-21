@@ -41,9 +41,10 @@ import {
   GradientsEncoder,
   AdamEncoder,
   RateEncoder,
+  LrAdaptEncoder,
   ClearBufferEncoder,
   SiteStatsEncoder,
-} from "./encoders.js?v=rate-20261020";
+} from "./encoders.js?v=lra-20261021";
 
 import { BITS_PER_SITE } from "./io.js?v=20261019";
 import {
@@ -66,6 +67,8 @@ const MAX_PREVIEW_SITE_READBACKS = 8;
 // delay cost 0.82 ± 0.24 dB on 40 held-out MNIST digits at 8 sites (5 repeats;
 // -0.08 at 32, within noise on Kodak).
 const ANI_START_ITER = 50;
+// LR groups, as the lr*Base args and lr_adapt.wgsl order them.
+export const LR_GROUP_KEYS = ["pos", "tau", "radius", "color", "dir", "aniso"];
 
 // Training losses (args.loss): label, and the LOSS id gradients_tiled.wgsl
 // switches on. Growth, λ and PSNR measure squared error either way.
@@ -295,6 +298,17 @@ export function buildArgs(config, overrides = {}) {
     // codecSteps' at rateLossDb; it is refit to the sites every rateEvery
     // iterations from rateStart × iters on, with rateComponents Gaussians per
     // coded plane. Colors are coded along the KLT of the target.
+    // Per-group LR adaptation (lr_adapt.wgsl): every lrAdaptEvery iterations
+    // each LR group's multiplier is scaled by exp(lrAdapt · (ρ − lrAdaptTarget)), ρ ∈ [−1, 1]
+    // the cosine between the gradients and the last Adam step directions
+    // summed since the last update (the normalized hypergradient: > 0, steps
+    // too short; < 0, too long), within [1/lrAdaptMax, lrAdaptMax]. 0 = off.
+    lrAdapt: Math.max(0, Number(pick("lrAdapt", "LR_ADAPT", 0))),
+    lrAdaptEvery: Math.max(1, Math.floor(Number(pick("lrAdaptEvery", "LR_ADAPT_EVERY", 5)))),
+    lrAdaptMax: Math.max(1, Number(pick("lrAdaptMax", "LR_ADAPT_MAX", 16))),
+    // The cosine each group is steered to: one unitless target for every
+    // group in place of six tuned bases (0 = the plain hypergradient rule).
+    lrAdaptTarget: Math.min(0.99, Math.max(-0.99, Number(pick("lrAdaptTarget", "LR_ADAPT_TARGET", 0)))),
     rateLambda: Math.max(0, Number(pick("rateLambda", "RATE_LAMBDA", 0))),
     rateLossDb: Math.max(1e-3, Number(pick("rateLossDb", "RATE_LOSS_DB", 0.5))),
     rateEvery: Math.max(1, Math.floor(Number(pick("rateEvery", "RATE_EVERY", 10)))),
@@ -418,6 +432,7 @@ export class Trainer {
     this.clearI32Enc = new ClearBufferEncoder(device, shaders, { useI32: true });
     this.statsEnc = new SiteStatsEncoder(device, shaders);
     this.rateEnc = new RateEncoder(device, shaders);
+    this.lrAdaptEnc = new LrAdaptEncoder(device, shaders);
   }
 
   // `tiling` (batch.js) trains an atlas of images in one run: a fixed count
@@ -513,6 +528,12 @@ export class Trainer {
     this.rateModel = null;
     this.rateLast = null;
     this.rateBuf = device.createBuffer({ size: RATE_FLOATS * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    // LR adaptation: per-group multipliers (LR_GROUP_KEYS order) and the
+    // statistics buffer lr_adapt.wgsl accumulates into.
+    this.lrMults = new Float64Array(LR_GROUP_KEYS.length).fill(1);
+    this.lrAdaptLog = [];
+    this.lrAccBuf = device.createBuffer({ size: 18 * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
+    this.lrAdaptParams = device.createBuffer({ size: 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
 
     // Candidate lists (candidates.js)
     this.cands = new CandidateLists(device, this.shaders, { ...args, width, height, capacity: this.bufferCapacity, tiling });
@@ -700,11 +721,12 @@ export class Trainer {
       const activeSites = this.activeEstimate;
 
       const lrScale = args.lrMult * lrSchedule(it, args.iters, args.lrSchedule, this.growDoneIter ?? Infinity);
+      const lm = this.lrMults;
       updateAdamParamsBuffer(queue, this.adamParams, {
-        lrPos: args.lrPosBase * lrScale, lrTau: args.lrTauBase * lrScale, lrRadius: args.lrRadiusBase * lrScale,
-        lrColor: args.lrColorBase * lrScale,
-        lrDir: it >= ANI_START_ITER ? args.lrDirBase * lrScale : 0,
-        lrAniso: it >= ANI_START_ITER ? args.lrAnisoBase * lrScale : 0,
+        lrPos: args.lrPosBase * lrScale * lm[0], lrTau: args.lrTauBase * lrScale * lm[1], lrRadius: args.lrRadiusBase * lrScale * lm[2],
+        lrColor: args.lrColorBase * lrScale * lm[3],
+        lrDir: it >= ANI_START_ITER ? args.lrDirBase * lrScale * lm[4] : 0,
+        lrAniso: it >= ANI_START_ITER ? args.lrAnisoBase * lrScale * lm[5] : 0,
         beta1: args.beta1, beta2: args.beta2, eps: args.eps, t: it + 1,
         ...this._adamSize(), layerSite: this._globalCand(), colorMoment: COLOR_MOMENTS[args.colorMoment].id,
       });
@@ -744,6 +766,17 @@ export class Trainer {
 
       // After the snapshot, so logged gradients stay the squared error's.
       if (this.rateModel) this.rateEnc.encode(encoder, this.sitesBuf, this.grads, this.rateBuf, siteCount);
+      let lrStaging = null;
+      if (args.lrAdapt > 0 && it > 0) {
+        queue.writeBuffer(this.lrAdaptParams, 0, Uint32Array.from([siteCount, this.layerIndex ?? 0xffffffff,
+          this.tiling ? this.tiling.sitesPerTile : 0, 0]));
+        this.lrAdaptEnc.encode(encoder, this.sitesBuf, this.adamBuf, this.grads, this.lrAccBuf, this.lrAdaptParams, siteCount);
+        if (it % args.lrAdaptEvery === 0) {
+          lrStaging = device.createBuffer({ size: 18 * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+          encoder.copyBufferToBuffer(this.lrAccBuf, 0, lrStaging, 0, 18 * 4);
+          encoder.clearBuffer(this.lrAccBuf);
+        }
+      }
       this.adamEnc.encode(encoder, this.sitesBuf, this.adamBuf, this.grads, this.adamParams, siteCount);
 
       // Preview/log renders. The log path does a blocking readback for PSNR.
@@ -758,6 +791,7 @@ export class Trainer {
         }
       }
       queue.submit([encoder.finish()]);
+      if (lrStaging) await this._lrAdaptStep(lrStaging, it);
 
       if (shouldLog) {
         const rgba = await readRgba32FloatTexture(device, this.renderTex, this.width, this.height);
@@ -1449,6 +1483,30 @@ export class Trainer {
     return { psnr: decoded, basePsnr: psnr(await this.renderView("render")) };
   }
 
+  // Reads the LR statistics since the last update and rescales each group's
+  // multiplier by exp(lrAdapt · cosine) (a group with no step yet, e.g.
+  // direction before ANI_START_ITER, is left alone).
+  async _lrAdaptStep(staging, it) {
+    await staging.mapAsync(GPUMapMode.READ);
+    const acc = new Float32Array(staging.getMappedRange()).slice();
+    staging.unmap();
+    staging.destroy();
+    const { lrAdapt, lrAdaptMax, lrAdaptTarget, lrAdaptEvery } = this.args;
+    // Direction and anisotropy have no LR before ANI_START_ITER, but Adam's
+    // moments still build up, so their statistics mean nothing until their
+    // first steps are in.
+    const stepping = (g) => (LR_GROUP_KEYS[g] !== "dir" && LR_GROUP_KEYS[g] !== "aniso") || it > ANI_START_ITER + lrAdaptEvery;
+    const rho = LR_GROUP_KEYS.map((_, g) => {
+      const [gd, gg, dd] = [acc[3 * g], acc[3 * g + 1], acc[3 * g + 2]];
+      return stepping(g) && gg > 0 && dd > 0 ? gd / Math.sqrt(gg * dd) : null;
+    });
+    rho.forEach((r, g) => {
+      if (r === null || !Number.isFinite(r)) return;
+      this.lrMults[g] = Math.min(lrAdaptMax, Math.max(1 / lrAdaptMax, this.lrMults[g] * Math.exp(lrAdapt * (r - lrAdaptTarget))));
+    });
+    this.lrAdaptLog.push({ it, rho, mults: Array.from(this.lrMults) });
+  }
+
   // Whether slot i is the histogram layer (in any tile).
   _isLayer(i) {
     if (this.layerIndex === null || this.layerIndex === undefined) return false;
@@ -1535,7 +1593,7 @@ export class Trainer {
     this._destroyed = true;
     const owned = [
       this.targetTex, this.maskTex, this.renderTex,
-      this.sitesBuf, this.adamBuf, this.seedCounter, this.grads, this.rateBuf,
+      this.sitesBuf, this.adamBuf, this.seedCounter, this.grads, this.rateBuf, this.lrAccBuf, this.lrAdaptParams,
       this.renderParams, this.gradParams, this.adamParams, this.gradCountParams,
       this._tauHeatBuf, this._gnBuf, this.siteStatsParams, this.siteStatsBuf, this.maskBuf,
       this.errEmaBuf, this.errEmaSumBuf,

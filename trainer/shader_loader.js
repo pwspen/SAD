@@ -41,6 +41,7 @@ const SHADER_FILES = [
   "render_tau_heatmap",
   "site_stats",
   "rate",
+  "lr_adapt",
 ];
 
 let _cache = null;
@@ -91,6 +92,7 @@ export async function loadShaders({ tileSlots = 128, readText = fetchText } = {}
     RENDER_TAU_HEATMAP: out.render_tau_heatmap,
     SITE_STATS: out.site_stats,
     RATE: out.rate,
+    LR_ADAPT: out.lr_adapt,
     tileSlots,
   };
   return _cache;

@@ -258,6 +258,27 @@ export class RateEncoder {
   }
 }
 
+// LR adaptation statistics (lr_adapt.wgsl): per-group gradient/step sums into `acc`.
+export class LrAdaptEncoder {
+  constructor(device, shaders) {
+    this.device = device;
+    this.pipeline = makePipeline(device, shaders.LR_ADAPT);
+    this._bgs = new Map();
+  }
+  encode(encoder, sitesBuffer, adamBuffer, gradsBuffer, accBuffer, paramsBuffer, siteCount) {
+    const entries = [
+      { binding: 0, resource: { buffer: sitesBuffer } },
+      { binding: 1, resource: { buffer: adamBuffer } },
+      { binding: 2, resource: { buffer: gradsBuffer } },
+      { binding: 3, resource: { buffer: accBuffer } },
+      { binding: 4, resource: { buffer: paramsBuffer } },
+    ];
+    const layout = this.pipeline.getBindGroupLayout(0);
+    const bg = getBindGroup(this.device, this._bgs, layout, entries);
+    dispatch1D(encoder, this.pipeline, bg, Math.ceil(siteCount / 64));
+  }
+}
+
 export class ClearBufferEncoder {
   constructor(device, shaders, { useI32 = false } = {}) {
     this.device = device;
