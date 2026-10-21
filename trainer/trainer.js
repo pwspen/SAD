@@ -301,12 +301,13 @@ export function buildArgs(config, overrides = {}) {
     rateEvery: Math.max(1, Math.floor(Number(pick("rateEvery", "RATE_EVERY", 10)))),
     rateStart: Math.min(1, Math.max(0, Number(pick("rateStart", "RATE_START", 0)))),
     rateComponents: Math.min(8, Math.max(1, Math.floor(Number(pick("rateComponents", "RATE_COMPONENTS", 4))))),
-    // Quantization-aware training (qnoise.wgsl): the gradient pass sees the
-    // sites perturbed by uniform noise of quantNoise × the codec's step per
-    // coded plane (the rate model's steps at rateLossDb, refit on the rate
-    // schedule even when rateLambda is 0); Adam updates the clean values.
-    // 0 = off.
+    // Quantization-aware training (qnoise.wgsl): from quantNoiseStart × iters
+    // on, the gradient pass sees the sites perturbed by uniform noise of
+    // quantNoise × the codec's step per coded plane (the rate model's steps
+    // at rateLossDb, refit every rateEvery iterations even when rateLambda is
+    // 0); Adam updates the clean values. 0 = off.
     quantNoise: Math.max(0, Number(pick("quantNoise", "QUANT_NOISE", 0))),
+    quantNoiseStart: Math.min(1, Math.max(0, Number(pick("quantNoiseStart", "QUANT_NOISE_START", 0)))),
     lrPosBase: Number(pick("lrPosBase", "LR_POS_BASE", 0.05)),
     lrTauBase: Number(pick("lrTauBase", "LR_TAU_BASE", 0.01)),
     lrRadiusBase: Number(pick("lrRadiusBase", "LR_RADIUS_BASE", 0.02)),
@@ -729,12 +730,14 @@ export class Trainer {
       updateGradParamsBuffer(queue, this.gradParams, siteCount, this.invScaleSq, this._globalCand(), this._gradEma(), this.tiling);
 
       const rateFrom = Math.floor(args.rateStart * iters);
-      if ((args.rateLambda > 0 || args.quantNoise > 0) && it >= rateFrom && (it - rateFrom) % args.rateEvery === 0) await this._rateRefit(siteCount);
+      const noiseFrom = Math.floor(args.quantNoiseStart * iters);
+      const refitFrom = Math.min(args.rateLambda > 0 ? rateFrom : iters, args.quantNoise > 0 ? noiseFrom : iters);
+      if (it >= refitFrom && (it - refitFrom) % args.rateEvery === 0) await this._rateRefit(siteCount);
 
       const encoder = device.createCommandEncoder();
       if (it % candUpdateFreq === 0) this.cands.encodeUpdate(encoder, this.sitesBuf, siteCount);
       encoder.clearBuffer(this.errEmaSumBuf, (1 - this.errSlot) * 4, 4);
-      const noisy = args.quantNoise > 0 && this.rateModel ? this._encodeQuantNoise(encoder, siteCount, it) : null;
+      const noisy = args.quantNoise > 0 && it >= noiseFrom && this.rateModel ? this._encodeQuantNoise(encoder, siteCount, it) : null;
       this.gradsEnc.encode(encoder, this.sitesBuf, this.gradParams,
         this.cands.cand0, this.cands.cand1, this.targetTex, this.maskBuf,
         this.grads, this.errEmaBuf, this.errEmaSumBuf, this.width, this.height);
@@ -753,7 +756,7 @@ export class Trainer {
       }
 
       // After the snapshot, so logged gradients stay the squared error's.
-      if (this.rateModel) this.rateEnc.encode(encoder, this.sitesBuf, this.grads, this.rateBuf, siteCount);
+      if (this.rateModel && it >= rateFrom) this.rateEnc.encode(encoder, this.sitesBuf, this.grads, this.rateBuf, siteCount);
       this.adamEnc.encode(encoder, this.sitesBuf, this.adamBuf, this.grads, this.adamParams, siteCount);
 
       // Preview/log renders. The log path does a blocking readback for PSNR.
