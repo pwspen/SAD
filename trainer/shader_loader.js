@@ -40,6 +40,7 @@ const SHADER_FILES = [
   "clear_buffer_i32",
   "render_tau_heatmap",
   "site_stats",
+  "rate",
 ];
 
 let _cache = null;
@@ -89,6 +90,7 @@ export async function loadShaders({ tileSlots = 128, readText = fetchText } = {}
     CLEAR_BUFFER_I32: out.clear_buffer_i32,
     RENDER_TAU_HEATMAP: out.render_tau_heatmap,
     SITE_STATS: out.site_stats,
+    RATE: out.rate,
     tileSlots,
   };
   return _cache;

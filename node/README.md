@@ -77,3 +77,11 @@ compares held-out PSNR and codec bits.
 `e1.mjs` tunes the six LR bases on MNIST and CIFAR-10, replaces them with one constant
 × each unit, and scores everything on held-out images, within and across datasets.
 
+## Rate term
+
+`rateLambda` > 0 trains on squared error + λ × estimated coded bits (`trainer/rate.js`,
+`shaders/wgsl/rate.wgsl`): per coded plane a Gaussian mixture refit to the sites every
+`rateEvery` iterations, at the codec's quantizer steps for `rateLossDb`, colors along the
+KLT of the target. `rate.mjs` checks the estimate against the real codec per plane and
+sweeps λ against the site count by median PSNR vs measured bits per pixel.
+

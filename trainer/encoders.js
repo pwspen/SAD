@@ -239,6 +239,25 @@ export class AdamEncoder {
   }
 }
 
+// Rate term (rate.wgsl): adds λ · ∂bits/∂param to `grads`, one thread per site.
+export class RateEncoder {
+  constructor(device, shaders) {
+    this.device = device;
+    this.pipeline = makePipeline(device, shaders.RATE);
+    this._bgs = new Map();
+  }
+  encode(encoder, sitesBuffer, gradsBuffer, rateBuffer, siteCount) {
+    const entries = [
+      { binding: 0, resource: { buffer: sitesBuffer } },
+      { binding: 1, resource: { buffer: gradsBuffer } },
+      { binding: 2, resource: { buffer: rateBuffer } },
+    ];
+    const layout = this.pipeline.getBindGroupLayout(0);
+    const bg = getBindGroup(this.device, this._bgs, layout, entries);
+    dispatch1D(encoder, this.pipeline, bg, Math.ceil(siteCount / 256));
+  }
+}
+
 export class ClearBufferEncoder {
   constructor(device, shaders, { useI32 = false } = {}) {
     this.device = device;

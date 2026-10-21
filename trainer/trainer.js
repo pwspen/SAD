@@ -40,15 +40,18 @@ import {
   RenderTauHeatmapEncoder,
   GradientsEncoder,
   AdamEncoder,
+  RateEncoder,
   ClearBufferEncoder,
   SiteStatsEncoder,
-} from "./encoders.js?v=20261019";
+} from "./encoders.js?v=rate-20261020";
 
 import { BITS_PER_SITE } from "./io.js?v=20261019";
 import {
   cellMoments, pickMerges, mergedSite, mergePrecision, sitePrecision, candidateEdges, neighborMerge, EDGE_GROUPS,
 } from "./merge.js?v=20261019";
 import { CandidateLists } from "./candidates.js?v=20261019";
+import { codecSteps } from "./codec.js?v=klt-20261020";
+import { RATE_FLOATS, fitRateModel, rateBits, rateBuffer } from "./rate.js?v=rate-20261020";
 import {
   colorSpaceFor,
   pcaBasis,
@@ -271,6 +274,16 @@ export function buildArgs(config, overrides = {}) {
     errBeta: Math.min(0.9999, Math.max(0, Number(pick("errBeta", "ERR_BETA", 0.95)))),
     errCap: Math.max(1, Number(pick("errCap", "ERR_CAP", 8))),
     errGrowth: Boolean(pick("errGrowth", "ERR_GROWTH", false)),
+    // Rate term (rate.js, rate.wgsl): train on squared error + rateLambda ·
+    // estimated coded bits (0 = off). The model's quantizer steps are
+    // codecSteps' at rateLossDb; it is refit to the sites every rateEvery
+    // iterations from rateStart × iters on, with rateComponents Gaussians per
+    // coded plane. Colors are coded along the KLT of the target.
+    rateLambda: Math.max(0, Number(pick("rateLambda", "RATE_LAMBDA", 0))),
+    rateLossDb: Math.max(1e-3, Number(pick("rateLossDb", "RATE_LOSS_DB", 0.5))),
+    rateEvery: Math.max(1, Math.floor(Number(pick("rateEvery", "RATE_EVERY", 10)))),
+    rateStart: Math.min(1, Math.max(0, Number(pick("rateStart", "RATE_START", 0)))),
+    rateComponents: Math.min(8, Math.max(1, Math.floor(Number(pick("rateComponents", "RATE_COMPONENTS", 4))))),
     lrPosBase: Number(pick("lrPosBase", "LR_POS_BASE", 0.05)),
     lrTauBase: Number(pick("lrTauBase", "LR_TAU_BASE", 0.01)),
     lrRadiusBase: Number(pick("lrRadiusBase", "LR_RADIUS_BASE", 0.02)),
@@ -385,6 +398,7 @@ export class Trainer {
     this.adamEnc = new AdamEncoder(device, shaders);
     this.clearI32Enc = new ClearBufferEncoder(device, shaders, { useI32: true });
     this.statsEnc = new SiteStatsEncoder(device, shaders);
+    this.rateEnc = new RateEncoder(device, shaders);
   }
 
   // `tiling` (batch.js) trains an atlas of images in one run: a fixed count
@@ -474,6 +488,12 @@ export class Trainer {
     this.adamBuf = createAdamBuffer(device, this.bufferCapacity);
     this.seedCounter = createSeedCounter(device, tiling ? tiling.tiles : 1);
     this.grads = createGradsBuffer(device, this.bufferCapacity);
+    // The rate model's buffer (empty until the first refit) and its color
+    // basis: the KLT of the masked target, as klt uses.
+    this.rateBasis = this.colorSpace.needsBasis ? this.colorSpace.basis : pcaBasis(targetRgba32f, width * height, this.maskCpu);
+    this.rateModel = null;
+    this.rateLast = null;
+    this.rateBuf = device.createBuffer({ size: RATE_FLOATS * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
 
     // Candidate lists (candidates.js)
     this.cands = new CandidateLists(device, this.shaders, { ...args, width, height, capacity: this.bufferCapacity, tiling });
@@ -679,6 +699,9 @@ export class Trainer {
       this.errKeep = Math.min(args.errBeta, it / (it + 1));
       updateGradParamsBuffer(queue, this.gradParams, siteCount, this.invScaleSq, this._globalCand(), this._gradEma(), this.tiling);
 
+      const rateFrom = Math.floor(args.rateStart * iters);
+      if (args.rateLambda > 0 && it >= rateFrom && (it - rateFrom) % args.rateEvery === 0) await this._rateRefit(siteCount);
+
       const encoder = device.createCommandEncoder();
       if (it % candUpdateFreq === 0) this.cands.encodeUpdate(encoder, this.sitesBuf, siteCount);
       encoder.clearBuffer(this.errEmaSumBuf, (1 - this.errSlot) * 4, 4);
@@ -698,6 +721,8 @@ export class Trainer {
         encoder.copyBufferToBuffer(this.grads, 0, gradStaging, 0, gradBytes);
       }
 
+      // After the snapshot, so logged gradients stay the squared error's.
+      if (this.rateModel) this.rateEnc.encode(encoder, this.sitesBuf, this.grads, this.rateBuf, siteCount);
       this.adamEnc.encode(encoder, this.sitesBuf, this.adamBuf, this.grads, this.adamParams, siteCount);
 
       // Preview/log renders. The log path does a blocking readback for PSNR.
@@ -742,6 +767,7 @@ export class Trainer {
             elapsedSec: elapsed,
             renderRgba: rgba,
             sitesData,
+            rate: this.rateLast,
             layerIndex: this.layerIndex,
             width: this.width,
             height: this.height,
@@ -1402,6 +1428,38 @@ export class Trainer {
     return { psnr: decoded, basePsnr: psnr(await this.renderView("render")) };
   }
 
+  // Whether slot i is the histogram layer (in any tile).
+  _isLayer(i) {
+    if (this.layerIndex === null || this.layerIndex === undefined) return false;
+    return this.tiling ? i % this.tiling.sitesPerTile === this.layerIndex : i === this.layerIndex;
+  }
+
+  // Refits the rate model (rate.js) to the current sites: quantizer steps
+  // from codecSteps (Gauss–Newton diagonal and the current squared error),
+  // a mixture per plane warm-started from the last fit, then uploads it for
+  // rate.wgsl. this.rateLast: its estimate for the current sites.
+  async _rateRefit(siteCount) {
+    const args = this.args;
+    const sites = await this._readSitesRgb(siteCount);
+    const { F } = await this.siteSensitivity();
+    const rgba = await this.renderView("render");
+    let sse = 0;
+    for (let i = 0; i < this.width * this.height; i += 1) {
+      if (this.maskCpu && !(this.maskCpu[i] > 0)) continue;
+      for (let c = 0; c < 3; c += 1) sse += (rgba[i * 4 + c] - this.target[i * 4 + c]) ** 2;
+    }
+    const skip = (i) => this._isLayer(i);
+    const coded = Float32Array.from(sites);
+    for (let i = 0; i < siteCount; i += 1) if (skip(i)) coded[i * SITE_FLOATS] = -1;
+    const steps = codecSteps(coded, siteCount, F, { lossDb: args.rateLossDb, sse0: sse });
+    this.rateModel = fitRateModel(sites, siteCount, this.rateBasis, steps,
+      { components: args.rateComponents, prev: this.rateModel, skip });
+    this.rateLast = { ...rateBits(this.rateModel, sites, siteCount, skip), steps, sse };
+    this.device.queue.writeBuffer(this.rateBuf, 0, rateBuffer(this.rateModel, {
+      lambda: args.rateLambda, siteCount, layerSlot: this.layerIndex, sitesPerTile: this.tiling ? this.tiling.sitesPerTile : 0,
+    }));
+  }
+
   // Site readback with colors decoded to RGB, so nothing outside the trainer
   // sees color-space params.
   async _readSitesRgb(count) {
@@ -1456,7 +1514,7 @@ export class Trainer {
     this._destroyed = true;
     const owned = [
       this.targetTex, this.maskTex, this.renderTex,
-      this.sitesBuf, this.adamBuf, this.seedCounter, this.grads,
+      this.sitesBuf, this.adamBuf, this.seedCounter, this.grads, this.rateBuf,
       this.renderParams, this.gradParams, this.adamParams, this.gradCountParams,
       this._tauHeatBuf, this._gnBuf, this.siteStatsParams, this.siteStatsBuf, this.maskBuf,
       this.errEmaBuf, this.errEmaSumBuf,
