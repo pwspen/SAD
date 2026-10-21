@@ -77,3 +77,29 @@ compares held-out PSNR and codec bits.
 `e1.mjs` tunes the six LR bases on MNIST and CIFAR-10, replaces them with one constant
 × each unit, and scores everything on held-out images, within and across datasets.
 
+
+## Parameter-space diagnostics (E7, E8)
+
+`lossmap.mjs` (E7) trains one batch and asks whether a loss map over parameter space
+predicts what restricting the space costs. Each pixel's squared error goes to its owner
+site; the sites are binned on chroma × luma, log τ × radius and |log aniso| × radius.
+Every bin is then snapped into a restricted space (grey colors, log τ to the median or
+clamped to its interquartile range, radius to the median, log aniso to 0) and the ΔPSNR
+measured by render (trained and rebuilt candidate lists) and after a short projected
+refit, against the Gauss–Newton prediction Σ F·δ² (and with the first-order term g·δ):
+
+```bash
+node lossmap.mjs --mnist ../../comp/data/mnist/t10k-images-idx3-ubyte.gz --count 1024 --preset ../presets/mnist.json
+node lossmap.mjs --parquet ../../comp/data/cifar10/test.parquet --count 1024 --preset ../presets/cifar10.json
+```
+
+`clamps.mjs` (E8) lists every bound the trainer applies (log aniso ±5, position in the
+tile, layer β ±8, the logchroma floor at −1/255; none on τ or radius), measures the share
+of sites at each and their outward gradient at the end of the run, then extends each
+bound by patching adam.wgsl's text in memory, retrains held-out images and compares the
+ΔPSNR with the signal:
+
+```bash
+node clamps.mjs --mnist ../../comp/data/mnist/t10k-images-idx3-ubyte.gz --from 1024 --count 2048 --preset ../presets/mnist.json
+node clamps.mjs --parquet ../../comp/data/cifar10/test.parquet --from 1024 --count 2048 --preset ../presets/cifar10.json
+```
