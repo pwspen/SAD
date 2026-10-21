@@ -20,7 +20,7 @@ import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 
 import { SITE_FLOATS } from "../trainer/params.js?v=20261019";
-import { encodeSites } from "../trainer/codec.js?v=klt-20261020";
+import { encodeSites } from "../trainer/codec.js?v=shared-20261020";
 import { createHeadlessDevice, loadShadersFromDisk } from "./headless.mjs";
 import { DATASET_OPTIONS, loadParams, argsFor, loadImages, trainBatched, median } from "./common.mjs";
 

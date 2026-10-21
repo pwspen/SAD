@@ -50,7 +50,7 @@ import {
   cellMoments, pickMerges, mergedSite, mergePrecision, sitePrecision, candidateEdges, neighborMerge, EDGE_GROUPS,
 } from "./merge.js?v=20261019";
 import { CandidateLists } from "./candidates.js?v=20261019";
-import { codecSteps } from "./codec.js?v=klt-20261020";
+import { codecSteps } from "./codec.js?v=shared-20261020";
 import { RATE_FLOATS, fitRateModel, rateBits, rateBuffer } from "./rate.js?v=rate-20261020";
 import {
   colorSpaceFor,
