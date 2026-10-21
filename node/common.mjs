@@ -48,9 +48,13 @@ export async function argsFor(params) {
   return { args, config };
 }
 
-// Test-split MNIST digits [from, from + count) as rgba32f images.
+// MNIST digits [from, from + count) as rgba32f images, each with its
+// `label` from the matching labels file (…-labels-idx1-ubyte.gz) when it is
+// there.
 export async function loadMnist(path, from, count) {
   const bytes = gunzipSync(await readFile(path));
+  let labels = null;
+  try { labels = gunzipSync(await readFile(path.replace("images-idx3", "labels-idx1"))); } catch {}
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const total = view.getUint32(4), side = view.getUint32(8);
   const n = side * side;
@@ -61,7 +65,8 @@ export async function loadMnist(path, from, count) {
       const v = bytes[16 + i * n + p] / 255;
       data.set([v, v, v, 1], p * 4);
     }
-    images.push({ name: `mnist${String(i).padStart(4, "0")}`, data, width: side, height: side });
+    images.push({ name: `mnist${String(i).padStart(4, "0")}`, data, width: side, height: side,
+                  label: labels ? labels[8 + i] : null });
   }
   return images;
 }
@@ -72,7 +77,8 @@ export async function loadPngDir(dir, from, count, maxDim) {
 }
 
 // Rows [from, from + count) of a Hugging Face parquet file whose image column
-// holds PNG bytes (CIFAR-10's "img", MNIST's "image"), as rgba32f images.
+// holds PNG bytes (CIFAR-10's "img", MNIST's "image"), as rgba32f images,
+// each with its `label` column's value when the file has one.
 export async function loadParquet(path, from, count, column = null) {
   const b = await readFile(path);
   const buf = b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength);
@@ -80,13 +86,16 @@ export async function loadParquet(path, from, count, column = null) {
   const names = metadata.schema.map((s) => s.name);
   const col = column ?? ["img", "image"].find((c) => names.includes(c));
   if (!col) throw new Error(`${path}: no img/image column (pass --column)`);
-  const rows = await parquetReadObjects({ file: buf, metadata, columns: [col], utf8: false, rowStart: from, rowEnd: from + count });
+  const labelCol = names.includes("label") ? "label" : null;
+  const rows = await parquetReadObjects({ file: buf, metadata, columns: labelCol ? [col, labelCol] : [col], utf8: false,
+                                          rowStart: from, rowEnd: from + count });
   const prefix = basename(dirname(resolve(path)));
   return rows.map((r, k) => {
     const png = PNG.sync.read(Buffer.from(r[col].bytes));
     const data = new Float32Array(png.width * png.height * 4);
     for (let i = 0; i < data.length; i += 1) data[i] = png.data[i] / 255;
-    return { name: `${prefix}_${String(from + k).padStart(4, "0")}`, data, width: png.width, height: png.height };
+    return { name: `${prefix}_${String(from + k).padStart(4, "0")}`, data, width: png.width, height: png.height,
+             label: labelCol ? Number(r[labelCol]) : null };
   });
 }
 

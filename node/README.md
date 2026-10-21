@@ -364,3 +364,31 @@ INIT_LOG_TAU 5 / INIT_RADIUS 4 (untuned; the start is far from converged, so whi
 restrictions pay may shift with a tuned init, the calibration findings less so); direction and
 anisotropy don't train in a 40-step refit (iso is one-way); calibration is fit at the start
 state and drifts as the greedy goes.
+
+## Clustering with one peeked label (cluster.mjs)
+
+Classification without training on labels: encode a labelled dataset into sites (batch
+mode, a preset), cluster the converged sites into k = 10 groups, peek at one random
+member's label per cluster, name every member by it, and score the rest against the
+true labels (mean ± sd over 1000 draws; purity = the majority label per cluster, the
+best any one-label-per-cluster rule can do). Clusterings: k-means on the raw pixels (a
+reference), k-means on a 14 × 14 map of each image's sites (Gaussians, σ 2 px, weighted
+by the first KLT color coordinate), and codelength clustering, the codec as the
+classifier: a shared coding model per cluster, each image to the model that codes it in
+the fewest bits, iterated from the site-map clusters. The loaders now return each
+image's label (MNIST's labels file next to the images, the parquet `label` column).
+
+2000 test images, presets, 10 sites (9 coded):
+
+| | MNIST purity | MNIST one peek | CIFAR-10 purity | CIFAR-10 one peek |
+|---|---|---|---|---|
+| pixels (k-means) | 55.0% | 43.8 ± 6.0% | 21.3% | 13.0 ± 2.0% |
+| site map (k-means) | 53.5–56.4% | 38.0–41.8% | 19.9% | 11.9 ± 1.9% |
+| codelength | 37.8% | 22.7 ± 4.8% | 20.1% | 12.5 ± 2.0% |
+
+The site map matches the pixels on MNIST (two runs, so ±3% from encoding and k-means
+seeding); on CIFAR-10 every method is near chance, as k-means on pixels is known to be.
+The codec does not classify: its shared model is factorized per plane (value histograms
+and raster position gaps), with no model of where on the image which values sit, so the
+clusters it settles into share value statistics, not shapes (325 → 322 bits/image).
+
