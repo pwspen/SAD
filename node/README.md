@@ -90,6 +90,71 @@ compares held-out PSNR and codec bits.
 KLT of the target. `rate.mjs` checks the estimate against the real codec per plane and
 sweeps λ against the site count by median PSNR vs measured bits per pixel.
 
+## Color dims (colordims.mjs)
+
+`colorDims` k (klt only, 1–3, default 3) keeps the first k principal axes of the KLT basis:
+rgb = mean + Σ_{j<k} axis_j · c_j. The dropped coordinates are held at 0 (a mask compiled
+into the WGSL next to the basis: encode zeroes them, so init colors are projected; decode
+ignores them; their gradient is 0, so Adam never moves them), and the codec does not code
+their planes at all when its `colorBasis` carries the same `dims`. `colordims.mjs` draws
+rate–distortion curves per color configuration over the site count: median PSNR vs bits
+per pixel measured with the codec (steps at `rateLossDb`, every image's sites pooled into
+one stream, as rate.mjs), the Pareto frontier, and each point's PSNR against a reference
+curve at equal bpp:
+
+```bash
+node colordims.mjs --parquet ../../comp/data/cifar10/test.parquet --from 1024 --count 2048 \
+  --preset ../presets/cifar10.json --configs klt:1:0.01465,klt:2:0.01625,klt:3:0.01784 --sites 2,3,4,6,8,10,12,14 --repeats 3
+```
+
+Held-out images 1024–3071, median of 3 repeats (repeat spread ≤ 0.05 dB), presets'
+settings with colorSpace klt; lrColorBase tuned per k on CIFAR images 0–1023 (tune.mjs
+`--keys lrColorBase`: k = 1 / 2 / 3 → 0.01465 / 0.01625 / 0.01784, from 0.008919, each
++0.08–0.10 dB on the tuning images). Δ = PSNR minus the klt k = 3 curve's at the same bpp
+(sites count the layer, which is not coded).
+
+**MNIST** (presets/mnist.json): k is free and buys nothing. The targets are grey, so
+under k = 3 the two chroma coordinates already get no gradient and code at ~0.01 bits/site
+each; k = 1, 2, 3 agree within noise at every count (|Δ| ≤ 0.045 dB, 4–12 sites).
+
+| sites | k = 1 dB / bpp | k = 2 dB / bpp | k = 3 dB / bpp |
+|---|---|---|---|
+| 4 | 15.238 / 0.1219 | 15.255 / 0.1219 | 15.242 / 0.1218 |
+| 8 | 17.620 / 0.3230 | 17.602 / 0.3217 | 17.620 / 0.3219 |
+| 12 | 18.776 / 0.5240 | 18.800 / 0.5243 | 18.821 / 0.5242 |
+
+**CIFAR-10** (presets/cifar10.json): k < 3 is never on the frontier; the bits are better
+spent on sites. The third axis costs 0.4–1.4 bits/site (more sites, more bits) and the
+second 1.3–2.7, less than the ~1.7 / ~4.7 the variances suggested.
+
+| sites | k = 1 dB / bpp (Δ) | k = 2 dB / bpp (Δ) | klt k = 3 dB / bpp | ycocg dB / bpp (Δ) |
+|---|---|---|---|---|
+| 2 | 15.481 / 0.0209 | 16.062 / 0.0224 | 16.164 / 0.0227 | |
+| 3 | 16.481 / 0.0487 (−0.55) | 17.136 / 0.0543 (−0.08) | 17.236 / 0.0548 | |
+| 4 | 17.238 / 0.0778 (−0.70) | 18.096 / 0.0849 (−0.06) | 18.293 / 0.0895 | 18.321 / 0.0888 (+0.05) |
+| 6 | 18.348 / 0.1378 (−1.03) | 19.505 / 0.1539 (−0.17) | 19.787 / 0.1599 | 19.828 / 0.1596 (+0.05) |
+| 8 | 18.929 / 0.1971 (−1.31) | 20.277 / 0.2240 (−0.28) | 20.726 / 0.2377 | 20.722 / 0.2375 (−0.00) |
+| 10 | 19.422 / 0.2576 (−1.51) | 21.063 / 0.2963 (−0.26) | 21.493 / 0.3128 | 21.561 / 0.3125 (+0.07) |
+| 12 | 19.734 / 0.3168 (−1.79) | 21.431 / 0.3695 (−0.45) | 22.006 / 0.3880 | 22.003 / 0.3933 (−0.03) |
+| 14 | 20.055 / 0.3807 (−1.90) | 21.870 / 0.4439 (−0.43) | 22.458 / 0.4756 | 22.467 / 0.4748 (+0.01) |
+
+- The frontier is k = 3 (klt and ycocg tie within noise, ycocg +0.03 dB on average). k = 2
+  sits below it everywhere (−0.06 to −0.45 dB, the gap growing with the count) and k = 1
+  far below (−0.55 to −1.9 dB). k < 3 points are only non-dominated in the gaps between
+  integer site counts, never above the interpolated k = 3 curve. At 2 sites (one coded
+  site) the k = 3 slope is ~33 dB/bpp, so k = 2's 0.0003 bpp saving is worth ~0.01 dB
+  against its −0.10 dB.
+- With the rate term on (`rateLambda` 0.03, 3–14 sites) the picture is the same: k = 2
+  −0.15 to −0.38 dB, k = 1 −0.62 to −1.63 dB at equal bpp; the rate term already shrinks
+  the third axis to 0.6–0.9 bits/site at k = 3.
+- Batches share one basis per atlas (here all 2048 images, so a dataset KLT). With a basis
+  per image (`--per-image`: each image trained and coded alone, 64 images, 8 sites, one
+  repeat) k = 2 loses nothing (20.743 vs 20.726 dB) and k = 1 only 0.23 dB (vs 1.96 dB with
+  the shared basis on the same images). At the pooled stream's ~3.7 bits/site for the two
+  dropped planes that is roughly break-even with more sites before paying for the
+  per-image basis (a line: ~4–5 numbers), which the shared basis needs none of; worth a
+  look only with a cheap basis code.
+
 ## LR bases for a new dataset (units_init.mjs)
 
 `units_init.mjs` sets the six LR bases from one probe batch instead of tuning them: every

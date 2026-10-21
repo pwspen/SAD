@@ -18,6 +18,12 @@
 // point, the Pareto frontier over all of them, and for each point the PSNR
 // difference to the reference configuration's curve (--ref, default the last
 // config) at equal bits per pixel (linear interpolation; blank outside it).
+//
+// Batches share one KLT basis per atlas (with --count ≤ an atlas, one for the
+// whole set). --per-image trains every image alone instead, so each gets its
+// own basis (slow: a shader compile per image), and codes each alone; its bits
+// then leave out the stream header (~200 bits/image, and the basis a real
+// stream would have to carry), so they compare only with each other.
 
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
@@ -25,14 +31,14 @@ import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 
 import { SITE_FLOATS } from "../trainer/params.js?v=m3-20261020";
-import { encodeSites } from "../trainer/codec.js?v=shared-20261020";
+import { encodeSites } from "../trainer/codec.js?v=cdims-20261021";
 import { createHeadlessDevice, loadShadersFromDisk } from "./headless.mjs";
 import { DATASET_OPTIONS, loadParams, argsFor, loadImages, trainBatched, median } from "./common.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PLANE_NAMES = ["log_aniso", "θ", "log_tau", "radius", "K0", "K1", "K2"];
 
-async function run(ctx, params, images) {
+async function run(ctx, params, images, perImage = false) {
   const { args } = await argsFor(params);
   args.logFreq = args.iters;
   const codec = {};
@@ -46,10 +52,11 @@ async function run(ctx, params, images) {
     const add = (k, v) => { codec[k] = (codec[k] ?? 0) + v; };
     PLANE_NAMES.forEach((k, p) => add(k, enc.planeBits[p]));
     add("position", enc.positionBits);
-    add("header", enc.headerBits);
+    if (!perImage) add("header", enc.headerBits);
     sites += enc.n;
   };
-  const { results } = await trainBatched({ ...ctx, args, quiet: true }, images, { after });
+  const batches = perImage ? images.map((_, i) => [i]) : undefined;
+  const { results } = await trainBatched({ ...ctx, args, quiet: true }, images, { after, batches });
   const pixels = images.reduce((s, im) => s + im.width * im.height, 0);
   const total = Object.values(codec).reduce((s, v) => s + v, 0);
   return { psnr: median(results.map((r) => r.psnr)), bpp: total / pixels, bitsPerSite: total / sites,
@@ -70,7 +77,7 @@ async function main() {
     options: {
       ...DATASET_OPTIONS, configs: { type: "string", default: "klt:1,klt:2,klt:3" },
       sites: { type: "string", default: "4,6,8,10,12" }, repeats: { type: "string", default: "1" },
-      ref: { type: "string" }, out: { type: "string" },
+      ref: { type: "string" }, out: { type: "string" }, "per-image": { type: "boolean", default: false },
     },
   });
   const base = await loadParams(cli.preset, cli.set);
@@ -92,7 +99,7 @@ async function main() {
   for (const c of configs) {
     for (const n of siteList) {
       const reps = [];
-      for (let k = 0; k < repeats; k += 1) reps.push(await run(ctx, { ...c.params, sites: n }, images));
+      for (let k = 0; k < repeats; k += 1) reps.push(await run(ctx, { ...c.params, sites: n }, images, cli["per-image"]));
       const m = (f) => median(reps.map(f));
       const r = { config: c.name, sites: n, params: { ...c.params, sites: n }, psnr: m((x) => x.psnr), bpp: m((x) => x.bpp),
                   bitsPerSite: m((x) => x.bitsPerSite), colorPerSite: [0, 1, 2].map((j) => m((x) => x.colorPerSite[j])),
@@ -121,7 +128,7 @@ async function main() {
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
   const outPath = cli.out || resolve(HERE, `../results/colordims_${stamp}.json`);
   await mkdir(dirname(outPath), { recursive: true });
-  await writeFile(outPath, JSON.stringify({ dataset: cli.mnist || cli.parquet || cli.images, from: cli.from, count: images.length, ref, rows }, null, 1) + "\n");
+  await writeFile(outPath, JSON.stringify({ dataset: cli.mnist || cli.parquet || cli.images, from: cli.from, count: images.length, perImage: cli["per-image"], ref, rows }, null, 1) + "\n");
   console.error(`Wrote  | ${outPath}`);
   device.destroy();
   process.exit(0);

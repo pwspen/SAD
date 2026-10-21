@@ -11,7 +11,7 @@ import { loadSitesFromFile, serializeSitesTxt, triggerDownload, floatImageToRgba
 import { SITE_FLOATS } from "../trainer/params.js?v=m3-20261020";
 import { BatchTrainer, planBatches, tileSites, tileActive, tileSize, atlasCapacity } from "../trainer/batch.js?v=cdims-20261021";
 import { COLOR_SPACES } from "../trainer/color_spaces.js?v=cdims-20261021";
-import { encodeSites, codecSteps, CODEC_PLANES } from "../trainer/codec.js?v=shared-20261020";
+import { encodeSites, codecSteps, CODEC_PLANES } from "../trainer/codec.js?v=cdims-20261021";
 import { parquetMetadata, parquetReadObjects } from "./vendor/hyparquet/src/index.js";
 import {
   luma, maskWeights, laplacianBands, maskLevels, bandEnergies, IMPORTANCE, importanceMap,
