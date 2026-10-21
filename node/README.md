@@ -93,6 +93,15 @@ node lossmap.mjs --mnist ../../comp/data/mnist/t10k-images-idx3-ubyte.gz --count
 node lossmap.mjs --parquet ../../comp/data/cifar10/test.parquet --count 1024 --preset ../presets/cifar10.json
 ```
 
+On 1024 test images per dataset (5 × 5 bins, ~115–121 regions): Σ F·δ² ranks the measured
+render cost well (Spearman 0.87 MNIST, 0.89 CIFAR, pooled; 0.80 / 0.77 after a 40-step
+refit) but overstates it for the large geometric snaps (slope 0.14 / 0.54; refit 0.03 /
+0.11), since the softmax saturates. On MNIST the sites' chroma is off-optimum, so greying
+gains: there the first-order term is needed (g·δ ≈ −2F·δ², GN+g Spearman 0.92). The naive
+loss map is confounded: a bin's SSE tracks its site count (Spearman 0.81 / 0.77) and ranks
+the cost poorly (0.36 / 0.55); per site, SSE per pixel says nothing (−0.10 / 0.12) while F·δ²
+per site does (0.87 / 0.86).
+
 `clamps.mjs` (E8) lists every bound the trainer applies (log aniso ±5, position in the
 tile, layer β ±8, the logchroma floor at −1/255; none on τ or radius), measures the share
 of sites at each and their outward gradient at the end of the run, then extends each
@@ -103,3 +112,11 @@ bound by patching adam.wgsl's text in memory, retrains held-out images and compa
 node clamps.mjs --mnist ../../comp/data/mnist/t10k-images-idx3-ubyte.gz --from 1024 --count 2048 --preset ../presets/mnist.json
 node clamps.mjs --parquet ../../comp/data/cifar10/test.parquet --from 1024 --count 2048 --preset ../presets/cifar10.json
 ```
+
+With the presets (100 iterations) no stock bound binds much: log aniso never reaches ±5
+(it learns from iteration 50), β ±8 holds 0–0.3% of layers, and only position sits at the
+tile edge (1% MNIST, 8.8% CIFAR), where extending it by 4 px costs 0.026 ± 0.008 dB on
+CIFAR (MNIST within noise). `--base aniso=0.5,posMargin=-2,beta=1` tightens the bounds so
+they bind (21–52% of sites at them); restoring each to stock, the Newton-gain signal ranks
+the gains correctly on both datasets (aniso +0.23 / +0.30 dB, position +0.01 / +0.07,
+β +0.03 / +0.02), share × outward gradient on MNIST only.

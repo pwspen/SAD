@@ -216,6 +216,7 @@ export async function lossmap(ctx, args, images, opts) {
         await continueRun(tr, { ...refitPatch, logFreq: refitIters + 1 });
         controls.push((await tr.renderEdited()).psnr);
       }
+      restoreSites(tr, raw0); // the render-only snaps compare against the trained state
     }
     const ctl = mean(controls);
     const atlas = { images: images.length, sites: rows.length, samples, psnr0, sse0, layerLossShare: layerLoss / sse0, med,
