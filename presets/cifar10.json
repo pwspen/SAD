@@ -1,0 +1,33 @@
+{
+  "_note": "Trainer settings (as presets/mnist.json) for CIFAR-10 32x32 test images in batch mode: presets/mnist.json's, with its six LR bases tuned headless on CIFAR (node/tune.mjs, step decaying ×2 → ×1.1, median PSNR over test images 0–1023; node/e1.mjs): lrPosBase 0.15 -> 0.1578, lrTauBase 0.01688 -> 0.05567, lrRadiusBase 0.01 -> 0.04757, lrColorBase 0.0075 -> 0.008919, lrDirBase 0.0025 -> 0.1001, lrAnisoBase 0.01875 -> 0.1061. On held-out images 1024–3071: 21.33 dB vs 20.68 median for the MNIST preset.",
+  "args": {
+    "iters": 100,
+    "lrMult": 6.75,
+    "lrSchedule": "decay-after-growth",
+    "loss": "l2",
+    "colorSpace": "logchroma",
+    "lrPosBase": 0.1578,
+    "lrTauBase": 0.05567,
+    "lrRadiusBase": 0.04757,
+    "lrColorBase": 0.008919,
+    "lrDirBase": 0.1001,
+    "lrAnisoBase": 0.1061,
+    "INIT_LOG_TAU": 5,
+    "INIT_RADIUS": 4,
+    "sites": 10,
+    "countSchedule": "constant",
+    "countEnd": 0.8,
+    "sawTeeth": 2,
+    "sawAmp": 2,
+    "sawRatio": 1,
+    "growEvery": 10,
+    "growLambda": 0,
+    "candFreq": 8,
+    "candInjectCount": 4,
+    "logFreq": 5,
+    "layer": "learn",
+    "errWeight": 0.05625,
+    "errBeta": 0.95,
+    "errCap": 9
+  }
+}

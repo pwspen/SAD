@@ -23,7 +23,7 @@ const CONFIG_URL = "../training_config.json";
 // Saved settings (presets/<key>.json: { _note, args }, keys as in
 // node/sweep.mjs --set). "" = training_config.json and buildArgs defaults.
 const PRESET_DIR = "../presets/";
-const PRESETS = { "": "defaults", kodak: "Kodak", mnist: "MNIST" };
+const PRESETS = { "": "defaults", kodak: "Kodak", mnist: "MNIST", cifar10: "CIFAR-10" };
 const DEFAULTS_NOTE = "training_config.json and the trainer's built-in defaults.";
 // "Save as defaults": the form's args (and the config patch) as a preset that
 // replaces "defaults", in this browser only.
@@ -3301,8 +3301,8 @@ const DATASETS = {
   }),
   cifar10: parquetDataset({
     key: "cifar10", label: "CIFAR-10",
-    // Small images like MNIST's, so its fixed-site preset (one atlas per batch); not tuned on CIFAR.
-    preset: "mnist",
+    // MNIST's fixed-site preset (one atlas per batch) with LR bases tuned on CIFAR.
+    preset: "cifar10",
     file: "test.parquet",
     source: "https://huggingface.co/datasets/uoft-cs/cifar10/resolve/main/plain_text/test-00000-of-00001.parquet",
     imageColumn: "img", labelColumn: "label", prefix: "cifar", classTitle: "CIFAR-10 class",
