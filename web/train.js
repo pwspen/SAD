@@ -686,7 +686,7 @@ const VIEWS = {
                       "steps for rate fidelity's quantization loss, every way the codec can run: each image " +
                       "alone (alone: its own header, models starting from nothing, as the Entropy coding card " +
                       "and the PSNR vs bpp card's green points measure), with a shared dataset model (shared: fit on the " +
-                      `even-numbered images, measured on the odd ones, up to ${BATCH_CODING_MAX} each), and every ` +
+                      `one half of the images and measured on the other, both ways, fitting on up to ${BATCH_CODING_MAX}), and every ` +
                       "image's sites as one stream (pooled). Model: the rate term's estimate (rate.js) for the " +
                       "same sites and steps; it models what a pooled or shared stream pays, not the header or " +
                       "positions. KLT runs code colors along the run's basis, others as YCoCg-R; color is the " +
@@ -1683,28 +1683,43 @@ function colorSpaceColor(key) {
 
 // Plotted points: { x: bpp, y: psnr, sites, run, point, current, coded? }
 // (coded: { bitsPerSite, lossDb } of an entropy-coded point).
+// Bits per site a run's log ticks are drawn at: its own coded rate once the
+// codec has run (shared model if it had one, else alone), else the latest
+// coded run's on this plot, else the assumed BITS_PER_SITE.
+function runBitsPerSite(r) {
+  const coded = r.coded ?? [...state.bppRuns].reverse().find((x) => x.coded)?.coded;
+  return coded ? { bps: coded.bitsPerSite, mode: coded.mode ?? "alone", own: !!r.coded }
+               : { bps: BITS_PER_SITE, mode: "assumed", own: false };
+}
+
 function bppPlotPoints() {
   const runs = state.bppRuns;
   const pts = [];
   const job = state.codec?.status === "done" && state.codec.sites === state.lastSites ? state.codec : null;
   runs.forEach((r, ri) => {
     const current = ri === runs.length - 1;
+    const { bps } = runBitsPerSite(r);
+    const x = (p) => (p.bpp * bps) / BITS_PER_SITE;
     if (current) {
-      r.points.forEach((p, pi) => pts.push({ x: p.bpp, y: p.psnr, sites: p.sites, run: ri, point: pi, current }));
+      r.points.forEach((p, pi) => pts.push({ x: x(p), y: p.psnr, sites: p.sites, run: ri, point: pi, current }));
       if (job && r.coded) {
-        job.result.rows.forEach((row, ci) => pts.push({
+        job.result.rows.filter((row) => !row.shared).forEach((row, ci) => pts.push({
           x: row.bpp, y: row.psnr, sites: row.n, run: ri, point: `c${ci}`, current,
           coded: { bitsPerSite: row.bitsPerSite, lossDb: row.lossDb },
         }));
+        const sh = job.result.rows.find((row) => row.shared);
+        if (sh) pts.push({ x: sh.bpp, y: sh.psnr, sites: sh.n, run: ri, point: "cs", current,
+                           coded: { bitsPerSite: sh.bitsPerSite, lossDb: sh.lossDb, shared: true } });
       }
     } else if (r.points.length) {
       const pi = r.points.length - 1;
       const p = r.points[pi];
-      pts.push({ x: p.bpp, y: p.psnr, sites: p.sites, run: ri, point: pi, current });
+      pts.push({ x: x(p), y: p.psnr, sites: p.sites, run: ri, point: pi, current });
     }
     if (r.coded && !(current && job)) {
       pts.push({ x: r.coded.bpp, y: r.coded.psnr, sites: r.coded.n, run: ri, point: "c", current,
-                 coded: { bitsPerSite: r.coded.bitsPerSite, lossDb: CODEC_REPORT_LOSS } });
+                 coded: { bitsPerSite: r.coded.bitsPerSite, lossDb: r.coded.lossDb ?? CODEC_REPORT_LOSS,
+                          shared: r.coded.mode === "shared" } });
     }
   });
   return pts;
@@ -1717,7 +1732,7 @@ function drawBppPlot(view) {
   const pts = bppPlotPoints();
   let xMin = Infinity, xMax = -Infinity, lo = Infinity, hi = -Infinity;
   const cur0 = state.bppRuns[state.bppRuns.length - 1];
-  if (cur0) { xMin = xMax = cur0.bpp; }
+  if (cur0) { xMin = xMax = (cur0.bpp * runBitsPerSite(cur0).bps) / BITS_PER_SITE; }
   for (const pt of pts) {
     xMin = Math.min(xMin, pt.x); xMax = Math.max(xMax, pt.x);
     lo = Math.min(lo, pt.y); hi = Math.max(hi, pt.y);
@@ -1730,13 +1745,15 @@ function drawBppPlot(view) {
   // Color-space legend only once runs in more than one space are on the plot.
   const spaces = [...new Set(state.bppRuns.map((r) => r.colorSpace))];
   const coded = pts.filter((pt) => pt.coded);
+  const curRate = cur0 ? runBitsPerSite(cur0) : { mode: "assumed" };
+  const trail = curRate.mode === "assumed" ? `${BITS_PER_SITE} bits/site assumed` : `at coded bits/site (${curRate.mode})`;
   const legend = spaces.length > 1
-    ? spaces.map((key) => ({ label: `${COLOR_SPACES[key].label} (${BITS_PER_SITE} bits/site)`, color: colorSpaceColor(key) }))
-    : coded.length ? [{ label: `${BITS_PER_SITE} bits/site`, color: BPP_PAST_COLOR }] : [];
+    ? spaces.map((key) => ({ label: COLOR_SPACES[key].label, color: colorSpaceColor(key) }))
+    : coded.length ? [{ label: trail, color: BPP_PAST_COLOR }] : [];
   if (coded.length) legend.push({ label: "entropy coded", color: CODED_COLOR });
   const top = legend.length ? drawLegend(p, legend) + 10 : undefined;
   const g = view.geom = plotAxes(plotBox(p, top), xr, linRange(lo, hi, [0, 40]));
-  drawAxes(p, g, { xTitle: coded.length ? "bpp" : `bpp (${BITS_PER_SITE} bits/site)`, yTitle: "PSNR (dB)",
+  drawAxes(p, g, { xTitle: curRate.mode === "assumed" ? `bpp (${BITS_PER_SITE} bits/site assumed)` : "bpp (coded)", yTitle: "PSNR (dB)",
                    xFmt: fmtSig, xSpacing: 40 });
   if (!pts.length) {
     drawEmpty(p, g, state.running ? "Waiting for first log tick…" : "Train to see PSNR vs bpp");
@@ -1757,9 +1774,12 @@ function drawBppPlot(view) {
   }
 
   // Current run's codec curve, the report budget marked larger
-  const curCoded = coded.filter((pt) => pt.current).sort((a, b) => a.x - b.x);
+  // (each image alone, one point per budget); the shared-model point, when
+  // there is one, marked largest on its own
+  const curCoded = coded.filter((pt) => pt.current && !pt.coded.shared).sort((a, b) => a.x - b.x);
   if (curCoded.length > 1) drawLine(p, g, curCoded.map((pt) => [pt.x, pt.y]), CODED_COLOR);
   for (const pt of curCoded) drawMarker(p, g, pt.x, pt.y, CODED_COLOR, pt.coded.lossDb === CODEC_REPORT_LOSS ? 4.5 : 3);
+  for (const pt of coded.filter((q) => q.current && q.coded.shared)) drawMarker(p, g, pt.x, pt.y, CODED_COLOR, 6);
 
   // Current run: trail of log ticks in iteration order, latest marked
   const cur = pts.filter((pt) => pt.current && !pt.coded);
@@ -1774,9 +1794,11 @@ function drawBppPlot(view) {
   const run = state.bppRuns[hover.run];
   drawMarker(p, g, hover.x, hover.y,
              hover.coded ? CODED_COLOR : hover.current ? PSNR_LINE_COLOR : colorSpaceColor(run.colorSpace), 5);
+  const hr = runBitsPerSite(run);
   const rate = hover.coded
-    ? `${hover.coded.bitsPerSite.toFixed(1)} bits/site coded (${hover.coded.lossDb} dB budget)`
-    : `${BITS_PER_SITE} bits/site`;
+    ? `${hover.coded.bitsPerSite.toFixed(1)} bits/site coded (${hover.coded.shared ? "shared model, " : ""}${hover.coded.lossDb} dB budget)`
+    : hr.mode === "assumed" ? `${BITS_PER_SITE} bits/site assumed`
+    : `${hr.bps.toFixed(1)} bits/site, ${hr.own ? "this run's" : "the latest"} coded rate (${hr.mode})`;
   drawTooltip(p, g, g.x(hover.x), g.y(hover.y), {
     rows: [{ cells: [`${hover.sites} sites · ${fmtSig(hover.x)} bpp · ${hover.y.toFixed(2)} dB · ${COLOR_SPACES[run.colorSpace].label}`] },
            { cells: [rate] }],
@@ -2792,10 +2814,25 @@ async function runCodec(sites, count, trainer) {
     rows.push({ lossDb, steps, enc, n: enc.n, bits: enc.bits, bitsPerSite: enc.bits / Math.max(1, enc.n),
                 bpp: enc.bits / pixels, psnr, loss: base - psnr });
   }
-  const report = rows.find((r) => r.lossDb === CODEC_REPORT_LOSS);
+  // The last batch's shared dataset model (Batch: coding), when this image
+  // is from that dataset at its size: the reported rate, as a decoder holding
+  // the model would pay.
+  const sm = state.sharedModel;
+  let shared = null;
+  if (sm && sm.width === width && sm.height === height && sm.dataset === ui.datasetSelect?.value) {
+    const enc = encodeSites(sites, count, width, height, rows[0].steps, { globalSite, shared: sm.model });
+    const placed = Float32Array.from(sites);
+    enc.slots.forEach((slot, i) => placed.set(enc.decoded.subarray(i * SITE_FLOATS, (i + 1) * SITE_FLOATS), slot * SITE_FLOATS));
+    const { psnr, basePsnr: base } = await trainer.decodedPsnr(placed);
+    shared = { lossDb: sm.lossDb, shared: true, enc, n: enc.n, bits: enc.bits, bitsPerSite: enc.bits / Math.max(1, enc.n),
+               bpp: enc.bits / pixels, psnr, loss: base - psnr };
+    rows.push(shared);
+  }
+  const report = shared ?? rows.find((r) => r.lossDb === CODEC_REPORT_LOSS);
   return {
     basePsnr, rows, pixels, klt: !!colorBasis,
-    report: { bpp: report.bpp, psnr: report.psnr, bitsPerSite: report.bitsPerSite, n: report.n },
+    report: { bpp: report.bpp, psnr: report.psnr, bitsPerSite: report.bitsPerSite, n: report.n,
+              mode: shared ? "shared" : "alone", lossDb: report.lossDb },
   };
 }
 
@@ -2816,12 +2853,13 @@ function drawCodec(view) {
     return;
   }
   const r = job.result;
-  const rep = r.rows.find((row) => row.lossDb === CODEC_REPORT_LOSS);
+  const rep = r.rows.find((row) => !row.shared && row.lossDb === CODEC_REPORT_LOSS);
   const mid = Math.round(w * 0.55);
   drawTable(p, box, box.left, mid - 12, ["budget", "bits/site", "bpp", "PSNR", "loss"],
     r.rows.map((row) => ({
-      color: row === rep ? CODED_COLOR : undefined,
-      cells: [String(row.lossDb), row.bitsPerSite.toFixed(1), fmtSig(row.bpp), row.psnr.toFixed(2), row.loss.toFixed(2)],
+      color: row === rep || row.shared ? CODED_COLOR : undefined,
+      cells: [row.shared ? `shared ${row.lossDb}` : String(row.lossDb), row.bitsPerSite.toFixed(1), fmtSig(row.bpp),
+              row.psnr.toFixed(2), row.loss.toFixed(2)],
     })));
   const { enc, steps } = rep;
   const per = (bits) => (bits / Math.max(1, enc.n)).toFixed(2);
@@ -2870,14 +2908,18 @@ function batchCodingJob() {
       job.status = "error";
       console.error(err);
     }
-    if (state.batchCoding === job && VIEWS.batchCoding.canvas) drawBatchCoding(VIEWS.batchCoding);
+    if (state.batchCoding === job) {
+      batchVersion += 1; // the batch's PSNR vs bpp now has measured bits
+      drawBatchViews();
+    }
   }, 0);
   return job;
 }
 
 function batchCoding(b, entry) {
   const { steps } = entry.estimate;
-  const list = entry.runs.map((i) => b.runs[i]).filter((r) => r.status === "done").map((r) => {
+  const doneRuns = entry.runs.map((i) => b.runs[i]).filter((r) => r.status === "done");
+  const list = doneRuns.map((r) => {
     const snap = r.snaps.at(-1);
     const sites = Float32Array.from(snap.sites);
     if (snap.layer !== null && snap.layer !== undefined) sites[snap.layer * SITE_FLOATS] = -1;
@@ -2893,12 +2935,38 @@ function batchCoding(b, entry) {
     alone: per(codecBits(list, steps, entry.basis)),
     pooled: per(codecBits(poolImages(list), steps, entry.basis)),
   };
+  // Each image's measured bits: with a shared model fit on the other half of
+  // the batch (two folds, so no image is coded by a model it helped fit),
+  // or alone when the batch is too small for one.
+  const coded = new Array(list.length);
   if (list.length >= 4) {
-    const fit = list.filter((_, i) => i % 2 === 0).slice(0, BATCH_CODING_MAX);
-    const held = list.filter((_, i) => i % 2 === 1).slice(0, BATCH_CODING_MAX);
-    const shared = buildSharedModel(fit, steps, { colorBasis: entry.basis });
-    cols.shared = per(codecBits(held, steps, null, shared));
+    const halves = [0, 1].map((h) => list.map((_, i) => i).filter((i) => i % 2 === h));
+    const heldBits = [];
+    halves.forEach((own, h) => {
+      const fit = halves[1 - h].slice(0, BATCH_CODING_MAX).map((i) => list[i]);
+      const shared = buildSharedModel(fit, steps, { colorBasis: entry.basis });
+      if (h === 0) state.sharedModel = { model: shared, dataset: b.dataset, width: list[0].width, height: list[0].height,
+                                         lossDb: b.args.rateLossDb };
+      for (const i of own) {
+        const bits = codecBits([list[i]], steps, null, shared);
+        coded[i] = { bits: bits.perSite.total * bits.sites, n: bits.sites, mode: "shared" };
+        heldBits.push(bits);
+      }
+    });
+    const n = heldBits.reduce((t, x) => t + x.sites, 0);
+    const sum = {};
+    for (const x of heldBits) for (const [k, v] of Object.entries(x.perSite)) sum[k] = (sum[k] ?? 0) + v * x.sites;
+    cols.shared = per({ perSite: Object.fromEntries(Object.entries(sum).map(([k, v]) => [k, v / Math.max(1, n)])), sites: n });
+  } else {
+    list.forEach((im, i) => {
+      const bits = codecBits([im], steps, entry.basis);
+      coded[i] = { bits: bits.perSite.total * bits.sites, n: bits.sites, mode: "alone" };
+    });
   }
+  doneRuns.forEach((r, i) => {
+    r.coded = { ...coded[i], bpp: coded[i].bits / (r.width * r.height), bitsPerSite: coded[i].bits / Math.max(1, coded[i].n),
+                lossDb: b.args.rateLossDb };
+  });
   const est = entry.estimate, n = Math.max(1, est.sites), pl = est.planes;
   const model = { log_aniso: pl.log_aniso / n, "θ": pl["θ"] / n, log_tau: pl.log_tau / n, radius: pl.radius / n,
                   color: (pl.K0 + pl.K1 + pl.K2) / n };
@@ -3916,7 +3984,7 @@ async function runBatch({ items: fixedItems = null, quiet = false } = {}) {
   const tiled = ui.batchTiled.checked && canTileBatch(runArgs);
   batchVersion += 1;
   const batch = state.batch = {
-    dataset: datasetKey, args: runArgs, from, random, jobs, snapCount, tiled, running: true,
+    dataset: datasetKey, args: runArgs, from, random, jobs, snapCount, tiled, quiet, running: true,
     selected: null, snapIndex: 0, startMs: performance.now(), wallSec: 0,
     runs: items.map((item, i) => ({
       id: i, item, name: dataset.itemName(item), label: dataset.labelOf?.(item) ?? null, status: "queued",
@@ -3979,6 +4047,7 @@ async function runBatch({ items: fixedItems = null, quiet = false } = {}) {
   if (state.tune?.progress) state.tune.progress.batches += 1;
   updateBatchProgress();
   updateBatchBar();
+  if (!quiet) batchCodingJob(); // measured bits for the batch's PSNR vs bpp
   drawBatchViews();
   if (done.length && !quiet) await selectBatchRun(done[0].id);
   if (signal.aborted || done.length < n) return null;
@@ -4413,8 +4482,9 @@ async function trainTiledBatch(batch, dataset, signal) {
         break;
       }
       // The rate model and its codec steps fit to this atlas's final sites
-      // (whether or not the rate term trained them), for Batch: coding.
-      try {
+      // (whether or not the rate term trained them), for Batch: coding and
+      // the measured bits of the batch's PSNR vs bpp. Skipped for auto-tune.
+      if (!batch.quiet) try {
         await bt.trainer._rateRefit(bt.trainer.siteCount);
         (batch.coding ??= []).push({
           runs: idx.slice(), estimate: bt.trainer.rateLast,
@@ -4713,7 +4783,8 @@ function exportBatch() {
   const lines = b.runs.filter((r) => r.curve.length || r.final).map((r) => JSON.stringify({
     name: r.name, dataset: b.dataset, item: r.item, status: r.status, width: r.width, height: r.height,
     finalPsnr: r.final?.psnr ?? null, bestPsnr: r.final?.bestPsnr ?? null, sites: r.final?.activeSites ?? null,
-    bpp: r.final ? computeBpp(r.final.activeSites, r.width, r.height) : null, bitsPerSite: BITS_PER_SITE,
+    bpp: r.coded ? r.coded.bpp : r.final ? computeBpp(r.final.activeSites, r.width, r.height) : null,
+    bitsPerSite: r.coded ? r.coded.bitsPerSite : BITS_PER_SITE, coded: r.coded ? r.coded.mode : "assumed",
     trainSeconds: r.final?.seconds ?? null, growStop: r.final?.growStop ?? null, args: b.args,
     curve: r.curve.map(({ it, psnr, sites }) => ({ it, psnr, sites })),
   }));
@@ -5183,11 +5254,16 @@ function hitBatchDigits(g, mx, my) {
 
 // One point per run log tick plus the final render, each at its own raw rate
 // (its site count over its image's pixels), so mixed-size batches spread out.
+// x: the run's measured codec bits (Batch: coding, shared model or alone),
+// scaled to each log tick's site count, once coded; until then (or for an
+// untiled batch) the assumed BITS_PER_SITE.
 function batchBppPoints(runs) {
   const pts = [];
   for (const r of runs) {
     if (!r.width || !r.height) continue;
-    const bpp = (sites) => computeBpp(sites, r.width, r.height);
+    const bpp = r.coded && r.final
+      ? (sites) => (r.coded.bpp * sites) / Math.max(1, r.final.activeSites)
+      : (sites) => computeBpp(sites, r.width, r.height);
     for (const d of r.curve) {
       if (Number.isFinite(d.psnr) && d.sites > 0) pts.push({ run: r.id, it: d.it, sites: d.sites, x: bpp(d.sites), y: d.psnr });
     }
@@ -5204,7 +5280,7 @@ function batchBppPoints(runs) {
 function batchBppTip(run, pt) {
   return {
     rows: [{ cells: [run.name] },
-           { cells: [`${pt.sites} sites · ${fmtSig(pt.x)} bpp (${BITS_PER_SITE} bits/site) · ` +
+           { cells: [`${pt.sites} sites · ${fmtSig(pt.x)} bpp (${run.coded ? `coded, ${run.coded.mode}` : `${BITS_PER_SITE} bits/site assumed`}) · ` +
                      `${pt.y.toFixed(2)} dB${pt.final ? "" : ` @ it ${pt.it}`}`] }],
     footer: state.batch.running ? undefined : "click to open",
   };
@@ -5248,7 +5324,8 @@ function drawBatchBpp(view) {
     const mid = (Math.log10(xMin) + Math.log10(xMax)) / 2;
     const g = plotAxes(plotBox(p), { min: 10 ** (mid - span / 2), max: 10 ** (mid + span / 2), log: true },
                        linRange(lo, hi, [0, 40]));
-    drawAxes(p, g, { xTitle: `bpp (${BITS_PER_SITE} bits/site)`, yTitle: "PSNR (dB)",
+    const measured = runs.length && runs.every((r) => r.status !== "done" || r.coded);
+    drawAxes(p, g, { xTitle: measured ? "bpp (coded)" : `bpp (${BITS_PER_SITE} bits/site assumed)`, yTitle: "PSNR (dB)",
                      xFmt: fmtSig, xSpacing: 40 });
     // Faint trails so thousands of overlapping runs still read as a band,
     // grouped per stroke like the PSNR-vs-iteration batch plot. The trails
