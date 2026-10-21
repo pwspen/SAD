@@ -74,6 +74,10 @@ There is no LR warmup. `lrSchedule` is `"cosine"` (1 to 0 over `iters`), `"fixed
 - `codec.js` - site codec: quantization (steps from the Gauss–Newton sensitivity), neighbour
   prediction and adaptive arithmetic coding, with a decoder, so the rate is a real bitstream
   length rather than `BITS_PER_SITE`. `node/codec_test.mjs` checks the round trip.
+  `buildSharedModel` fits a dataset-level shared model (quantizer steps, color basis, plane
+  constants, primed starting frequencies for the adaptive models) that encoder and decoder
+  hold like a codebook; `encodeSites(…, { shared })` / `decodeSites(bytes, { shared })` then
+  code each image with only what is specific to it (`node/shared_codec.mjs` measures it).
 
 ## Storage-buffer limits
 

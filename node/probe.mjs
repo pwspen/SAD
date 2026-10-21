@@ -43,7 +43,7 @@ import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 
 import { SITE_FLOATS } from "../trainer/params.js?v=20261019";
-import { codecSteps, encodeSites, CODEC_PLANES } from "../trainer/codec.js?v=klt-20261020";
+import { codecSteps, encodeSites, CODEC_PLANES } from "../trainer/codec.js?v=shared-20261020";
 import { COLOR_SPACES, pcaBasis } from "../trainer/color_spaces.js?v=klt-20261020";
 import { createHeadlessDevice, loadShadersFromDisk } from "./headless.mjs";
 import { DATASET_OPTIONS, loadParams, argsFor, loadImages, trainBatched, median, mean } from "./common.mjs";
@@ -365,12 +365,14 @@ function entropyOf(keys) {
 }
 
 // Per-plane codec bits per site: { header, position, <plane>…, total }.
-function codecBits(list, steps, colorBasis = null) {
+// `shared`: code against that shared model (its steps and basis) instead.
+export function codecBits(list, steps, colorBasis = null, shared = null) {
+  if (shared) colorBasis = shared.colorBasis;
   const planes = colorBasis ? [...CODEC_PLANES.slice(0, 4), "K0", "K1", "K2"] : CODEC_PLANES;
   const acc = { header: 0, position: 0, ...Object.fromEntries(planes.map((p) => [p, 0])) };
   let n = 0, modes = null;
   for (const im of list) {
-    const enc = encodeSites(im.sites, im.n, im.width, im.height, steps, { colorBasis });
+    const enc = encodeSites(im.sites, im.n, im.width, im.height, steps, { colorBasis, shared });
     acc.header += enc.headerBits;
     acc.position += enc.positionBits;
     planes.forEach((p, k) => { acc[p] += enc.planeBits[k]; });
@@ -381,6 +383,24 @@ function codecBits(list, steps, colorBasis = null) {
   out.total = Object.values(out).reduce((s, v) => s + v, 0);
   out.color = planes.slice(4).reduce((t, p) => t + out[p], 0);
   return { perSite: out, sites: n, modes: list.length === 1 ? Object.fromEntries(planes.map((p, k) => [p, modes[k] ? "neighbours" : "constant"])) : null };
+}
+
+// Every image's sites as one image: tiles in a near-square grid.
+export function poolImages(perImage) {
+  const W = Math.max(...perImage.map((im) => im.width)), H = Math.max(...perImage.map((im) => im.height));
+  const T = Math.ceil(Math.sqrt(perImage.length));
+  const total = perImage.reduce((s, im) => s + im.n, 0);
+  const pooled = new Float32Array(total * SITE_FLOATS);
+  let at = 0;
+  perImage.forEach((im, b) => {
+    const ox = (b % T) * W, oy = Math.floor(b / T) * H;
+    for (let i = 0; i < im.n; i += 1, at += 1) {
+      const src = im.sites.subarray(i * SITE_FLOATS, (i + 1) * SITE_FLOATS);
+      pooled.set(src, at * SITE_FLOATS);
+      if (src[0] >= 0) { pooled[at * SITE_FLOATS] += ox; pooled[at * SITE_FLOATS + 1] += oy; }
+    }
+  });
+  return [{ sites: pooled, n: total, width: T * W, height: Math.ceil(perImage.length / T) * H }];
 }
 
 // perImage: each image's sites in its own coordinates. rows: E3's rows.
@@ -401,21 +421,7 @@ export function codecAudit(perImage, rows, steps, trainBasis = null) {
     "joint RGB": entropyOf(q.map((v) => v.join(","))),
   };
   const perPlaneStatic = { Y: entropyOf(col(ycocg, 0)), Co: entropyOf(col(ycocg, 1)), Cg: entropyOf(col(ycocg, 2)) };
-  // Every image's sites as one image: tiles in a near-square grid.
-  const W = Math.max(...perImage.map((im) => im.width)), H = Math.max(...perImage.map((im) => im.height));
-  const T = Math.ceil(Math.sqrt(perImage.length));
-  const total = perImage.reduce((s, im) => s + im.n, 0);
-  const pooled = new Float32Array(total * SITE_FLOATS);
-  let at = 0;
-  perImage.forEach((im, b) => {
-    const ox = (b % T) * W, oy = Math.floor(b / T) * H;
-    for (let i = 0; i < im.n; i += 1, at += 1) {
-      const src = im.sites.subarray(i * SITE_FLOATS, (i + 1) * SITE_FLOATS);
-      pooled.set(src, at * SITE_FLOATS);
-      if (src[0] >= 0) { pooled[at * SITE_FLOATS] += ox; pooled[at * SITE_FLOATS + 1] += oy; }
-    }
-  });
-  const pooledList = [{ sites: pooled, n: total, width: T * W, height: Math.ceil(perImage.length / T) * H }];
+  const pooledList = poolImages(perImage);
   const out = {
     sites: rows.length, staticBits, perPlaneStatic, siteBasis, trainBasis,
     perImage: codecBits(perImage, steps),
@@ -431,7 +437,10 @@ export function codecAudit(perImage, rows, steps, trainBasis = null) {
 
 // Trains `images` once with `args`, recording E2's per-tick gradients and,
 // after the run, the Gauss–Newton diagonal for E1 and the final sites for E3.
-export async function probe(ctx, args, images, { e2 = true, e3 = true, audit = true } = {}) {
+// `keep`: an object that gets the per-image sites (perImage, as codecAudit
+// takes them), E3's rows and the training basis, for further audits
+// (shared_codec.mjs).
+export async function probe(ctx, args, images, { e2 = true, e3 = true, audit = true, keep = null } = {}) {
   const ticks = [];
   const e1Parts = { sites: [], F: [], sse0: 0 };
   const rows = [];
@@ -478,6 +487,7 @@ export async function probe(ctx, args, images, { e2 = true, e3 = true, audit = t
   const slots = Array.from({ length: count }, (_, i) => i);
   const units = e1Units({ sites, F, slots, sse0: e1Parts.sse0, args });
   const steps = codecSteps(sites, count, F, { lossDb: LOSS_DB, sse0: e1Parts.sse0 });
+  if (keep) Object.assign(keep, { perImage, rows, trainBasis });
   return {
     images: images.length, sites: count, seconds, medianPsnr: median(results.map((r) => r.psnr)),
     e1: { units, collapse: Object.fromEntries(["raw", "delta", "invSqrtF", "sigma"].map((u) => [u, collapse(units, u === "raw" ? null : u)])) },

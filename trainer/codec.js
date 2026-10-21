@@ -23,6 +23,10 @@
 //      bucket symbol + mantissa bits, the top two adaptive, the rest raw)
 //      and arithmetic coded with adaptive frequency models. The header (image
 //      size, count, steps, plane flags) is raw Exp-Golomb.
+// With a shared model (buildSharedModel: steps, color basis, plane constants
+// and primed starting frequencies fit on a training set, held by encoder and
+// decoder like a codebook) the stream drops the steps, codes its short header
+// with the arithmetic coder too, and its models start primed (Shared model).
 //
 // The site layout is io.js's: [x, y, log_tau, radius, r, g, b, dir_x, dir_y,
 // log_aniso], colors decoded RGB.
@@ -77,17 +81,20 @@ const MAX_TOTAL = 1 << 16;
 const INC = 24;
 
 class Model {
-  constructor(size, frozen = false) {
-    this.f = new Array(size).fill(1);
-    this.total = size;
+  // `init`: starting frequencies (a shared model's primed table), else
+  // uniform; `inc`: the increment per coded symbol (smaller = a stronger prior).
+  constructor(size, frozen = false, init = null, inc = INC) {
+    this.f = init ? init.slice() : new Array(size).fill(1);
+    this.total = init ? init.reduce((a, b) => a + b, 0) : size;
     this.frozen = frozen;
+    this.inc = inc;
   }
   cumLo(s) { let c = 0; for (let i = 0; i < s; i += 1) c += this.f[i]; return c; }
   bits(s) { return -Math.log2(this.f[s] / this.total); }
   update(s) {
     if (this.frozen) return;
-    this.f[s] += INC;
-    this.total += INC;
+    this.f[s] += this.inc;
+    this.total += this.inc;
     if (this.total > MAX_TOTAL) {
       this.total = 0;
       for (let i = 0; i < this.f.length; i += 1) { this.f[i] = (this.f[i] + 1) >> 1; this.total += this.f[i]; }
@@ -96,12 +103,48 @@ class Model {
 }
 const BYPASS = new Model(2, true);
 
+// Every adaptive model of one stream, made on first use under a string key
+// (the same key in encoder and decoder). With a shared model's `tables` and
+// `incs` (buildSharedModel) a model starts from its primed frequencies instead
+// of uniform, then adapts as before (by its inc if listed). Keys: "h…"
+// header, "x…" positions, "p<plane>/…".
+class ModelSet {
+  constructor(tables = null, incs = null) { this.tables = tables; this.incs = incs; this.models = new Map(); }
+  get(key, size) {
+    let m = this.models.get(key);
+    if (!m) {
+      const t = this.tables?.[key];
+      m = t && t.length === size ? new Model(size, false, t, this.incs?.[key] ?? INC) : new Model(size);
+      m.key = key;
+      this.models.set(key, m);
+    }
+    return m;
+  }
+}
+
 // The three ways of running the same coding code: count ideal bits only,
 // encode, decode. sym(model, s) returns the symbol (s when coding it).
 class CostIO {
   constructor() { this.bits = 0; }
   sym(m, s) { this.bits += m.bits(s); m.update(s); return s; }
 }
+
+// CostIO that also counts each adaptive model's symbols (by key) and the
+// bits per model family (familyOf), for fitting a shared model.
+class CountIO extends CostIO {
+  constructor(counts = new Map(), famBits = {}) { super(); this.counts = counts; this.famBits = famBits; }
+  sym(m, s) {
+    if (!m.frozen) {
+      if (!this.counts.has(m.key)) this.counts.set(m.key, new Array(m.f.length).fill(0));
+      this.counts.get(m.key)[s] += 1;
+    }
+    const fam = m.frozen ? "raw" : familyOf(m.key);
+    this.famBits[fam] = (this.famBits[fam] ?? 0) + m.bits(s);
+    return super.sym(m, s);
+  }
+}
+// "h" header, "x" positions, "p0"… a plane: each gets its own prior strength.
+const familyOf = (key) => (key[0] === "p" ? key.slice(0, key.indexOf("/")) : key[0]);
 
 class EncodeIO {
   constructor(w) { this.w = w; this.low = 0; this.high = 2 ** 32 - 1; this.pending = 0; this.bits = 0; }
@@ -163,14 +206,14 @@ const ADAPTIVE_MANTISSA_BITS = 2;
 // Models for one stream of integers: the bucket symbol and the top mantissa
 // bits per bucket. `signed`: 0 | ±[2^k, 2^(k+1)) → 1 + 2k + sign; unsigned:
 // v + 1 ∈ [2^k, 2^(k+1)) → k.
-function intModels(signed) {
-  return { signed, bucket: new Model(signed ? 1 + 2 * MAX_K : MAX_K), mant: [] };
+function intModels(signed, ms = new ModelSet(), key = "") {
+  return { signed, ms, key, bucket: ms.get(`${key}b`, signed ? 1 + 2 * MAX_K : MAX_K), mant: [] };
 }
 
 function floorLog2(v) { let k = 0; while (2 ** (k + 1) <= v) k += 1; return k; }
 
 function codeMantissa(io, m, k, value) {
-  m.mant[k] ||= Array.from({ length: ADAPTIVE_MANTISSA_BITS }, () => new Model(2));
+  m.mant[k] ||= Array.from({ length: ADAPTIVE_MANTISSA_BITS }, (_, t) => m.ms.get(`${m.key}m${k}.${t}`, 2));
   let acc = 0;
   for (let j = k - 1; j >= 0; j -= 1) {
     const top = k - 1 - j;
@@ -264,8 +307,9 @@ function median(vals) {
 // or 1 (predict from neighbours; `constant` for a site without any). `levels`:
 // per site, M for a value mod M (an angle in M levels over π; the nearest
 // neighbour's angle is the prediction, rescaled to M), or null for integers.
-function codePlane(io, { vals, has, levels }, nbrs, mode, constant, enc) {
-  const models = Array.from({ length: SPREAD_CTX }, () => intModels(true));
+// Models come from `ms` under `key` (fresh uniform ones by default).
+function codePlane(io, { vals, has, levels }, nbrs, mode, constant, enc, ms = new ModelSet(), key = "") {
+  const models = Array.from({ length: SPREAD_CTX }, (_, c) => intModels(true, ms, `${key}${c}/`));
   for (let i = 0; i < vals.length; i += 1) {
     if (has && !has[i]) continue;
     const near = nbrs[i].filter((j) => !has || has[j]);
@@ -380,8 +424,8 @@ export const CODEC_PLANES = ["log_aniso", "θ", "log_tau", "radius", "Y", "Co", 
 const THETA_PLANE = 1;
 
 // Positions: raster gaps between cell indices, context = the previous gap's bucket.
-function codePositions(io, idx, n, enc) {
-  const models = Array.from({ length: MAX_K + 1 }, () => intModels(false));
+function codePositions(io, idx, n, enc, ms = new ModelSet()) {
+  const models = Array.from({ length: MAX_K + 1 }, (_, c) => intModels(false, ms, `x${c}/`));
   let prev = 0, ctx = MAX_K;
   for (let i = 0; i < n; i += 1) {
     const gap = codeInt(io, models[ctx], enc ? idx[i] - prev : undefined);
@@ -389,6 +433,204 @@ function codePositions(io, idx, n, enc) {
     prev = idx[i];
     ctx = floorLog2(gap + 1);
   }
+}
+
+// Everything the coder needs about one image's active sites at steps `q`.
+function analyze(sites, count, width, height, q, basis) {
+  const { rows } = quantize(sites, count, width, height, q, basis);
+  const xsPos = rows.map((r) => r.x), ysPos = rows.map((r) => r.y), idx = rows.map((r) => r.idx);
+  const levels = rows.map((r) => r.m);
+  const has = levels.map((m) => m > 1);
+  const planes = CODEC_PLANES.map((_, p) => rows.map((r) => r.planes[p]));
+  const specs = planes.map((vals, p) => (p === THETA_PLANE ? { vals, has, levels } : { vals, has: null, levels: null }));
+  return { rows, n: rows.length, xsPos, ysPos, idx, nbrs: priorNeighbors(xsPos, ysPos), levels, planes, specs };
+}
+
+// A plane's median (θ: over the sites that have one), its per-image constant.
+function ownConstant(s) {
+  const v = s.vals.filter((_, i) => !s.has || s.has[i]);
+  return v.length ? median(v) : 0;
+}
+
+// ---- Shared model ----
+// Side information that encoder and decoder hold like a codebook (as a
+// colorBasis), fit on a training set of images by buildSharedModel, so a
+// per-image stream carries only what is specific to its image:
+//   q          quantizer step exponents (no steps in the stream)
+//   colorBasis the color basis, or null for YCoCg-R
+//   width, height  the usual image size (one flag in the stream when it matches)
+//   constants  per plane, the dataset's median value
+//   tables     primed starting frequencies of the adaptive models, by key
+//   incs       their increments per symbol where smaller than usual
+//   strengths  per model family, the prior weight the tables were made with
+// A shared stream is arithmetic coded from its first bit, header included:
+// a size flag (then the size if it differs), the count, the layer's index + 1,
+// and per plane a mode: 0 = predict the shared constant, 1 = neighbours (the
+// shared constant for a site without any), 2 = predict an own constant (coded
+// against the shared one). These use primed models too. Then positions and
+// planes as in a per-image stream, their models starting primed and adapting
+// per image. The stream does not identify its shared model: decode with the
+// one it was coded with.
+
+const SHARED_VERSION = 1;
+const SHARED_MODES = 3;
+const PRIOR_STRENGTHS = [0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768];
+const PRIOR_MASS = INC * 2048; // most a primed table holds (plus 1 per symbol), under MAX_TOTAL
+
+// Codes one image's shared stream (st filled in when decoding): header,
+// positions, planes. Returns the ideal bits by stage.
+function sharedStream(io, S, st, enc, ms = new ModelSet(S.tables, S.incs)) {
+  const same = io.sym(ms.get("hs", 2), enc ? (st.width === S.width && st.height === S.height ? 1 : 0) : undefined);
+  if (same) { st.width = S.width; st.height = S.height; } else {
+    st.width = codeInt(io, intModels(false, ms, "hw/"), enc ? st.width : undefined);
+    st.height = codeInt(io, intModels(false, ms, "hh/"), enc ? st.height : undefined);
+  }
+  st.n = codeInt(io, intModels(false, ms, "hn/"), enc ? st.n : undefined);
+  st.globalIndex = codeInt(io, intModels(false, ms, "hg/"), enc ? st.globalIndex + 1 : undefined) - 1;
+  if (!enc) { st.modes = []; st.constants = []; }
+  for (let p = 0; p < CODEC_PLANES.length; p += 1) sharedPlaneHeader(io, S, st, p, enc, ms);
+  const headerBits = io.bits;
+  if (!enc) st.idx = new Array(st.n);
+  codePositions(io, st.idx, st.n, enc, ms);
+  const positionBits = io.bits - headerBits;
+  if (!enc) {
+    const gx = Math.max(1, Math.ceil(st.width / stepOf(S.q.pos)));
+    st.xs = st.idx.map((v) => v % gx); st.ys = st.idx.map((v) => Math.floor(v / gx));
+    st.nbrs = priorNeighbors(st.xs, st.ys);
+    st.planes = CODEC_PLANES.map(() => new Array(st.n).fill(0));
+  }
+  const planeBits = CODEC_PLANES.map((_, p) => {
+    const before = io.bits;
+    sharedPlane(io, S, st, p, enc, ms);
+    return io.bits - before;
+  });
+  return { headerBits, positionBits, planeBits };
+}
+
+function sharedPlaneHeader(io, S, st, p, enc, ms) {
+  const mode = io.sym(ms.get(`hm${p}`, SHARED_MODES), enc ? st.modes[p] : undefined);
+  let c = S.constants[p];
+  if (mode === 2) c += codeInt(io, intModels(true, ms, `hc${p}/`), enc ? st.constants[p] - S.constants[p] : undefined);
+  if (!enc) { st.modes.push(mode); st.constants.push(c); }
+}
+
+function sharedPlane(io, S, st, p, enc, ms) {
+  if (p === THETA_PLANE) st.levels = st.planes[0].map((a) => thetaLevelsOf(S.q, a)); // log_aniso is coded by now
+  const spec = p === THETA_PLANE ? { vals: st.planes[p], has: st.levels.map((m) => m > 1), levels: st.levels }
+                                 : { vals: st.planes[p], has: null, levels: null };
+  const mode = st.modes[p];
+  codePlane(io, spec, st.nbrs, mode === 1 ? 1 : 0, mode === 2 ? st.constants[p] : S.constants[p], enc, ms, `p${p}/`);
+}
+
+// An analyzed image (analyze) as a shared stream's state, each plane's mode
+// whichever codes shortest with S's primed models (its mode symbol and
+// constant included; planes use disjoint models, so each is costed alone).
+function sharedState(a, width, height, globalIndex, S) {
+  const st = { width, height, n: a.n, globalIndex, idx: a.idx, nbrs: a.nbrs, planes: a.planes, modes: [], constants: [] };
+  a.specs.forEach((spec, p) => {
+    const own = ownConstant(spec);
+    let best = Infinity;
+    for (let mode = 0; mode < SHARED_MODES; mode += 1) {
+      if (mode === 2 && own === S.constants[p]) continue;
+      const io = new CostIO(), ms = new ModelSet(S.tables, S.incs);
+      const trial = { modes: [], constants: [] };
+      trial.modes[p] = mode; trial.constants[p] = own;
+      sharedPlaneHeader(io, S, trial, p, true, ms);
+      codePlane(io, spec, a.nbrs, mode === 1 ? 1 : 0, mode === 2 ? own : S.constants[p], true, ms, `p${p}/`);
+      if (io.bits < best) { best = io.bits; st.modes[p] = mode; st.constants[p] = mode === 2 ? own : S.constants[p]; }
+    }
+  });
+  return st;
+}
+
+function encodeShared(sites, count, width, height, globalSite, S) {
+  const basis = S.colorBasis ?? null;
+  const a = analyze(sites, count, width, height, S.q, basis);
+  const globalIndex = a.rows.findIndex((r) => r.slot === globalSite);
+  const st = sharedState(a, width, height, globalIndex, S);
+  const w = new BitWriter();
+  const io = new EncodeIO(w);
+  const { headerBits, positionBits, planeBits } = sharedStream(io, S, st, true);
+  io.finish();
+  const bytes = w.finish();
+  return {
+    bytes, bits: w.bits, n: a.n, headerBits, positionBits, planeBits, modes: st.modes,
+    decoded: dequantize(a.xsPos, a.ysPos, a.planes, a.levels, S.q, basis),
+    slots: a.rows.map((r) => r.slot), globalIndex,
+  };
+}
+
+function decodeShared(bytes, S) {
+  const st = {};
+  sharedStream(new DecodeIO(new BitReader(bytes)), S, st, false);
+  return { sites: dequantize(st.xs, st.ys, st.planes, st.levels, S.q, S.colorBasis ?? null),
+           count: st.n, width: st.width, height: st.height, globalSite: st.globalIndex };
+}
+
+// Primed tables from symbol counts: a model seen N times starts at
+// 1 + INC·K'·count/N per symbol, i.e. as if it had already adapted to
+// K' = K·N/(N + K) observations (K its family's strength: few counts, less
+// trust). Past PRIOR_MASS the table is scaled down to it and the model's
+// increment instead (incs), so the ratio of prior to update holds.
+function primedTables(counts, strengths) {
+  const tables = {}, incs = {};
+  for (const [key, c] of counts) {
+    const N = c.reduce((a, b) => a + b, 0), K = strengths[familyOf(key)] ?? 0;
+    if (!N || !K) continue;
+    const mass = (INC * K * N) / (N + K), scale = Math.min(1, PRIOR_MASS / mass);
+    tables[key] = c.map((x) => 1 + Math.round((mass * scale * x) / N));
+    if (scale < 1) incs[key] = Math.max(1, Math.round(INC * scale));
+  }
+  return { tables, incs };
+}
+
+// Builds a shared model (see above) from training images `list` ([{ sites,
+// n (slots), width, height, globalSite? }], each in its own coordinates) at
+// `steps` (codecSteps; any positive numbers work). `colorBasis`: code colors
+// along it. Constants are the pooled per-plane medians; the tables are the
+// pooled symbol counts of every image coded with its best modes. Each model
+// family's strength (header, positions, each plane) is picked from
+// PRIOR_STRENGTHS by two-fold cross-validation over the images (counts from
+// one half, bits on the other), so it is not fit to the images it is scored
+// on. `iterations` alternate modes and tables. Returns a plain JSON object.
+export function buildSharedModel(list, steps, { colorBasis = null, iterations = 2 } = {}) {
+  const q = {};
+  for (const k of STEP_GROUPS) q[k] = quantizeStep(steps[k]);
+  const items = list.map((im) => {
+    const a = analyze(im.sites, im.n, im.width, im.height, q, colorBasis);
+    const g = im.globalSite ?? -1;
+    return { a, width: im.width, height: im.height, globalIndex: a.rows.findIndex((r) => r.slot === g) };
+  });
+  const sizes = new Map();
+  for (const it of items) { const k = `${it.width}x${it.height}`; sizes.set(k, (sizes.get(k) ?? 0) + 1); }
+  const [width, height] = ([...sizes].sort((x, y) => y[1] - x[1])[0]?.[0] ?? "0x0").split("x").map(Number);
+  const constants = CODEC_PLANES.map((_, p) => {
+    const v = [];
+    for (const { a } of items) a.specs[p].vals.forEach((x, i) => { if (!a.specs[p].has || a.specs[p].has[i]) v.push(x); });
+    return v.length ? median(v) : 0;
+  });
+  const S = { version: SHARED_VERSION, q, colorBasis, width, height, constants, tables: {}, incs: {}, strengths: {} };
+  for (let iter = 0; iter < iterations; iter += 1) {
+    const states = items.map((it) => sharedState(it.a, it.width, it.height, it.globalIndex, S));
+    const count = (sel) => { const io = new CountIO(); sel.forEach((st) => sharedStream(io, S, st, true, new ModelSet())); return io.counts; };
+    const halves = [states.filter((_, i) => i % 2 === 0), states.filter((_, i) => i % 2 === 1)];
+    const halfCounts = halves.map(count);
+    const fams = new Set([...halfCounts[0].keys(), ...halfCounts[1].keys()].map(familyOf));
+    const best = {};
+    for (const K of PRIOR_STRENGTHS) {
+      const strengths = Object.fromEntries([...fams].map((f) => [f, K]));
+      const famBits = {};
+      for (let h = 0; h < 2; h += 1) {
+        const T = { ...S, ...primedTables(halfCounts[1 - h], strengths) };
+        const io = new CountIO(new Map(), famBits);
+        halves[h].forEach((st) => sharedStream(io, T, st, true));
+      }
+      for (const f of fams) if (!(best[f]?.bits <= (famBits[f] ?? 0))) best[f] = { K, bits: famBits[f] ?? 0 };
+    }
+    S.strengths = Object.fromEntries(Object.entries(best).map(([f, b]) => [f, b.K]));
+    Object.assign(S, primedTables(count(states), S.strengths));
+  }
+  return S;
 }
 
 // ---- Public API ----
@@ -430,28 +672,22 @@ export function codecSteps(sites, count, F, { lossDb, sse0 }) {
 // Encodes the active sites of `sites` (count · SITE_FLOATS, decoded RGB).
 // `steps` from codecSteps (any positive numbers work). `globalSite`: the slot
 // of the histogram layer, or −1. `colorBasis`: code colors along its axes
-// (decodeSites needs the same one); null = YCoCg-R. Returns
+// (decodeSites needs the same one); null = YCoCg-R. `shared`: a shared model
+// (buildSharedModel) to code against instead; its steps and color basis then
+// replace `steps` and `colorBasis`, and modes are 0/1/2 (see Shared model).
+// Returns
 //   { bytes, bits, n, headerBits, positionBits, planeBits: [per CODEC_PLANES],
 //     modes, decoded: the sites as decodeSites returns them (coded order),
 //     slots: each decoded site's slot in `sites`, globalIndex: the layer's
 //     index in decoded, or −1 }.
-export function encodeSites(sites, count, width, height, steps, { globalSite = -1, colorBasis = null } = {}) {
+export function encodeSites(sites, count, width, height, steps, { globalSite = -1, colorBasis = null, shared = null } = {}) {
+  if (shared) return encodeShared(sites, count, width, height, globalSite, shared);
   const q = {};
   for (const k of STEP_GROUPS) q[k] = quantizeStep(steps[k]);
-  const { rows } = quantize(sites, count, width, height, q, colorBasis);
-  const n = rows.length;
-  const xsPos = rows.map((r) => r.x), ysPos = rows.map((r) => r.y), idx = rows.map((r) => r.idx);
-  const nbrs = priorNeighbors(xsPos, ysPos);
-  const levels = rows.map((r) => r.m);
-  const has = levels.map((m) => m > 1);
-  const planes = CODEC_PLANES.map((_, p) => rows.map((r) => r.planes[p]));
-  const specs = planes.map((vals, p) => (p === THETA_PLANE ? { vals, has, levels } : { vals, has: null, levels: null }));
+  const { rows, n, xsPos, ysPos, idx, nbrs, levels, planes, specs } = analyze(sites, count, width, height, q, colorBasis);
 
   // Per plane: whichever predictor codes shorter.
-  const constants = specs.map((s) => {
-    const v = s.vals.filter((_, i) => !s.has || s.has[i]);
-    return v.length ? median(v) : 0;
-  });
+  const constants = specs.map(ownConstant);
   const modes = specs.map((s, p) => {
     const cost = [0, 1].map((mode) => { const io = new CostIO(); codePlane(io, s, nbrs, mode, constants[p], true); return io.bits; });
     return cost[1] < cost[0] ? 1 : 0;
@@ -483,9 +719,10 @@ export function encodeSites(sites, count, width, height, steps, { globalSite = -
 }
 
 // Inverse of encodeSites: { sites (n · SITE_FLOATS, decoded RGB), count,
-// width, height, globalSite (index in sites, or −1) }. `colorBasis`: the one
-// the stream was coded with, if any.
-export function decodeSites(bytes, { colorBasis = null } = {}) {
+// width, height, globalSite (index in sites, or −1) }. `colorBasis`, `shared`:
+// the ones the stream was coded with, if any.
+export function decodeSites(bytes, { colorBasis = null, shared = null } = {}) {
+  if (shared) return decodeShared(bytes, shared);
   const r = new BitReader(bytes);
   const width = r.eg(), height = r.eg(), n = r.eg(), globalSite = r.eg() - 1;
   if (r.bit() && !colorBasis) throw new Error("decodeSites: stream was coded along a color basis; pass it");
