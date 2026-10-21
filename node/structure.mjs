@@ -19,7 +19,7 @@
 //                 cheapest (merge.js mergedSite, pixel-count weights from the
 //                 owner render; the larger site survives at the merged
 //                 parameters, the other is deactivated), in every image where
-//                 cal · ΔD + λ · (bits per coded site) < 0. ΔD predicted as
+//                 cal · ΔD − λ · (bits per coded site) < 0. ΔD predicted as
 //                 Gauss–Newton with the first-order term for both sites moving
 //                 to the merged one (or Ward's nᵢnⱼ/(nᵢ+nⱼ)·‖μᵢ−μⱼ‖² with
 //                 --drop-pred ward); one site ≈ 30–40 bits.
@@ -40,8 +40,8 @@
 //   continuous sites, minus the same for the current decoded sites (so
 //   quantization changes are priced like any other move; direction is left
 //   out where the decoded site is round, since it does nothing there).
-//   Calibrated: × the slope (through 0) of the measured refit ΔD on the
-//   prediction per action type, fit per image on the calibration images.
+//   Calibrated: × the ratio of pooled measured refit ΔD (coarsen: render) to
+//   pooled prediction per action, on the calibration images.
 //   ΔR: the codec on the preview state (for drops the remaining sites).
 // Greedy loop. Each step ranks the actions by cal · ΔD + λ · ΔR, refits a
 //   control (the current state, nothing changed: --refit-iters iterations,
@@ -320,7 +320,7 @@ const ACTIONS = [
       let merges = bestMerges(ctx, snap, state.sites);
       if (env.lambda !== undefined) {
         const c = env.cal.drop ?? 1;
-        merges = merges.filter((m) => c * (ctx.dropPred === "ward" ? m.ward : m.gn + m.lin) + env.lambda * env.bitsPerSite < 0);
+        merges = merges.filter((m) => c * (ctx.dropPred === "ward" ? m.ward : m.gn + m.lin) - env.lambda * env.bitsPerSite < 0);
       }
       if (!merges.length) return null;
       return { state: withState(state, { sites: applyMerges(state.sites, merges) }), ...mergePred(ctx, merges) };
@@ -477,11 +477,14 @@ async function calibrate(ctx, opts) {
                   `refit ${p.refit.toFixed(1)} | ρ/slope render ${f2(s.gnLinRender.spearman)}/${f3(s.gnLinRender.slope)} refit ` +
                   `${f2(s.gnLinRefit.spearman)}/${f3(s.gnLinRefit.slope)} | ΔR pred ${p.predBits} meas ${p.measBits.toFixed(0)} ρ ${f2(s.bits.spearman)} slope ${f3(s.bits.slope)}`);
   }
-  // Calibration factor per action key: refit-measured on predicted (coarsen: render), clamped.
+  // Calibration factor per action key: pooled refit-measured ΔD over pooled
+  // prediction (coarsen: render), as the greedy prices pooled sums (the
+  // per-image slope, weighted to the largest images, comes out lower), clamped.
   const cal = {};
   for (const r of rows) {
-    const s = r.type === "coarsen" ? r.stats.gnLinRender.slope : (ctx.dropPred === "ward" && r.ward ? r.stats.wardRefit.slope : r.stats.gnLinRefit.slope);
-    cal[r.key] = Number.isFinite(s) ? Math.min(1.5, Math.max(0.02, s)) : 1;
+    const p = r.pooled, pred = ctx.dropPred === "ward" && r.ward ? sum(r.ward) : p.pred;
+    const s = (r.type === "coarsen" ? p.render : p.refit) / pred;
+    cal[r.key] = Number.isFinite(s) && pred > 0 ? Math.min(1.5, Math.max(0.01, s)) : 1;
   }
   return { start: scores(ctx, base), controls: controls.map((c) => scores(ctx, c.m)), controlNoiseSpearman: noise, rows, cal };
 }
@@ -605,7 +608,7 @@ async function main() {
       "calib-from": { type: "string", default: "0" }, "calib-count": { type: "string", default: "1024" }, calib: { type: "string" },
       lambdas: { type: "string", default: "0.03,0.1,0.3" }, sites: { type: "string", default: "4,6,8,12" },
       "refit-iters": { type: "string", default: "40" }, "refit-lr": { type: "string", default: "0.25" },
-      "max-steps": { type: "string", default: "12" }, tries: { type: "string", default: "3" },
+      "max-steps": { type: "string", default: "20" }, tries: { type: "string", default: "3" },
       repeats: { type: "string", default: "1" }, "drop-pred": { type: "string", default: "gn" },
       "no-baselines": { type: "boolean", default: false }, out: { type: "string" }, help: { type: "boolean", short: "h", default: false },
     },
@@ -614,7 +617,7 @@ async function main() {
     process.stdout.write("Usage: node structure.mjs (--mnist <idx3.gz> | --parquet <file> | --images <dir>) [--from 1024] [--count 2048]\n" +
                          "         [--preset json] [--set key=value …] [--calib-from 0] [--calib-count 1024 | --calib json]\n" +
                          "         [--lambdas 0.03,0.1,0.3] [--sites 4,6,8,12] [--refit-iters 40] [--refit-lr 0.25]\n" +
-                         "         [--max-steps 12] [--tries 3] [--repeats 1] [--drop-pred gn|ward] [--no-baselines] [--out json]\n");
+                         "         [--max-steps 20] [--tries 3] [--repeats 1] [--drop-pred gn|ward] [--no-baselines] [--out json]\n");
     process.exit(cli.help ? 0 : 1);
   }
   const base = await loadParams(cli.preset, cli.set);
@@ -642,7 +645,6 @@ async function main() {
     } });
   }
   const cal = calib?.cal ?? {};
-  if (dropPred === "ward" && calib) cal.drop = calib.rows.find((r) => r.key === "drop")?.stats.wardRefit.slope ?? cal.drop;
   result.calibration = calib;
   console.error(`Cal    | ${Object.entries(cal).map(([k, v]) => `${k} ${v.toFixed(3)}`).join(", ")}`);
 
