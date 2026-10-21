@@ -1,0 +1,1 @@
+Always commit all changes after verifying them yourself. Don't leave anything uncommitted when giving control back to the user. 
