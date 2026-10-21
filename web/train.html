@@ -976,6 +976,10 @@
           <div class="row"><label>space</label><select id="p-colorSpace" aria-label="Site color space"></select></div>
           <div class="tip" role="tooltip">What a site's three color numbers mean while optimizing. <b>RGB</b>: red, green, blue on 0–1 (1 = 255 levels). <b>Log intensity + chroma</b>: mean natural-log brightness, then log(R/G) and log(B/G), so a pure brightness change moves one number. Blending, the loss and saved files are always RGB.</div>
         </div>
+        <div class="param">
+          <div class="row"><label>Adam scale</label><select id="p-colorMoment" aria-label="Adam second moment for the color"></select></div>
+          <div class="tip" role="tooltip">How Adam sizes the color steps. <b>Per param</b>: each of the three color numbers is scaled by its own gradient history, so a number whose gradient is only rounding noise (the chroma of a grey image) still takes full-size steps and drifts. <b>Shared</b>: one scale for all three (as for position), so each number moves in proportion to its share of the color gradient.</div>
+        </div>
 
         <h3>Loss</h3>
         <div class="param">
@@ -1110,6 +1114,6 @@
       </section>
     </div>
 
-    <script type="module" src="train.js?v=merge-20261020"></script>
+    <script type="module" src="train.js?v=m3-20261020"></script>
   </body>
 </html>

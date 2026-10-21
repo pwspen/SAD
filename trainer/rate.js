@@ -16,7 +16,7 @@
 // Steps Δ come from codecSteps at a fixed quantization loss (args.rateLossDb):
 // the rate is that of coding the current sites at that fidelity.
 
-import { SITE_FLOATS } from "./params.js?v=20261019";
+import { SITE_FLOATS } from "./params.js?v=m3-20261020";
 
 export const RATE_PLANES = ["log_tau", "radius", "K0", "K1", "K2", "log_aniso"];
 const RATE_HEADER = 20;

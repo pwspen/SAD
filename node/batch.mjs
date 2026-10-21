@@ -17,8 +17,8 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 
-import { Trainer } from "../trainer/trainer.js?v=rate-20261020";
-import { planBatches } from "../trainer/batch.js?v=rate-20261020";
+import { Trainer } from "../trainer/trainer.js?v=m3-20261020";
+import { planBatches } from "../trainer/batch.js?v=m3-20261020";
 import { computePsnr } from "../trainer/io.js?v=20261019";
 import { whiteMaskRgba32Float } from "../trainer/textures.js?v=20261019";
 import { createHeadlessDevice, loadShadersFromDisk } from "./headless.mjs";

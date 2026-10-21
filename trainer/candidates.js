@@ -15,7 +15,7 @@ import {
   createPackParamsBuffer,
   updatePackParamsBuffer,
   packJumpStep,
-} from "./params.js?v=20261019";
+} from "./params.js?v=m3-20261020";
 import { createPackedCandidatesBuffer } from "./buffers.js?v=20261019";
 import { createCandidateTexture, readRgba32FloatTexture } from "./textures.js?v=20261019";
 import { CandidatesEncoder, SeedCandidatesEncoder, CandidatePackEncoder } from "./encoders.js?v=rate-20261020";

@@ -11,7 +11,7 @@ import { dirname, join, resolve, basename } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 
-import { Trainer, buildArgs } from "../trainer/trainer.js?v=rate-20261020";
+import { Trainer, buildArgs } from "../trainer/trainer.js?v=m3-20261020";
 import { parseSitesTxt, serializeSitesTxt, computePsnr, computeBpp, BITS_PER_SITE } from "../trainer/io.js?v=20261019";
 import {
   createHeadlessDevice,

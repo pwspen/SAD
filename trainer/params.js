@@ -155,7 +155,8 @@ export function updateGradParamsBuffer(queue, buffer, siteCount, invScaleSq, glo
 // ---------------------------------------------------------------------------
 // AdamParams (adam.wgsl):
 //   f32 lrPos, lrTau, lrRadius, lrColor, lrDir, lrAniso, beta1, beta2, eps,
-//   u32 t, u32 width, u32 height, u32 layerSite, u32 _pad × 3, Tiling (80 bytes).
+//   u32 t, u32 width, u32 height, u32 layerSite, u32 colorMoment, u32 _pad × 2,
+//   Tiling (80 bytes).
 // Tiled, width and height are the tile's.
 // ---------------------------------------------------------------------------
 
@@ -167,7 +168,7 @@ export function createAdamParamsBuffer(device, opts) {
 
 export function updateAdamParamsBuffer(queue, buffer, {
   lrPos = 0, lrTau = 0, lrRadius = 0, lrColor = 0, lrDir = 0, lrAniso = 0,
-  beta1 = 0.9, beta2 = 0.999, eps = 1e-8, t = 1, width, height, layerSite = 0xffffffff, tiling = null,
+  beta1 = 0.9, beta2 = 0.999, eps = 1e-8, t = 1, width, height, layerSite = 0xffffffff, colorMoment = 0, tiling = null,
 }) {
   const bytes = new ArrayBuffer(80);
   const f = new Float32Array(bytes);
@@ -177,6 +178,7 @@ export function updateAdamParamsBuffer(queue, buffer, {
   u[10] = width >>> 0;
   u[11] = height >>> 0;
   u[12] = layerSite >>> 0;
+  u[13] = colorMoment >>> 0;
   writeTiling(u, 16, tiling);
   queue.writeBuffer(buffer, 0, bytes);
 }

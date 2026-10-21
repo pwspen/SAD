@@ -11,7 +11,7 @@
 
 import { encodeSites, decodeSites, codecSteps, buildSharedModel } from "../trainer/codec.js?v=shared-20261020";
 import { pcaBasis } from "../trainer/color_spaces.js?v=klt-20261020";
-import { SITE_FLOATS } from "../trainer/params.js?v=20261019";
+import { SITE_FLOATS } from "../trainer/params.js?v=m3-20261020";
 
 let failures = 0;
 function check(name, ok, detail) {

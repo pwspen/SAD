@@ -1,6 +1,6 @@
 // Site / Adam / gradient / stats / pairs / indices buffer helpers.
 
-import { SITE_FLOATS, ADAM_FLOATS, PACKED_CAND_BYTES } from "./params.js?v=20261019";
+import { SITE_FLOATS, ADAM_FLOATS, PACKED_CAND_BYTES } from "./params.js?v=m3-20261020";
 
 export function createSitesBuffer(device, capacity) {
   return device.createBuffer({
