@@ -331,12 +331,34 @@
         color: var(--text);
       }
       .group-tag { font-size: 10.5px; font-weight: 400; color: var(--text-soft); }
-      .panel details > summary { list-style: none; cursor: pointer; }
-      .panel details > summary h3 { margin-bottom: 4px; }
-      .panel details:not([open]) > summary h3 { margin-bottom: 0; }
+      /* Collapsible groups (train.js setupCollapsibleGroups): each top-level
+         group (details.group) and each setting group (details.subgroup) opens
+         from a full-width button; a group's contents are indented under it. */
+      .panel details > summary {
+        list-style: none;
+        cursor: pointer;
+        display: block;
+        margin: 6px 0;
+        padding: 7px 10px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--panel-soft);
+        user-select: none;
+      }
+      .panel details > summary:hover { border-color: var(--text-soft); }
+      .panel details > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+      .panel details[open] > summary { background: var(--accent-soft); }
       .panel details > summary::-webkit-details-marker { display: none; }
+      .panel details > summary h3 { margin: 0; }
       .panel details > summary h3::before { content: "▸ "; letter-spacing: 0; }
       .panel details[open] > summary h3::before { content: "▾ "; }
+      .panel details.subgroup > :not(summary) { margin-left: 10px; }
+      .panel details.group { margin-top: 14px; }
+      .panel details.group > summary { padding: 9px 12px; }
+      .panel details.group > summary .group-head { margin: 0; padding: 0; border: 0; }
+      .panel details.group > summary .group-head > span:first-child::before { content: "▸ "; }
+      .panel details.group[open] > summary .group-head > span:first-child::before { content: "▾ "; }
+      .panel .group-body { margin: 0 0 0 6px; padding-left: 10px; border-left: 2px solid var(--line); }
       .row input:disabled, .row input[readonly] { color: var(--text-soft); background: var(--panel-soft); }
       .panel h3.has-tip::after { content: " ⓘ"; letter-spacing: 0; }
       .tip {
@@ -1197,6 +1219,6 @@
       </section>
     </div>
 
-    <script type="module" src="train.js?v=groups-20261021"></script>
+    <script type="module" src="train.js?v=groups2-20261021"></script>
   </body>
 </html>

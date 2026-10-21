@@ -4113,9 +4113,11 @@ function fieldActive(input) {
   return true;
 }
 
-// Advanced's setting groups (each h3 and the settings after it, up to the
-// next heading) as <details>, closed unless opened before in this browser
-// (the open ones are remembered by heading). Candidate search is already one.
+// Advanced's groups as <details>, closed unless opened before in this browser
+// (the open ones are remembered by name): each setting group (an h3 and the
+// settings after it, up to the next heading; Candidate search is already one)
+// and, one level up, each top-level group (a .group-head and everything up to
+// the next one, indented in a .group-body).
 const OPEN_GROUPS_KEY = "sad.openSettingGroups";
 
 function setupCollapsibleGroups() {
@@ -4132,8 +4134,23 @@ function setupCollapsibleGroups() {
     details.append(summary);
     while (details.nextElementSibling && !ends(details.nextElementSibling)) details.append(details.nextElementSibling);
   }
+  for (const details of ui.paramsPanel.querySelectorAll("details")) details.classList.add("subgroup");
+  for (const head of [...ui.paramsPanel.querySelectorAll(":scope > .group-head")]) {
+    const details = document.createElement("details");
+    details.className = "group";
+    if (head.id) { details.id = head.id; head.removeAttribute("id"); } // e.g. batchSection, which openBatchSettings opens
+    const summary = document.createElement("summary");
+    const body = document.createElement("div");
+    body.className = "group-body";
+    head.before(details);
+    summary.append(head);
+    details.append(summary, body);
+    while (details.nextElementSibling && !details.nextElementSibling.matches(".group-head")) body.append(details.nextElementSibling);
+  }
   for (const details of ui.paramsPanel.querySelectorAll("details")) {
-    const name = details.querySelector("summary h3")?.firstChild?.textContent.trim();
+    const name = details.classList.contains("group")
+      ? details.querySelector(":scope > summary .group-head > span")?.textContent.trim()
+      : details.querySelector(":scope > summary h3")?.firstChild?.textContent.trim();
     details.open = open.has(name);
     details.addEventListener("toggle", () => {
       if (details.open) open.add(name); else open.delete(name);
@@ -4878,7 +4895,9 @@ function openBatchSettings() {
   if (ui.paramsPanel.classList.contains("hidden")) toggleParams();
   syncBatchFill();
   updateBatchNote();
-  document.getElementById("batchSection").scrollIntoView({ block: "start", behavior: "smooth" });
+  const section = document.getElementById("batchSection");
+  section.open = true;
+  section.scrollIntoView({ block: "start", behavior: "smooth" });
 }
 
 // ---- Batch plots ----
