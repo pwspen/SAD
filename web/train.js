@@ -5,11 +5,11 @@
 
 import { loadShaders, tileSlotsForLimit } from "../trainer/shader_loader.js?v=rate-20261020";
 import { requestTrainingDevice } from "../trainer/device.js?v=20261019";
-import { Trainer, buildArgs, GRAD_GROUPS, GRAD_CHANNELS, lrSchedule, LR_SCHEDULES, LOSSES, COLOR_MOMENTS, COUNT_SCHEDULES, LAYER_MODES, countPlan, countVaries, countHorizon } from "../trainer/trainer.js?v=m3-20261020";
+import { Trainer, buildArgs, GRAD_GROUPS, GRAD_CHANNELS, lrSchedule, LR_SCHEDULES, LOSSES, COLOR_MOMENTS, COUNT_SCHEDULES, LAYER_MODES, countPlan, countVaries, countHorizon } from "../trainer/trainer.js?v=m4-20261020";
 import { loadImageToFloat32, loadMaskRgba32Float, whiteMaskRgba32Float } from "../trainer/textures.js?v=20261019";
 import { loadSitesFromFile, serializeSitesTxt, triggerDownload, floatImageToRgba8, computeBpp, computePsnr, BITS_PER_SITE } from "../trainer/io.js?v=20261019";
 import { SITE_FLOATS } from "../trainer/params.js?v=m3-20261020";
-import { BatchTrainer, planBatches, tileSites, tileActive, tileSize, atlasCapacity } from "../trainer/batch.js?v=m3-20261020";
+import { BatchTrainer, planBatches, tileSites, tileActive, tileSize, atlasCapacity } from "../trainer/batch.js?v=m4-20261020";
 import { COLOR_SPACES } from "../trainer/color_spaces.js?v=klt-20261020";
 import { encodeSites, codecSteps, CODEC_PLANES } from "../trainer/codec.js?v=shared-20261020";
 import { parquetMetadata, parquetReadObjects } from "./vendor/hyparquet/src/index.js";
@@ -56,7 +56,7 @@ const UI_FIELDS = [
   ["sawTeeth", "p-sawTeeth"],
   ["sawAmp", "p-sawAmp"],
   ["sawRatio", "p-sawRatio"],
-  ["logFreq", "p-logFreq"], // also sets viewerFreq (one "refresh every" field)
+  ["logFreq", "p-logFreq", { blankDefault: true }], // also sets viewerFreq; blank = auto (autoRefresh)
   ["candFreq", "p-candFreq"],
   ["candUpdatePasses", "p-candUpdatePasses"],
   ["candDownscale", "p-candDownscale"],
@@ -81,6 +81,8 @@ const UI_FIELDS = [
   ["growLambda", "p-growLambda"],
   ["growEvery", "p-growEvery"],
   ["layer", "p-layer"],
+  ["initLogTau", "p-initLogTau"],
+  ["initRadius", "p-initRadius"],
 ];
 
 const state = {
@@ -176,7 +178,6 @@ const ui = {
   progressText: document.getElementById("progressText"),
   log: document.getElementById("logPanel"),
   batchBtn: document.getElementById("batchBtn"),
-  batchPopover: document.getElementById("batchPopover"),
   batchFrom: document.getElementById("batchFrom"),
   batchCount: document.getElementById("batchCount"),
   batchRandom: document.getElementById("batchRandom"),
@@ -185,7 +186,6 @@ const ui = {
   batchLogFreq: document.getElementById("batchLogFreq"),
   batchSnaps: document.getElementById("batchSnaps"),
   batchNote: document.getElementById("batchNote"),
-  batchRunBtn: document.getElementById("batchRunBtn"),
   batchTiled: document.getElementById("batchTiled"),
   batchBar: document.getElementById("batchBar"),
   batchRunSelect: document.getElementById("batchRunSelect"),
@@ -249,8 +249,14 @@ function readFormOverrides() {
     else if (el.value === "") continue;
     else overrides[key] = Number(el.value);
   }
-  if (overrides.logFreq !== undefined) overrides.viewerFreq = overrides.logFreq;
+  if (overrides.logFreq === undefined) overrides.logFreq = autoRefresh(overrides.iters);
+  overrides.viewerFreq = overrides.logFreq;
   return overrides;
+}
+
+// "refresh every" left blank: about 20 refreshes per run (5 for 100 iterations).
+function autoRefresh(iters) {
+  return iters > 0 ? Math.max(1, Math.round(iters / 20)) : undefined;
 }
 
 function readFormArgs() {
@@ -373,8 +379,13 @@ async function initDevice() {
   return device;
 }
 
+// Trainer args that only change what the viewer sees, never what is learned:
+// presets and saved defaults leave them out.
+const INSTRUMENTATION_ARGS = ["logFreq", "viewerFreq"];
+
 // Fills the advanced panel from a preset: camelCase keys are trainer args,
-// UPPER_CASE keys patch training_config.json (they have no field).
+// UPPER_CASE keys patch training_config.json (they have no field, unless
+// buildArgs also takes the camelCase name, as for initLogTau).
 let presetToken = 0;
 async function applyPreset(key) {
   if (!state.baseConfig) return;
@@ -396,10 +407,13 @@ async function applyPreset(key) {
   const configPatch = {}, overrides = {};
   for (const [k, v] of Object.entries(preset.args || {})) {
     if (/^[A-Z0-9_]+$/.test(k)) configPatch[k] = v;
-    else overrides[k] = v;
+    else if (!INSTRUMENTATION_ARGS.includes(k)) overrides[k] = v;
   }
+  // Refresh every is instrumentation, not part of a preset: keep what's typed.
+  const refresh = document.getElementById("p-logFreq").value;
   state.config = { ...state.baseConfig, ...configPatch };
   applyConfigToForm(state.config, overrides);
+  if (refresh !== "") document.getElementById("p-logFreq").value = refresh;
   ui.presetNote.textContent = `Fills every field below; picking a dataset switches to its preset. ${preset._note || ""}`;
   updatePlanSummary();
 }
@@ -419,7 +433,7 @@ function saveDefaults() {
     if (/^[A-Z0-9_]+$/.test(k) && JSON.stringify(v) !== JSON.stringify(state.baseConfig[k])) args[k] = v;
   }
   const overrides = readFormOverrides();
-  delete overrides.viewerFreq; // follows logFreq
+  for (const k of INSTRUMENTATION_ARGS) delete overrides[k];
   Object.assign(args, overrides);
   try {
     localStorage.setItem(DEFAULTS_STORAGE_KEY, JSON.stringify(args));
@@ -483,8 +497,8 @@ function fitCanvasToCard(canvas, width = canvas.width, height = canvas.height) {
 // nothing (band SNR history is the exception: it's recorded on every render).
 //
 // `source` says where a view's data comes from and is shown as a badge on its
-// card; `note` (shown on hover) says what exactly is drawn. `on` lists the
-// events that redraw the view:
+// card; `stage` groups it (STAGES); `note` (shown on hover) says what exactly
+// is drawn. `on` lists the events that redraw the view:
 //   target – a new target or mask      render – a new reconstruction
 //   log    – a log tick's metrics      run    – a run starting
 //   batch  – a batch's progress        tune   – an auto-tune batch finishing
@@ -496,53 +510,68 @@ const SOURCES = {
   derived: { badge: "Viz only", desc: "Viz only: computed in the viewer (CPU) for display. The optimizer never sees it." },
 };
 const VIEW_EVENTS = ["target", "render", "log", "run", "batch", "tune"];
+// What a view belongs to, in picker order: each view's `stage`. `afterRun`
+// views are computed only once a run has stopped (an "after run" tag).
+const STAGES = {
+  images:   "Image maps",
+  curves:   "Run curves",
+  growth:   "Growth & merge",
+  spectral: "Spectral",
+  sites:    "Site statistics",
+  rate:     "Rate",
+  batch:    "Batch",
+  tune:     "Tuning",
+  tools:    "Tools",
+};
 
 const VIEWS = {
-  target:     { label: "Target", kind: "image", source: "input", on: ["target"], draw: drawTarget,
+  target:     { stage: "images", label: "Target", kind: "image", source: "input", on: ["target"], draw: drawTarget,
                 note: `The target image, downscaled to at most ${DEMO_MAX_IMAGE_SIDE} px per side.` },
-  preview:    { label: "Reconstruction + centroids", kind: "image", source: "model", overlay: true, blank: "#0a0a0f",
+  preview:    { stage: "images", label: "Reconstruction + centroids", kind: "image", source: "model", overlay: true, blank: "#0a0a0f",
                 on: ["render"], draw: drawPreview,
                 note: "The trainer's latest render, with site centroids on top (the dots checkbox hides them)." },
-  editor:     { label: "Site editor", kind: "image", source: "model", overlay: true, editor: true, blank: "#0a0a0f",
+  editor:     { stage: "tools", label: "Site editor", kind: "image", source: "model", overlay: true, editor: true, blank: "#0a0a0f",
                 on: ["render", "run"], draw: drawEditor,
                 note: "The latest render with site centroids; once a run has stopped, drag a site to move it or " +
                       "select one and edit its parameters below. Every change re-renders on the GPU with the " +
                       "candidate lists updated for the edited site; the other views follow when you let go." },
-  residual:   { label: "Residual |recon − target|", kind: "image", source: "derived", blank: "#000004",
+  residual:   { stage: "images", label: "Residual |recon − target|", kind: "image", source: "derived", blank: "#000004",
                 on: ["render"], draw: drawResidual,
                 note: "Mean |recon − target| over RGB on a fixed 0–0.25 scale." },
-  errEma:     { label: "Persistent error |EWMA(recon − target)|", kind: "image", source: "train", blank: "#000004",
+  errEma:     { stage: "images", label: "Persistent error |EWMA(recon − target)|", kind: "image", source: "train", blank: "#000004",
                 on: ["render"], draw: drawErrEma,
                 note: "The trainer's per-pixel running average of the signed error (decay = persist decay), as mean " +
                       "|ē| over RGB on the residual card's 0–0.25 scale. Error that keeps its sign stays bright; " +
                       "error that flips averages to dark. With persist weight > 0 this is what weights the loss. " +
                       "Read back from the GPU on each render while the card is shown." },
-  importance: { label: "Importance (Laplacian bands)", kind: "image", source: "derived", on: ["target"], draw: drawImportance,
+  importance: { stage: "images", label: "Importance (Laplacian bands)", kind: "image", source: "derived", on: ["target"], draw: drawImportance,
                 note: `Luma Laplacian band energy, mask · (ε + √Σ β_k L_k²)^γ with β = [${IMPORTANCE.bandWeights.join(", ")}]. ` +
                       "Not used by the optimizer." },
-  siteIds:    { label: "Site IDs", kind: "image", source: "model", blank: "#0a0a0f", on: ["render"],
+  siteIds:    { stage: "images", label: "Site IDs", kind: "image", source: "model", blank: "#0a0a0f", on: ["render"],
                 draw: () => drawGpuView("siteIds", "hashed"),
                 note: "Each pixel's winning site, hashed to a color (extra GPU render pass)." },
-  tau:        { label: "Tau heatmap", kind: "image", source: "model", blank: "#0a0a0f", on: ["render"],
+  tau:        { stage: "images", label: "Tau heatmap", kind: "image", source: "model", blank: "#0a0a0f", on: ["render"],
                 draw: () => drawGpuView("tau", "heatmap"),
                 note: "Per-site tau as a heatmap (extra GPU render pass)." },
-  gradHeat:   { label: "Gradient heatmap", kind: "image", source: "train", blank: "#00204d",
+  gradHeat:   { stage: "images", label: "Gradient heatmap", kind: "image", source: "train", blank: "#00204d",
                 on: ["log", "render"], draw: drawGradHeat, controls: buildGradHeatControls,
                 note: "Each pixel shows the loss gradient of the site with the largest weight there, from the last " +
                       "log tick, in the units Adam sees (summed grad / pixels). Magnitude is √Σ g² over all ten " +
                       "parameters (mixed units, so position tends to dominate); or pick one parameter for its |g|. " +
                       "Color params are the run's color space. Log scale through cividis from the 1st to 99.5th " +
                       "percentile over sites; black = no owner or masked out. Ownership is an extra GPU render pass." },
-  psnr:       { label: "PSNR vs iteration", kind: "plot", source: "train", on: ["log", "run"],
+  psnr:       { stage: "curves", label: "PSNR vs iteration", kind: "plot", source: "train", on: ["log", "run"],
                 draw: drawPsnrPlot, hit: hitPsnr,
-                note: "Masked PSNR the trainer computes at each log tick, with the active site count and each site's LR multiplier (schedule × growth LR decay) on the right axes." },
-  bpp:        { label: "PSNR vs bpp", kind: "plot", source: "derived", on: ["log", "run", "target"],
+                note: "Masked PSNR the trainer computes at each log tick, with the active site count and the LR " +
+                      "multiplier (schedule × LR mult) the trainer applied to every base LR on the right axes. " +
+                      "Dashed: the run's full planned LR schedule." },
+  bpp:        { stage: "rate", label: "PSNR vs bpp", kind: "plot", source: "derived", on: ["log", "run", "target"],
                 draw: drawBppPlot, hit: hitBpp,
                 note: `Grey and orange: the raw rate, active sites × ${BITS_PER_SITE} bits / pixels (an assumption), ` +
                       "at the trainer's PSNR. Green, once a run has stopped: the entropy-coded rate (the Entropy " +
                       "coding card's bitstream) at the PSNR of the decoded sites; the current run shows the codec's " +
                       `whole curve, earlier runs their point at the ${CODEC_REPORT_LOSS} dB budget.` },
-  codec:      { label: "Entropy coding", kind: "plot", source: "derived", on: ["render", "run"],
+  codec:      { stage: "rate", afterRun: true, label: "Entropy coding", kind: "plot", source: "derived", on: ["render", "run"],
                 draw: drawCodec,
                 note: "After a run: the sites coded to a real bitstream (trainer/codec.js), decoded, and " +
                       "re-rendered with candidate lists rebuilt from the decoded sites, as a decoder would. " +
@@ -553,21 +582,17 @@ const VIEWS = {
                       "then adaptive arithmetic coding. Left: one row per PSNR budget spent on quantization " +
                       "(predicted), with the measured loss. Right: where the bits go at the " +
                       `${CODEC_REPORT_LOSS} dB budget (nbr = neighbour prediction, const = constant).` },
-  grad:       { label: "|gradient| vs iteration (log)", kind: "plot", source: "train", on: ["log", "run"],
+  grad:       { stage: "curves", label: "|gradient| vs iteration (log)", kind: "plot", source: "train", on: ["log", "run"],
                 draw: drawGradPlot, hit: hitGrad,
                 note: "Per-parameter-group |gradient| over sites, reported by the trainer at each log tick." },
-  lr:         { label: "LR multiplier vs iteration", kind: "plot", source: "train", on: ["log", "run"],
-                draw: drawLrPlot, hit: hitLr,
-                note: "LR multiplier (schedule × LR mult) the trainer applied to every base " +
-                      "LR at each log tick. Dashed: the run's full planned schedule." },
-  growGain:   { label: "Site gain: predicted vs real", kind: "plot", source: "train", on: ["growth", "run"],
+  growGain:   { stage: "growth", label: "Site gain: predicted vs real", kind: "plot", source: "train", on: ["growth", "run"],
                 draw: drawGrowGainPlot, hit: hitGrowGain,
                 note: "One dot per site added by growth. x: the error it was predicted to remove when placed; y: " +
                       "the error that would come back if it were removed one growth step later, others unchanged " +
                       "(8-bit levels², summed over RGB and pixels). Diagnostic only; growth never uses it. The " +
                       "realized side is biased high: by then the site and its neighbours have adapted to each other. " +
                       "Sites at the bottom edge are worth nothing or harm the fit. Dashed: realized = predicted." },
-  mergeEdges: { label: "Merge edge weights", kind: "plot", source: "train", on: ["merge", "run"],
+  mergeEdges: { stage: "growth", label: "Merge edge weights", kind: "plot", source: "train", on: ["merge", "run"],
                 draw: drawMergeEdgesPlot, hit: hitMergeEdges,
                 note: "Edge weights of the last merge step (mergeCriterion \"neighbor\"). An edge joins two sites " +
                       "that are owner and runner-up in some candidate list. Its weight is the RMS over color, log τ, " +
@@ -575,24 +600,24 @@ const VIEWS = {
                       "group's median over the step's edges, so 1 (dashed) is a typical neighbour; position is left " +
                       "out. Bars: every edge before merging. Orange: the edges merged along, weighed when merged " +
                       "(chained merges reweigh the kept site's edges, so these can sit past the initial bars)." },
-  bandSnr:    { label: "Band SNR vs iteration", kind: "plot", source: "derived", on: ["render", "run"],
+  bandSnr:    { stage: "curves", label: "Band SNR vs iteration", kind: "plot", source: "derived", on: ["render", "run"],
                 draw: drawBandSnrPlot, hit: hitBandSnr,
                 note: "Per luma Laplacian band: 10·log₁₀(Σ L_k(target)² / Σ L_k(recon − target)²), mask-weighted. " +
                       "Recorded on every render, even while this card is hidden." },
-  spectrum:   { label: "Radial power spectrum (luma)", kind: "plot", source: "derived", on: ["render", "target"],
+  spectrum:   { stage: "spectral", label: "Radial power spectrum (luma)", kind: "plot", source: "derived", on: ["render", "target"],
                 draw: drawSpectrumPlot, hit: hitSpectrum,
                 note: "Luma with the mean removed, times a 2D Hann window and the mask, zero-padded FFT; |F|² " +
                       "averaged over log-spaced rings. Dashed line: 1/(2·site spacing), spacing = √(mask area / sites)." },
-  agreement:  { label: "Spectral SNR & FRC", kind: "plot", source: "derived", on: ["render", "target"],
+  agreement:  { stage: "spectral", label: "Spectral SNR & FRC", kind: "plot", source: "derived", on: ["render", "target"],
                 draw: drawAgreementPlot, hit: hitSpectrum,
                 note: "Per frequency ring: spectral SNR = 10·log₁₀(P_target / P_residual), and Fourier ring " +
                       "correlation Σ Re(F_r·F_t*) / √(Σ|F_r|² Σ|F_t|²): 1 = matches, 0 = unrelated." },
-  spectrum2d: { label: "2D power spectrum", kind: "plot", source: "derived", on: ["render", "target"],
+  spectrum2d: { stage: "spectral", label: "2D power spectrum", kind: "plot", source: "derived", on: ["render", "target"],
                 draw: drawSpectrum2d,
                 note: "log₁₀ |F|² with DC at the centre, on one shared scale set by the target; " +
                       "the target tile's axes are fx and fy in cycles/px. " +
                       "Dashed ring: the site-spacing frequency." },
-  siteMI:     { label: "Site parameter mutual information", kind: "plot", source: "derived", on: ["render", "run"],
+  siteMI:     { stage: "sites", label: "Site parameter mutual information", kind: "plot", source: "derived", on: ["render", "run"],
                 draw: drawSiteMI, hit: hitSiteMI,
                 note: `Normalized mutual information I(X;Y) / min(H(X), H(Y)) between site parameters over active ` +
                       `sites: ${MI_BINS} equal-width bins per parameter (1st–99th percentile; θ over [0, π)), ` +
@@ -601,13 +626,13 @@ const VIEWS = {
                       `${NEIGHBOR_K} nearest sites: log distance to the farthest of them, and the main direction φ ` +
                       `and eccentricity (λ1 − λ2) / (λ1 + λ2) of the structure tensor of the unit offsets to them. ` +
                       `Hover a cell for bits.` },
-  siteValues: { label: "Site parameter values", kind: "plot", source: "derived", on: ["render", "run"],
+  siteValues: { stage: "sites", label: "Site parameter values", kind: "plot", source: "derived", on: ["render", "run"],
                 draw: drawSiteValues,
                 note: `Per parameter, how many active sites (y) have each value (x): ${VALUE_BINS} equal-width ` +
                       "bins over the 1st–99th percentile, with values outside counted in the end bins (\"clipped\"). " +
                       `Colors are decoded RGB. θ is the major axis mod π, skipped for near-round sites ` +
                       `(|log_aniso| < ${MI_ROUND_ANISO}, counted as "round"). The histogram layer is left out.` },
-  siteClusters: { label: "Site snap analysis", kind: "plot", source: "derived", on: ["render", "run"],
+  siteClusters: { stage: "sites", afterRun: true, label: "Site snap analysis", kind: "plot", source: "derived", on: ["render", "run"],
                 draw: drawSnapAnalysis,
                 note: "After a run: every site parameter except position (aniso_dir sign-canonicalized) is " +
                       "clustered with k-means, measuring distance by each site's Gauss–Newton diagonal (the " +
@@ -617,7 +642,7 @@ const VIEWS = {
                       "the same if every site shared one value of that parameter (its weighted mean), others " +
                       "unchanged; near 0 means the parameter is slack. Predictions are second order, so they " +
                       "overshoot for large snaps." },
-  sensitivity: { label: "Site sensitivity (Gauss–Newton)", kind: "plot", source: "derived", on: ["render", "run"],
+  sensitivity: { stage: "sites", afterRun: true, label: "Site sensitivity (Gauss–Newton)", kind: "plot", source: "derived", on: ["render", "run"],
                 draw: drawSensitivity,
                 note: "After a run: per parameter group, how many sites (y) have each Gauss–Newton sensitivity " +
                       "(x, log bins): F = Σ over pixels of (∂render/∂θ)², summed over RGB and the group's " +
@@ -625,31 +650,31 @@ const VIEWS = {
                       "error by about F·δ². Units differ per group (pixels for position, log units for τ and " +
                       "anisotropy), so compare sites within a panel, not across panels. Sites with F = 0 (no " +
                       "pixels, or not reachable) are counted in the title." },
-  batchPsnr:  { label: "Batch: PSNR vs iteration", kind: "plot", source: "train", on: ["batch"],
+  batchPsnr:  { stage: "batch", label: "Batch: PSNR vs iteration", kind: "plot", source: "train", on: ["batch"],
                 draw: drawBatchViews, hit: hitBatchPsnr, click: clickBatchRun,
                 note: "Every run of the last batch, from its PSNR log ticks (log every in the Batch menu). Grey: " +
                       "finished; blue: still running; orange: the selected run; green: the mean over runs at each " +
                       "tick, labeled at its start, middle and end. Hover a curve to find its run; once the batch " +
                       "has finished, click it to load the run into the other views." },
-  batchHist:  { label: "Batch: final PSNR", kind: "plot", source: "train", on: ["batch"],
+  batchHist:  { stage: "batch", label: "Batch: final PSNR", kind: "plot", source: "train", on: ["batch"],
                 draw: drawBatchViews, hit: hitBatchHist, click: clickBatchRun,
                 note: "How many runs ended at each PSNR. Each run is one cell, stacked in its bin by PSNR, so " +
                       "hovering picks out a single run; click it to load it once the batch has finished. Final " +
                       "PSNR is measured on the last render, so it can sit below the run's best log tick." },
-  batchDigits: { label: "Batch: PSNR by class", kind: "plot", source: "train", on: ["batch"],
+  batchDigits: { stage: "batch", label: "Batch: PSNR by class", kind: "plot", source: "train", on: ["batch"],
                 draw: drawBatchViews, hit: hitBatchDigits, click: clickBatchRun,
                 note: "Final PSNR of each finished run, grouped by its label (the digit for MNIST, the class for CIFAR-10). Each " +
                       "circle is one run; the box spans the quartiles, the thick line the median and the whiskers " +
                       "1.5× the interquartile range. Drawn once the batch has finished; hover a run to find it " +
                       "in the other batch plots, click to load it." },
-  tune:       { label: "Auto-tune: PSNR vs setting", kind: "plot", source: "train", on: ["tune"],
+  tune:       { stage: "tune", label: "Auto-tune: PSNR vs setting", kind: "plot", source: "train", on: ["tune"],
                 draw: drawTunePlot, hit: hitTune,
                 note: "The setting the last auto-tune climbed (a tune button or optimize all, one setting at a " +
                       "time): one dot per value tried, at the median final PSNR of its batch on the same images. " +
                       "Orange: the best so far; green diamonds: Newton steps (the peak of a parabola through a " +
                       "round's three medians); the dashed line marks where it started. x is log-scaled, since " +
                       "each round multiplies or divides by the step." },
-  clusterMap: { label: `Snap clusters on the image (k = ${SNAP_MAP_K})`, kind: "image", source: "derived",
+  clusterMap: { stage: "sites", afterRun: true, label: `Snap clusters on the image (k = ${SNAP_MAP_K})`, kind: "image", source: "derived",
                 blank: "#f1f1ec", on: ["render"], draw: drawClusterMap,
                 note: "The latest render, washed out, with each site's centroid in its cluster's color from the " +
                       `k = ${SNAP_MAP_K} fit of the Site snap analysis.` },
@@ -659,53 +684,47 @@ const VIEWS = {
 // per cell, "." for an empty cell. Repeat an id to span cells (each view must
 // cover a rectangle). `rows` optionally sizes the rows; the default splits the
 // height evenly. Columns are always equal width.
+// One layout per stage (STAGES); Batch and Run also follow the run mode
+// (followStage).
 const LAYOUTS = {
-  overview: {
-    label: "Overview",
-    areas: `"target preview residual importance psnr bpp"
-            "grad   grad    grad     grad       grad grad"`,
-    rows: "minmax(0, 1fr) 320px",
-  },
-  images: {
-    label: "Images 2×2",
-    areas: `"target   preview importance"
-            "residual errEma  gradHeat"`,
-  },
-  sites: {
-    label: "Sites & tau",
-    areas: `"preview  siteIds    tau"
-            "residual importance psnr"`,
-  },
-  rate: {
-    label: "Rate",
-    areas: `"bpp  bpp     codec codec"
-            "psnr preview codec codec"`,
-  },
-  plots: {
-    label: "Plots",
-    areas: `"psnr bpp      lr"
-            "grad growGain mergeEdges"`,
-  },
-  siteStats: {
-    label: "Site stats",
-    areas: `"siteValues siteMI       sensitivity"
-            "clusterMap siteClusters sensitivity"`,
-  },
-  editor: {
-    label: "Site editor",
-    areas: `"editor target   residual"
-            "editor siteIds  tau"`,
-  },
   batch: {
     label: "Batch",
-    areas: `"batchHist   batchPsnr tune"
-            "batchDigits batchDigits batchDigits"
-            "preview     target    psnr"`,
+    areas: `"batchHist   batchPsnr   tune"
+            "batchDigits batchDigits batchDigits"`,
+  },
+  run: {
+    label: "Run",
+    areas: `"target preview residual"
+            "psnr   psnr    grad"`,
+  },
+  images: {
+    label: "Images",
+    areas: `"target preview residual importance"
+            "errEma gradHeat siteIds  tau"`,
+  },
+  growth: {
+    label: "Growth & merge",
+    areas: `"psnr     psnr"
+            "growGain mergeEdges"`,
   },
   spectral: {
     label: "Spectral",
     areas: `"spectrum  spectrum  spectrum2d spectrum2d"
             "agreement agreement bandSnr    bandSnr"`,
+  },
+  sites: {
+    label: "Site statistics",
+    areas: `"siteValues siteMI       sensitivity"
+            "clusterMap siteClusters sensitivity"`,
+  },
+  rate: {
+    label: "Rate",
+    areas: `"bpp codec"`,
+  },
+  editor: {
+    label: "Site editor",
+    areas: `"editor target   residual"
+            "editor siteIds  tau"`,
   },
 };
 const DEFAULT_LAYOUT = "batch";
@@ -766,6 +785,13 @@ function buildCards(name) {
     badge.className = "source-badge";
     badge.textContent = source.badge;
     label.append(badge, document.createTextNode(view.label));
+    if (view.afterRun) {
+      const after = document.createElement("span");
+      after.className = "after-badge";
+      after.textContent = "after run";
+      after.title = "Computed once a run has stopped";
+      label.append(after);
+    }
     const canvas = document.createElement("canvas");
     if (view.editor) {
       // The image fits a stage above the parameter fields; the overlay takes
@@ -841,6 +867,13 @@ function savedLayout() {
   try { return localStorage.getItem(LAYOUT_STORAGE_KEY) || DEFAULT_LAYOUT; } catch { return DEFAULT_LAYOUT; }
 }
 
+// Batch mode shows the Batch layout, a single run (or a batch run opened in
+// full) the Run layout; only while one of those two is showing, so a layout
+// picked by hand stays.
+function followStage(name) {
+  if (state.layoutName !== name && (state.layoutName === "batch" || state.layoutName === "run")) setLayout(name);
+}
+
 // ---- Layout editing ----
 // Cards keep the size their layout gives them; the grid only grows or shrinks
 // by whole rows / columns at the bottom / right. Dragging a card by its label
@@ -851,6 +884,9 @@ function loadCustomLayout() {
   try {
     const saved = JSON.parse(localStorage.getItem(CUSTOM_STORAGE_KEY));
     if (!saved?.areas) return;
+    // Views that no longer exist (the LR plot, now on PSNR) become empty cells.
+    saved.areas = saved.areas.replace(/"([^"]*)"/g, (_, row) =>
+      `"${row.trim().split(/\s+/).map((id) => (id === "." || VIEWS[id] ? id : ".")).join(" ")}"`);
     parseLayoutAreas(saved.areas);
     LAYOUTS[CUSTOM_LAYOUT] = { label: "Custom", areas: saved.areas, rows: saved.rows };
   } catch {}
@@ -1054,12 +1090,16 @@ function emptyCell(placed, r, c) {
   const select = document.createElement("select");
   select.setAttribute("aria-label", `Add a view at row ${r + 1}, column ${c + 1}`);
   select.add(new Option("+ Add view…", ""));
-  for (const [key, source] of Object.entries(SOURCES)) {
-    const ids = free.filter((id) => VIEWS[id].source === key);
+  for (const [key, label] of Object.entries(STAGES)) {
+    const ids = free.filter((id) => VIEWS[id].stage === key);
     if (!ids.length) continue;
     const group = document.createElement("optgroup");
-    group.label = source.badge;
-    for (const id of ids) group.append(new Option(VIEWS[id].label, id));
+    group.label = label;
+    for (const id of ids) {
+      const view = VIEWS[id];
+      const tags = [SOURCES[view.source].badge, ...(view.afterRun ? ["after run"] : [])];
+      group.append(new Option(`${view.label} (${tags.join(", ")})`, id));
+    }
     select.append(group);
   }
   select.addEventListener("change", () => {
@@ -1551,15 +1591,27 @@ function drawPsnrPlot(view) {
     { label: "LR mult", color: LR_LINE_COLOR },
   ]) + 10;
   const lrData = state.lrHistory;
+  const box = plotBox(p, top, PSNR_PAD);
+  // The run's planned LR schedule, sampled ~1 point per 2 px of plot width.
+  const planned = [];
+  const plan = state.lrPlan;
+  if (plan) {
+    const n = Math.max(2, Math.floor((box.right - box.left) / 2));
+    for (let i = 0; i <= n; i += 1) {
+      const it = Math.round((i / n) * Math.max(0, plan.iters - 1));
+      planned.push([it, plan.lrMult * lrSchedule(it, plan.iters, plan.kind, plan.growDoneIter)]);
+    }
+  }
   let maxLr = 0;
   for (const d of lrData) maxLr = Math.max(maxLr, d.lr);
-  const box = plotBox(p, top, PSNR_PAD);
+  for (const [, v] of planned) maxLr = Math.max(maxLr, v);
   const g = view.geom = plotAxes(box, iterRange(), linRange(lo, hi, [0, 40]));
   const gs = plotAxes(box, g.xr, { min: 0, max: Math.ceil(maxSites * 1.08) });
   const gl = plotAxes(box, g.xr, { min: 0, max: maxLr > 0 ? maxLr * 1.08 : 1 });
   drawAxes(p, g, { xTitle: "iteration", yTitle: "PSNR (dB)", xFmt: fmtIter });
   drawRightAxis(p, gs, { title: "sites" });
   drawRightAxis(p, gl, { title: "LR multiplier", offset: 50, integers: false, fmt: (v) => String(Number(v.toPrecision(3))) });
+  if (planned.length) drawLine(p, gl, planned, LR_LINE_COLOR, { dash: [5, 4], width: 1 });
   if (!data.length) {
     drawEmpty(p, g, state.running ? "Waiting for first log tick…" : "Train to see PSNR");
     return;
@@ -1769,46 +1821,6 @@ function hitGrad(g, mx) {
   return nearestX(g, state.gradHistory, (d) => d.it, mx);
 }
 
-// ---- LR multiplier vs iteration ----
-
-function drawLrPlot(view) {
-  const p = beginPlot(view);
-  if (!p) return;
-  const data = state.lrHistory;
-  const plan = state.lrPlan;
-  const xr = iterRange();
-  // The planned schedule, sampled ~1 point per 2 px of plot width.
-  const planned = [];
-  if (plan) {
-    const n = Math.max(2, Math.floor((p.w - PLOT_PAD.left - PLOT_PAD.right) / 2));
-    for (let i = 0; i <= n; i += 1) {
-      const it = Math.round((i / n) * Math.max(0, plan.iters - 1));
-      planned.push([it, plan.lrMult * lrSchedule(it, plan.iters, plan.kind, plan.growDoneIter)]);
-    }
-  }
-  let hi = 0;
-  for (const [, v] of planned) hi = Math.max(hi, v);
-  for (const d of data) hi = Math.max(hi, d.lr);
-  const yr = { min: 0, max: hi > 0 ? niceTicks(0, hi * 1.08, 4).at(-1) || hi * 1.08 : 1 };
-  if (yr.max < hi) yr.max = hi * 1.08;
-  const g = view.geom = plotAxes(plotBox(p), xr, yr);
-  drawAxes(p, g, { xTitle: "iteration", yTitle: "LR multiplier", xFmt: fmtIter, yFmt: (v) => String(Number(v.toPrecision(3))) });
-  if (planned.length) drawLine(p, g, planned, PSNR_LINE_COLOR, { dash: [5, 4], width: 1.5 });
-  if (!data.length) {
-    drawEmpty(p, g, state.running ? "Waiting for first log tick…" : "Train to see the LR schedule");
-    return;
-  }
-  drawLine(p, g, data.map((d) => [d.it, d.lr]), PSNR_LINE_COLOR);
-  const hover = view.hoverKey != null ? data[view.hoverKey] : null;
-  if (hover) drawCrosshair(p, g, hover.it);
-  const mark = hover || data[data.length - 1];
-  drawMarker(p, g, mark.it, mark.lr, PSNR_LINE_COLOR);
-  if (hover) {
-    drawTooltip(p, g, g.x(hover.it), g.y(hover.lr),
-      { rows: [{ cells: [`iter ${hover.it} · LR ×${hover.lr.toPrecision(3)}`] }] });
-  }
-}
-
 // ---- Auto-tune: median PSNR vs the setting's value ----
 
 const TUNE_DOT_COLOR = SERIES_COLORS[0];
@@ -1956,10 +1968,6 @@ function hitGrowGain(g, mx, my) {
     if (d < bestD) { bestD = d; best = i; }
   });
   return best;
-}
-
-function hitLr(g, mx) {
-  return nearestX(g, state.lrHistory, (d) => d.it, mx);
 }
 
 // ---- Merge edge weights (histogram, log x) ----
@@ -3372,6 +3380,8 @@ async function selectDataset(key) {
   }
   setStatus(prevStatus);
   maybeEnableStart();
+  updateBatchNote();
+  syncBatchFill();
   return true;
 }
 
@@ -3492,7 +3502,8 @@ function maybeEnableStart() {
 }
 
 // Batch is the default on every page load: Train runs the batch directly, and
-// only then does the batch-settings button appear.
+// only then does the batch-settings button appear. The stage layouts follow
+// the mode (followStage).
 function setRunMode(mode) {
   if (state.running) return;
   state.runMode = mode === "single" ? "single" : "batch";
@@ -3502,7 +3513,7 @@ function setRunMode(mode) {
   ui.startBtn.textContent = batch ? "Run batch" : "Train";
   ui.batchBtn.hidden = !batch;
   ui.loopToggle.disabled = batch;
-  if (!batch) ui.batchPopover.classList.add("hidden");
+  followStage(batch ? "batch" : "run");
   maybeEnableStart();
 }
 
@@ -3759,7 +3770,6 @@ function randomBatchItems(from, total, n) {
 // batch was stopped or not every run finished.
 async function runBatch({ items: fixedItems = null, quiet = false } = {}) {
   if (state.running || !state.device) return null;
-  ui.batchPopover.classList.add("hidden");
   let args;
   try {
     args = readFormArgs();
@@ -3880,14 +3890,38 @@ function tuneSettings() {
   return { ratio, decay, minRatio, rounds };
 }
 
-// Float fields, plus integer ones marked data-tune="int" (tuned in whole
-// steps). Optimize all leaves out the integer ones (withInts false): sites is
-// the only one, and more sites almost always raise the PSNR, so it would just
-// spend the bit budget.
-function tunableInputs(withInts = true) {
-  return [...ui.paramsPanel.querySelectorAll('input[type="number"]:not([data-no-tune])')]
-    .filter((el) => (el.getAttribute("step") ?? "").includes(".") || el.hasAttribute("data-float") ||
-                    (withInts && el.dataset.tune === "int"));
+// Optimize all's order, by stage: objective, optimizer, schedule, growth.
+// Explicit so that moving a field in the panel can't reorder the search.
+const TUNE_ORDER = [
+  "p-errWeight", "p-errBeta", "p-errCap",
+  "p-lrMult", "p-lrPosBase", "p-lrTauBase", "p-lrRadiusBase", "p-lrColorBase", "p-lrDirBase", "p-lrAnisoBase",
+  "p-countEnd", "p-sawAmp", "p-sawRatio",
+  "p-growLambda",
+];
+// Tune buttons only, left out of optimize all: more sites almost always raise
+// the PSNR (it would just spend the bit budget), and the init values are
+// starting points the LRs already compensate for. sites (data-tune="int")
+// is tuned in whole steps.
+const TUNE_BUTTON_ONLY = ["p-sites", "p-initLogTau", "p-initRadius"];
+
+function tunableInputs(withButtonOnly = true) {
+  return [...TUNE_ORDER, ...(withButtonOnly ? TUNE_BUTTON_ONLY : [])].map((id) => document.getElementById(id));
+}
+
+// False when a field has no effect with the current settings: the CSS hides
+// it for this count schedule (data-site-mode / data-count-schedule /
+// data-count-range on it or a section around it), or the setting it
+// modulates is 0 (data-needs, e.g. persist decay without persist weight).
+function fieldActive(input) {
+  const panel = ui.paramsPanel.dataset;
+  const mode = input.closest("[data-site-mode]")?.dataset.siteMode;
+  if (mode && mode !== panel.siteMode) return false;
+  const schedule = input.closest("[data-count-schedule]")?.dataset.countSchedule;
+  if (schedule && schedule !== panel.countSchedule) return false;
+  if (input.closest("[data-count-range]") && panel.countSchedule === "constant") return false;
+  const needs = input.closest("[data-needs]")?.dataset.needs;
+  if (needs && !(Number(document.getElementById(needs).value) > 0)) return false;
+  return true;
 }
 
 function setupAutoTune() {
@@ -4021,6 +4055,7 @@ async function optimizeAll(btn) {
       return;
     }
     const inputs = tunableInputs(false);
+    const skipped = inputs.filter((el) => !fieldActive(el)).map(tuneName);
     const steps = new Map(); // each setting's step, kept between cycles so later ones search finer
     state.tune.progress = { units: 1 + cycles * inputs.length, done: -1 };
     nextTuneUnit(true);
@@ -4029,13 +4064,16 @@ async function optimizeAll(btn) {
     if (!base || stopped) return;
     const items = base.items;
     baseline = current = base.median;
-    appendLog(`Optimize all: ${inputs.length} settings × ${cycles} cycle(s), baseline median ` +
-              `${baseline.toFixed(3)} dB (${items.length} images)`);
+    appendLog(`Optimize all: ${inputs.length - skipped.length} settings × ${cycles} cycle(s), baseline median ` +
+              `${baseline.toFixed(3)} dB (${items.length} images)` +
+              (skipped.length ? `; no effect with these settings, skipped: ${skipped.join(", ")}` : ""));
     for (let cycle = 1; cycle <= cycles; cycle += 1) {
       for (const [i, input] of inputs.entries()) {
         nextTuneUnit();
         const name = tuneName(input);
         const start = Number(input.value);
+        // Checked per setting: an earlier one (persist weight) can switch it on.
+        if (!fieldActive(input)) continue;
         if (!Number.isFinite(start) || start === 0) {
           appendLog(`Optimize all: skipping ${name} (needs a non-zero value to scale).`);
           continue;
@@ -4103,6 +4141,10 @@ async function autoTune(input, btn) {
       tune = tuneSettings();
     } catch (err) {
       appendLog(`Auto-tune ${name}: ${err.message}.`);
+      return;
+    }
+    if (!fieldActive(input)) {
+      appendLog(`Auto-tune ${name}: has no effect with the current settings.`);
       return;
     }
     if (!Number.isFinite(best) || best === 0) {
@@ -4378,7 +4420,14 @@ function clickBatchRun(id) {
     setStatus("Runs can be opened once the batch has finished");
     return;
   }
-  selectBatchRun(id);
+  pickBatchRun(id);
+}
+
+// A run the user picked (click, the run list, ‹ ›): load it and show the Run
+// stage, where its live-run views are.
+async function pickBatchRun(id) {
+  await selectBatchRun(id);
+  if (state.batch?.selected === id) followStage("run");
 }
 
 // Loads a finished run: its target, its log-tick histories, and a viewer-only
@@ -4509,7 +4558,7 @@ function stepBatchRun(delta) {
   if (!done.length) return;
   const i = done.findIndex((r) => r.id === state.batch.selected);
   const j = i < 0 ? 0 : (i + delta + done.length) % done.length;
-  selectBatchRun(done[j].id);
+  pickBatchRun(done[j].id);
 }
 
 // Re-trains the selected run's image with the form's settings and every view
@@ -4523,6 +4572,7 @@ function rerunBatchRun() {
   const changed = args && Object.keys(b.args).filter((k) => k !== "logFreq" && k !== "viewerFreq" &&
     JSON.stringify(args[k]) !== JSON.stringify(b.args[k]));
   if (changed?.length) appendLog(`Re-run uses the form's settings, which differ from the batch's in: ${changed.join(", ")}.`);
+  followStage("run");
   startTraining();
 }
 
@@ -4591,10 +4641,13 @@ function updateBatchNote() {
       : "The site count changes, so each image gets its own trainer.");
 }
 
-function toggleBatchMenu() {
+// The batch settings live in the Advanced panel (Batch section); the top
+// bar's button opens the panel there.
+function openBatchSettings() {
+  if (ui.paramsPanel.classList.contains("hidden")) toggleParams();
   syncBatchFill();
   updateBatchNote();
-  ui.batchPopover.classList.toggle("hidden");
+  document.getElementById("batchSection").scrollIntoView({ block: "start", behavior: "smooth" });
 }
 
 // ---- Batch plots ----
@@ -5581,6 +5634,7 @@ async function main() {
     document.getElementById(id).addEventListener("change", syncSiteFields);
   }
   ui.paramsPanel.addEventListener("input", updatePlanSummary);
+  ui.paramsPanel.addEventListener("change", updateBatchNote);
   ui.startBtn.addEventListener("click", () => {
     if (state.runMode === "batch") runBatch();
     else startTraining();
@@ -5592,15 +5646,14 @@ async function main() {
   ui.saveBtn.addEventListener("click", toggleSaveMenu);
   ui.savePng.addEventListener("click", exportPng);
   ui.saveTxt.addEventListener("click", exportSites);
-  ui.batchBtn.addEventListener("click", toggleBatchMenu);
-  ui.batchRunBtn.addEventListener("click", () => runBatch());
+  ui.batchBtn.addEventListener("click", openBatchSettings);
   setupAutoTune();
   ui.batchFill.addEventListener("change", syncBatchFill);
   ui.batchTiled.addEventListener("change", syncBatchFill);
   ui.batchFrom.addEventListener("change", syncBatchFill);
   ui.batchRandom.addEventListener("change", updateBatchNote);
   ui.batchRunSelect.addEventListener("change", () => {
-    if (ui.batchRunSelect.value) selectBatchRun(Number(ui.batchRunSelect.value));
+    if (ui.batchRunSelect.value) pickBatchRun(Number(ui.batchRunSelect.value));
   });
   ui.batchPrev.addEventListener("click", () => stepBatchRun(1));
   ui.batchNext.addEventListener("click", () => stepBatchRun(-1));
@@ -5611,9 +5664,6 @@ async function main() {
   document.addEventListener("click", (ev) => {
     if (!ui.savePopover.contains(ev.target) && ev.target !== ui.saveBtn) {
       ui.savePopover.classList.add("hidden");
-    }
-    if (!ui.batchPopover.contains(ev.target) && ev.target !== ui.batchBtn) {
-      ui.batchPopover.classList.add("hidden");
     }
   });
   ui.layoutSelect.addEventListener("change", () => setLayout(ui.layoutSelect.value));

@@ -25,7 +25,6 @@
     "growLambda": 0,
     "candFreq": 8,
     "candInjectCount": 4,
-    "logFreq": 5,
     "layer": "learn",
     "errWeight": 0.05625,
     "errBeta": 0.95,

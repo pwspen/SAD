@@ -158,19 +158,6 @@
       }
       .save-opt:hover { background: var(--accent-soft); }
 
-      .batch-popover { min-width: 220px; padding: 10px; gap: 6px; }
-      .batch-field { display: flex; justify-content: space-between; align-items: center; gap: 10px; font-size: 12px; color: var(--text-dim); }
-      .batch-field input {
-        width: 76px;
-        font: inherit;
-        font-size: 12px;
-        padding: 4px 6px;
-        border: 1px solid var(--line);
-        border-radius: 6px;
-        text-align: right;
-        font-variant-numeric: tabular-nums;
-      }
-      .batch-note { margin: 2px 0; font-size: 11px; line-height: 1.4; color: var(--text-soft); }
 
       .batch-bar {
         flex: none;
@@ -324,11 +311,30 @@
       }
       .plan-summary b { color: var(--text); font-weight: 600; }
       .plan-summary .warn { color: #b4471a; }
-      #paramsPanel[data-site-mode="fixed"] .param[data-site-mode="grow"],
-      #paramsPanel[data-site-mode="grow"] .param[data-site-mode="fixed"],
-      #paramsPanel:not([data-count-schedule="sawtooth"]) .param[data-count-schedule="sawtooth"],
-      #paramsPanel:not([data-count-schedule="constant"]) .param[data-count-schedule="constant"],
-      #paramsPanel[data-count-schedule="constant"] .param[data-count-range] { display: none; }
+      /* Fields (and whole sections) that do nothing with the current count
+         schedule; train.js fieldActive() mirrors these for tuning. */
+      #paramsPanel[data-site-mode="fixed"] [data-site-mode="grow"],
+      #paramsPanel[data-site-mode="grow"] [data-site-mode="fixed"],
+      #paramsPanel:not([data-count-schedule="sawtooth"]) [data-count-schedule="sawtooth"],
+      #paramsPanel:not([data-count-schedule="constant"]) [data-count-schedule="constant"],
+      #paramsPanel[data-count-schedule="constant"] [data-count-range] { display: none; }
+      /* Top-level groups: Training / Batch / Instrumentation / Tuning. */
+      .group-head {
+        display: flex;
+        flex-direction: column;
+        gap: 1px;
+        margin: 22px -16px 4px;
+        padding: 8px 16px 6px;
+        border-top: 1px solid var(--line);
+        font-size: 12px;
+        font-weight: 600;
+        color: var(--text);
+      }
+      .group-tag { font-size: 10.5px; font-weight: 400; color: var(--text-soft); }
+      .panel details > summary { list-style: none; cursor: pointer; }
+      .panel details > summary::-webkit-details-marker { display: none; }
+      .panel details > summary h3::before { content: "▸ "; letter-spacing: 0; }
+      .panel details[open] > summary h3::before { content: "▾ "; }
       .row input:disabled, .row input[readonly] { color: var(--text-soft); background: var(--panel-soft); }
       .panel h3.has-tip::after { content: " ⓘ"; letter-spacing: 0; }
       .tip {
@@ -694,6 +700,18 @@
       [data-source="train"] .source-badge { color: #1c5cab; }
       [data-source="input"] .source-badge { color: var(--text-dim); }
       [data-source="derived"] .source-badge { color: var(--text-dim); border-style: dashed; }
+      /* Views computed only once a run has stopped (VIEWS[id].afterRun). */
+      .after-badge {
+        font-size: 9px;
+        letter-spacing: 0.08em;
+        line-height: 1;
+        padding: 2px 5px;
+        border-radius: 3px;
+        color: #8a5a00;
+        background: #fff4dc;
+        white-space: nowrap;
+        flex: none;
+      }
 
       .footer {
         flex: none;
@@ -786,21 +804,7 @@
       </label>
       <button class="btn" id="stopBtn" disabled>Stop</button>
 
-      <div class="save-menu">
-        <button class="btn" id="batchBtn" disabled title="Batch range, snapshots and atlas settings">Batch settings</button>
-        <div class="save-popover batch-popover hidden" id="batchPopover">
-          <div class="batch-field"><label for="batchFrom">first image</label><input id="batchFrom" type="number" min="0" value="0" /></div>
-          <div class="batch-field"><label for="batchCount">images</label><input id="batchCount" type="number" min="1" value="500" /></div>
-          <div class="batch-field" title="Draw a fresh random sample each batch, from the first image to the end of the dataset."><label for="batchRandom">random</label><input id="batchRandom" type="checkbox" checked /></div>
-          <div class="batch-field" title="Take as many images (from the first one) as one atlas holds: the GPU's texture-size limit and a pixel budget that keeps its buffers near half a gigabyte, e.g. about 5,300 MNIST digits or 10 Kodak images. Needs one atlas (a fixed site count)."><label for="batchFill">fill GPU</label><input id="batchFill" type="checkbox" /></div>
-          <div class="batch-field" title="Trainers running at once on the GPU. Measured on an M-series Mac: Measured on this Mac (Dawn, 1000 iterations): MNIST throughput levels off at about 8 (≈7× one at a time), Kodak at 2 (≈1.2×)."><label for="batchJobs">at once</label><input id="batchJobs" type="number" min="1" value="8" /></div>
-          <div class="batch-field" title="Iterations between PSNR log ticks (each one reads the render back). Overrides refresh every for batch runs."><label for="batchLogFreq">log every</label><input id="batchLogFreq" type="number" min="1" value="25" /></div>
-          <div class="batch-field" title="Site snapshots kept per run, evenly spaced, plus the final sites. Selecting a run lets you scrub through them."><label for="batchSnaps">snapshots</label><input id="batchSnaps" type="number" min="1" value="20" /></div>
-          <div class="batch-field" title="Train every image of one size in a single run, one tile per image of a shared atlas: a dispatch covers them all. Needs a fixed site count (start sites = end sites, not sawtooth, no turnover); otherwise each image gets its own trainer. On MNIST about 10× faster than 8 separate trainers at the same PSNR; Kodak-sized images gain nothing."><label for="batchTiled">one atlas</label><input id="batchTiled" type="checkbox" checked /></div>
-          <p class="batch-note" id="batchNote"></p>
-          <button class="btn btn-primary" id="batchRunBtn">Run batch</button>
-        </div>
-      </div>
+      <button class="btn" id="batchBtn" disabled title="Open the batch range, snapshots and atlas settings (in Advanced → Batch)">Batch settings</button>
 
       <div class="spacer"></div>
 
@@ -819,7 +823,67 @@
 
     <div class="main">
       <aside class="panel hidden" id="paramsPanel">
-        <h3 class="has-tip" tabindex="0">Site count<span class="tip" role="tooltip">The only settings that decide how many sites the run uses. The count goes from <b>start sites</b> at iteration 0 to <b>end sites</b> by <b>reach end by</b>, on the chosen curve, then holds while the rest of the run refines. Start &lt; end grows by splitting the cells a second site would explain best; start &gt; end prunes, merging the cheapest neighbouring pairs into one site (the pixel-weighted average of both); start = end is a fixed count, as is the <b>constant</b> schedule's single <b>sites</b> field. Each site costs 128 bits: bpp = sites × 128 / (width × height).</span></h3>
+        <!-- Ordered by what a setting changes: A training (what is learned,
+             saved in presets), B batch (which images, how they run),
+             C instrumentation (nothing about the result), D tuning (searches
+             A, evaluated on B). Optimize all uses TUNE_ORDER in train.js, not
+             this order. -->
+        <h3>Preset</h3>
+        <div class="param">
+          <div class="row"><label>preset</label><select id="presetSelect" aria-label="Settings preset"></select></div>
+          <div class="tip" role="tooltip" id="presetNote"></div>
+        </div>
+        <div class="param">
+          <div class="row">
+            <label></label>
+            <div class="file-inline">
+              <button class="file-btn" id="saveDefaultsBtn">Save as defaults</button>
+              <button class="file-btn" id="resetDefaultsBtn" hidden>Reset</button>
+            </div>
+          </div>
+          <div class="tip" role="tooltip">Saves every <b>Training</b> field (and the preset's settings that have no field) in this browser as the <b>defaults</b> preset. Batch, instrumentation and tuning settings aren't part of a preset. <b>Reset</b> goes back to training_config.json and the trainer's built-in defaults.</div>
+        </div>
+
+        <div class="group-head"><span>Training</span><span class="group-tag">changes what is learned · saved in presets</span></div>
+
+        <h3>Start state</h3>
+        <div class="param">
+          <div class="row">
+            <label>mask</label>
+            <div class="file-inline">
+              <label class="file-btn"><input id="maskInput" type="file" accept="image/*" />Load</label>
+              <span class="file-name" id="maskLabel">none</span>
+            </div>
+          </div>
+          <div class="tip" role="tooltip">Pixels that aren't pure black count toward the loss and PSNR. Black pixels are ignored by sites, growth and the score. Single runs only: batches train without it.</div>
+        </div>
+        <div class="param">
+          <div class="row">
+            <label>init sites</label>
+            <div class="file-inline">
+              <label class="file-btn"><input id="initSitesInput" type="file" accept=".txt" />Load</label>
+              <button class="file-btn" id="initSitesClear" hidden>Clear</button>
+              <span class="file-name" id="initLabel">gradient init</span>
+            </div>
+          </div>
+          <div class="tip" role="tooltip">Start from these sites instead of the default placement (sites sampled where the image has edges). Positions are rescaled to the target size and every site's τ is reset to <b>init log τ</b>. Its site count becomes the starting count: it replaces <b>start sites</b>, which is locked to show it until the file is cleared. Single runs only.</div>
+        </div>
+        <div class="param">
+          <div class="row"><label>init log τ</label><input id="p-initLogTau" type="number" step="0.1" /></div>
+          <p class="help"><span class="unit">natural log of τ at iteration 0, every site</span></p>
+          <div class="tip" role="tooltip">Starting edge sharpness. τ is measured per image long side: a site's edge blends over roughly (long side ÷ τ) px, so log τ = 5 (τ ≈ 148) on a 768 px image ≈ 5 px edges. Also applied to a loaded init sites file.</div>
+        </div>
+        <div class="param">
+          <div class="row"><label>init radius</label><input id="p-initRadius" type="number" step="0.5" /></div>
+          <p class="help"><span class="unit">radius offset at iteration 0, pixels</span></p>
+          <div class="tip" role="tooltip">Every gradient-init site starts with this radius offset. Only differences between neighbouring sites matter, so this mostly sets where the radius LR starts from (and how sites compare with the histogram layer).</div>
+        </div>
+        <div class="param">
+          <div class="row"><label>layer</label><select id="p-layer" aria-label="Histogram layer"></select></div>
+          <div class="tip" role="tooltip"><b>learned depth</b>: the peak of the image's smoothed color histogram (MNIST's black) becomes a flat layer behind every site, a site with a constant logit β that every pixel blends. A site wins wherever its own logit beats β, and the layer's color shows everywhere else, so no sites are spent drawing it. β is learned, starting from how common that color is: on MNIST the layer comes forward and takes the background (+3 dB at 32 sites); on Kodak it stays mostly behind (−0.1 dB). It never splits or merges, counts as one of the sites, and is an ordinary site in the saved file.</div>
+        </div>
+
+        <h3 class="has-tip" tabindex="0">Budget<span class="tip" role="tooltip">How many sites the run uses. With the <b>constant</b> count schedule (under <b>Schedule</b>) that is <b>sites</b> throughout. Otherwise the count goes from <b>start sites</b> at iteration 0 to <b>end sites</b> by <b>reach end by</b>, then holds while the rest of the run refines. Start &lt; end grows by splitting the cells a second site would explain best; start &gt; end prunes, merging the cheapest neighbouring pairs into one site (the pixel-weighted average of both); start = end is a fixed count. Each site costs 128 bits: bpp = sites × 128 / (width × height).</span></h3>
         <div class="param">
           <div class="row"><label for="p-fromBpp">from bpp</label><input id="p-fromBpp" type="checkbox" /><input id="p-bpp" data-no-tune type="number" min="0" step="0.01" aria-label="Target bits per pixel" disabled /></div>
           <p class="help"><span class="unit" id="bppSitesNote">set the count from a target bpp</span></p>
@@ -840,173 +904,37 @@
           <p class="help"><span class="unit">sites once the schedule is done</span></p>
           <div class="tip" role="tooltip">Where the count ends up. Below <b>start sites</b> the run prunes: each step merges the cheapest neighbouring pairs (the least squared error added with the merged cell at its mean color), each site in at most one merge per step. On Kodak at 256 px, 1600 → 400 beat a fixed 400 (28.8 vs 28.1 dB); on MNIST 128 → 16 was still behind a fixed 16.</div>
         </div>
-        <div class="param">
-          <div class="row"><label>schedule</label><select id="p-countSchedule" aria-label="Site count schedule"></select></div>
-          <div class="tip" role="tooltip">The curve from start to end. <b>constant</b> (the default): one count, <b>sites</b>, for the whole run. <b>linear</b>: the same number of sites per step. <b>exponential</b>: the same factor per step, so few sites change early and many late when growing (the other way round when pruning). <b>sawtooth</b>: the exponential curve with teeth on top: each tooth grows above it by <b>amplitude</b>, then merges back down to it. Tuned and checked on held-out images, sawtooth beat the best exponential by about 0.8 dB on MNIST and 0.6 dB on Kodak at 256 px (the presets use it). Teeth shorter than a few steps can't go down: the summary warns when a sawtooth never merges.</div>
-        </div>
-        <div class="param" data-site-mode="grow">
-          <div class="row"><label>reach end by</label><input id="p-countEnd" type="number" step="0.05" min="0" max="1" /></div>
-          <p class="help"><span class="unit">fraction of the run (0–1)</span></p>
-          <div class="tip" role="tooltip">The count reaches <b>end sites</b> at this fraction of the iterations (a step merges at most half the sites, so a big sawtooth may take a few more steps to get back down); the rest of the run refines that set (with <b>decay after growth</b>, the LR cools down from here). Slow ramps take many small steps, and <b>LR decay</b> compounds per growth step.</div>
-        </div>
-        <div class="param" data-count-schedule="sawtooth">
-          <div class="row"><label>teeth</label><input id="p-sawTeeth" type="number" min="0" step="1" /></div>
-          <p class="help"><span class="unit">teeth before the count reaches the end</span></p>
-          <div class="tip" role="tooltip">Frequency: how many grow-then-merge cycles fit between iteration 0 and <b>reach end by</b>.</div>
-        </div>
-        <div class="param" data-count-schedule="sawtooth">
-          <div class="row"><label>amplitude</label><input id="p-sawAmp" type="number" min="0" step="0.1" /></div>
-          <p class="help"><span class="unit">peak above the curve, as a fraction of it</span></p>
-          <div class="tip" role="tooltip">Each tooth peaks at (1 + this) × the exponential curve's count at that point, e.g. 0.5 = 50% more sites, then merges back down to the curve.</div>
-        </div>
-        <div class="param" data-count-schedule="sawtooth">
-          <div class="row"><label>grow : merge</label><input id="p-sawRatio" type="number" min="0.01" step="0.5" /></div>
-          <p class="help"><span class="unit">time growing per unit of time merging, within a tooth</span></p>
-          <div class="tip" role="tooltip">3 = each tooth spends 3/4 of its time growing up to the peak and 1/4 merging back down.</div>
-        </div>
-        <div class="param" data-site-mode="grow">
-          <div class="row"><label>step every</label><input id="p-growEvery" type="number" min="1" /></div>
-          <p class="help"><span class="unit">iterations between count steps</span></p>
-          <div class="tip" role="tooltip">Time for each batch to settle before the next is placed. Too short and the next step still sees the old error where the last batch landed. Growth finishes after (number of steps) × this, e.g. 1 → 64 with factor 2 and 25 takes 6 steps, done at iteration 150.</div>
-        </div>
-        <h3>Preset</h3>
-        <div class="param">
-          <div class="row"><label>preset</label><select id="presetSelect" aria-label="Settings preset"></select></div>
-          <div class="tip" role="tooltip" id="presetNote"></div>
-        </div>
-        <div class="param">
-          <div class="row">
-            <label></label>
-            <div class="file-inline">
-              <button class="file-btn" id="saveDefaultsBtn">Save as defaults</button>
-              <button class="file-btn" id="resetDefaultsBtn" hidden>Reset</button>
-            </div>
-          </div>
-          <div class="tip" role="tooltip">Saves every field above (and the preset's settings that have no field) in this browser as the <b>defaults</b> preset. <b>Reset</b> goes back to training_config.json and the trainer's built-in defaults.</div>
-        </div>
 
-        <h3>Input</h3>
+        <h3>Objective</h3>
         <div class="param">
-          <div class="row">
-            <label>mask</label>
-            <div class="file-inline">
-              <label class="file-btn"><input id="maskInput" type="file" accept="image/*" />Load</label>
-              <span class="file-name" id="maskLabel">none</span>
-            </div>
-          </div>
-          <div class="tip" role="tooltip">Pixels that aren't pure black count toward the loss and PSNR. Black pixels are ignored by sites, growth and the score.</div>
+          <div class="row"><label>loss</label><select id="p-loss" aria-label="Training loss"></select></div>
+          <div class="tip" role="tooltip">What training minimizes, per color channel. <b>L2</b> (squared error): each site's color is the mean of the pixels it covers, so a cell straddling black and white goes grey. <b>L1</b> (absolute error): the median instead, so a mostly-white cell goes white and the boundaries are pushed onto the edges. PSNR, growth and λ use squared error either way, so L1 runs score a little lower.</div>
         </div>
         <div class="param">
-          <div class="row">
-            <label>init sites</label>
-            <div class="file-inline">
-              <label class="file-btn"><input id="initSitesInput" type="file" accept=".txt" />Load</label>
-              <button class="file-btn" id="initSitesClear" hidden>Clear</button>
-              <span class="file-name" id="initLabel">gradient init</span>
-            </div>
-          </div>
-          <div class="tip" role="tooltip">Start from these sites instead of the default placement (sites sampled where the image has edges). Positions are rescaled to the target size and every site's τ is reset. Its site count becomes the starting count: it replaces <b>start sites</b>, which is locked to show it until the file is cleared.</div>
-        </div>
-
-
-        <h3 class="has-tip" tabindex="0">Schedule<span class="tip" role="tooltip">Everything that decides when things happen in a run: how long it is, how the learning rate moves, and (in grow mode) when sites are added and when growth stops. The summary below is worked out from these fields as you edit them; after a run it also says when and why growth actually ended.</span></h3>
-        <div class="plan-summary" id="planSummary"></div>
-        <div class="param">
-          <div class="row"><label>iterations</label><input id="p-iters" type="number" min="1" /></div>
-          <p class="help"><span class="unit">iterations</span></p>
-          <div class="tip" role="tooltip">Run length. There is no learning-rate warmup: every rate starts at full (in tests a 200-iteration warmup was within ±0.2 dB).</div>
-        </div>
-        <div class="param">
-          <div class="row"><label>schedule</label><select id="p-lrSchedule" aria-label="LR schedule"></select></div>
-          <div class="tip" role="tooltip">How the learning rate changes over the run. <b>cosine</b>: falls from full to 0 on a cosine over the run. <b>fixed</b>: stays at full. <b>decay after growth</b>: stays at full while sites are being added, then falls to 0 on a cosine by the end of the run, so late sites aren't starved and the finished set still gets a cool-down (with fixed site count it equals cosine). The cool-down matters: without it MNIST lost 1–1.5 dB.</div>
-        </div>
-        <div class="param" data-site-mode="grow">
-          <div class="row"><label>λ (stop)</label><input id="p-growLambda" data-float type="number" step="10" min="0" /></div>
-          <p class="help"><span class="unit">error per bit: 8-bit levels² (summed over R, G, B and pixels)</span></p>
-          <div class="tip" role="tooltip">Only cells whose split would remove more than λ × 128 levels² of error (a site costs 128 bits) are split; a step adds fewer sites if fewer qualify, and growth ends early once none do. Example: λ = 400 → 51,200 levels², e.g. 100 pixels each off by about 13 levels in all three channels. Higher λ stops sooner. 0 = never stop early (any site that helps at all qualifies). The log says which limit ended growth.</div>
-        </div>
-
-
-        <div class="param">
-          <div class="row"><label>layer</label><select id="p-layer" aria-label="Histogram layer"></select></div>
-          <div class="tip" role="tooltip"><b>learned depth</b>: the peak of the image's smoothed color histogram (MNIST's black) becomes a flat layer behind every site, a site with a constant logit β that every pixel blends. A site wins wherever its own logit beats β, and the layer's color shows everywhere else, so no sites are spent drawing it. β is learned, starting from how common that color is: on MNIST the layer comes forward and takes the background (+3 dB at 32 sites); on Kodak it stays mostly behind (−0.1 dB). It never splits or merges, counts as one of the sites, and is an ordinary site in the saved file.</div>
-        </div>
-
-        <h3>Logging</h3>
-        <div class="param">
-          <div class="row"><label>refresh every</label><input id="p-logFreq" type="number" /></div>
-          <p class="help"><span class="unit">iterations between refreshes</span></p>
-          <div class="tip" role="tooltip">How often training pauses to read back the render and update PSNR, gradient stats, the plots, the preview images and the site overlay. Smaller = finer curves and a livelier view, slower runs. Doesn't change what is learned.</div>
-        </div>
-
-        <h3 class="has-tip" tabindex="0">Candidates<span class="tip" role="tooltip">Each pixel blends only its 8 best-scoring sites, kept in a per-pixel candidate list. These settings control how the lists are searched as sites move: better search means more accurate renders and gradients, at more cost per iteration. "Pass" below = one search sweep over every candidate pixel.</span></h3>
-        <div class="param">
-          <div class="row"><label>freq</label><input id="p-candFreq" type="number" /></div>
-          <p class="help"><span class="unit">iterations between list refreshes</span></p>
-          <div class="tip" role="tooltip">1 = refresh every iteration (most accurate); larger is faster, but lists go stale as sites move.</div>
-        </div>
-        <div class="param">
-          <div class="row"><label>passes</label><input id="p-candUpdatePasses" type="number" /></div>
-          <p class="help"><span class="unit">passes per refresh</span></p>
-          <div class="tip" role="tooltip">Each pass merges in neighbouring pixels' lists; the first passes of a run reach far (jump flooding), later ones only adjacent pixels.</div>
-        </div>
-        <div class="param">
-          <div class="row"><label>downscale</label><input id="p-candDownscale" type="number" /></div>
-          <p class="help"><span class="unit">image pixels per candidate cell, per side (integer)</span></p>
-          <div class="tip" role="tooltip">2 = one shared list per 2×2 pixels. Faster and lighter, but sites smaller than a cell can be missed. 1 = one list per pixel.</div>
-        </div>
-        <div class="param">
-          <div class="row"><label>radius scale</label><input id="p-candRadiusScale" type="number" step="1" /></div>
-          <p class="help"><span class="unit">candidate cells per 1024 cells of grid width</span></p>
-          <div class="tip" role="tooltip">Distance of the radius probes below; scales with the grid, e.g. 64 → 48 cells on a 768-wide grid.</div>
-        </div>
-        <div class="param">
-          <div class="row"><label>radius probes</label><input id="p-candRadiusProbes" type="number" /></div>
-          <p class="help"><span class="unit">probes per pixel per pass</span></p>
-          <div class="tip" role="tooltip">Also merge the lists of this many cells in random directions at the distance above, so large sites reach far pixels. 0 = off.</div>
-        </div>
-        <div class="param">
-          <div class="row"><label>inject count</label><input id="p-candInjectCount" type="number" /></div>
-          <p class="help"><span class="unit">random sites per pixel per pass</span></p>
-          <div class="tip" role="tooltip">Also try this many sites picked at random from all sites: a global safety net so no site stays undiscovered.</div>
-        </div>
-
-        <h3>Color</h3>
-        <div class="param">
-          <div class="row"><label>space</label><select id="p-colorSpace" aria-label="Site color space"></select></div>
+          <div class="row"><label>color space</label><select id="p-colorSpace" aria-label="Site color space"></select></div>
           <div class="tip" role="tooltip">What a site's three color numbers mean while optimizing. <b>RGB</b>: red, green, blue on 0–1 (1 = 255 levels). <b>Log intensity + chroma</b>: mean natural-log brightness, then log(R/G) and log(B/G), so a pure brightness change moves one number. Blending, the loss and saved files are always RGB.</div>
         </div>
         <div class="param">
           <div class="row"><label>Adam scale</label><select id="p-colorMoment" aria-label="Adam second moment for the color"></select></div>
           <div class="tip" role="tooltip">How Adam sizes the color steps. <b>Per param</b>: each of the three color numbers is scaled by its own gradient history, so a number whose gradient is only rounding noise (the chroma of a grey image) still takes full-size steps and drifts. <b>Shared</b>: one scale for all three (as for position), so each number moves in proportion to its share of the color gradient.</div>
         </div>
-
-        <h3>Loss</h3>
-        <div class="param">
-          <div class="row"><label>loss</label><select id="p-loss" aria-label="Training loss"></select></div>
-          <div class="tip" role="tooltip">What training minimizes, per color channel. <b>L2</b> (squared error): each site's color is the mean of the pixels it covers, so a cell straddling black and white goes grey. <b>L1</b> (absolute error): the median instead, so a mostly-white cell goes white and the boundaries are pushed onto the edges. PSNR, growth and λ use squared error either way, so L1 runs score a little lower.</div>
-        </div>
         <div class="param">
           <div class="row"><label>persist weight</label><input id="p-errWeight" type="number" step="0.5" min="0" /></div>
           <p class="help"><span class="unit">α (0 = off)</span></p>
           <div class="tip" role="tooltip">Pulls harder on error that stays put. Every pixel keeps a running average of its signed error; where the error keeps the same sign iteration after iteration, the average stays large, and where it flips (noise, a boundary sweeping past) it cancels. Each pixel's loss is multiplied by (1 + α · its average error² over the image mean, capped) / (1 + α), so the mean weight stays near 1 and pixels with persistent error count up to (1 + α · cap) / (1 + α) times more. Costs one extra read and write per pixel per iteration.</div>
         </div>
-        <div class="param">
+        <div class="param" data-needs="p-errWeight">
           <div class="row"><label>persist decay</label><input id="p-errBeta" type="number" step="0.01" min="0" max="0.9999" /></div>
           <p class="help"><span class="unit">β per iteration (memory ≈ 1 / (1 − β) iterations)</span></p>
-          <div class="tip" role="tooltip">How long the running average remembers: 0.95 ≈ the last 20 iterations. Longer memory picks out only error that has stayed for a long time, but reacts later once it's fixed.</div>
+          <div class="tip" role="tooltip">How long the running average remembers: 0.95 ≈ the last 20 iterations. Longer memory picks out only error that has stayed for a long time, but reacts later once it's fixed. No effect while persist weight is 0.</div>
         </div>
-        <div class="param">
+        <div class="param" data-needs="p-errWeight">
           <div class="row"><label>persist cap</label><input id="p-errCap" data-float type="number" step="1" min="1" /></div>
           <p class="help"><span class="unit">× the mean</span></p>
-          <div class="tip" role="tooltip">Largest average error that counts, as a multiple of the image mean. Keeps error that no site can remove (fine texture) from taking the whole loss.</div>
-        </div>
-        <div class="param" data-site-mode="grow">
-          <div class="row"><label>persist growth</label><input id="p-errGrowth" type="checkbox" /></div>
-          <div class="tip" role="tooltip">Growth weighs each pixel by the same weight when picking cells to split and placing the new site, so splits go where the error has persisted. λ then compares against weighted error. Needs persist weight &gt; 0.</div>
+          <div class="tip" role="tooltip">Largest average error that counts, as a multiple of the image mean. Keeps error that no site can remove (fine texture) from taking the whole loss. No effect while persist weight is 0.</div>
         </div>
 
-        <h3 class="has-tip" tabindex="0">Learning rates<span class="tip" role="tooltip">Adam step sizes. Adam moves a parameter by about its rate per iteration, in that parameter's units, so each unit below is "per iteration". Rate used = base below × <b>LR mult</b> × the LR schedule (set under <b>Schedule</b>), e.g. pos 0.025 × 3 = up to 0.075 px per iteration.</span></h3>
+        <h3 class="has-tip" tabindex="0">Optimizer<span class="tip" role="tooltip">Adam step sizes. Adam moves a parameter by about its rate per iteration, in that parameter's units, so each unit below is "per iteration". Rate used = base below × <b>LR mult</b> × the LR schedule (set under <b>Schedule</b>), e.g. pos 0.025 × 3 = up to 0.075 px per iteration.</span></h3>
         <div class="param">
           <div class="row"><label>LR mult</label><input id="p-lrMult" type="number" step="0.1" /></div>
           <p class="help"><span class="unit">× (multiplier on every base rate)</span></p>
@@ -1043,7 +971,141 @@
           <div class="tip" role="tooltip">Anisotropy: 0 = round, ±1 ≈ 2.7:1, clamped to ±2 ≈ 7.4:1. Frozen for the first 50 iterations.</div>
         </div>
 
-        <h3 class="has-tip" tabindex="0">Tuning<span class="tip" role="tooltip"><b>optimize all</b> tunes every setting in turn except <b>sites</b> (more sites nearly always win). How the <b>tune</b> buttons search (as node/tune.mjs). Each round runs one batch at the value × the step and one at the value ÷ the step, on the same images as the first batch; when the three medians lie on a parabola that opens down with its peak within two steps, it also runs that peak (a Newton step). It moves to whichever value scored best. When none beats the current value, the step shrinks (step ← step<sup><b>tune decay</b></sup>) instead of stopping; the setting is done when the step falls below <b>tune min ratio</b>, or after <b>tune max rounds</b>. Not training settings: they don't change a run.</span></h3>
+        <h3 class="has-tip" tabindex="0">Schedule<span class="tip" role="tooltip">Everything that decides when things happen in a run: how long it is, how the learning rate moves, and how the site count gets from start to end. The summary below is worked out from these fields as you edit them; after a run it also says when and why growth actually ended.</span></h3>
+        <div class="plan-summary" id="planSummary"></div>
+        <div class="param">
+          <div class="row"><label>iterations</label><input id="p-iters" type="number" min="1" /></div>
+          <p class="help"><span class="unit">iterations</span></p>
+          <div class="tip" role="tooltip">Run length. There is no learning-rate warmup: every rate starts at full (in tests a 200-iteration warmup was within ±0.2 dB).</div>
+        </div>
+        <div class="param">
+          <div class="row"><label>LR schedule</label><select id="p-lrSchedule" aria-label="LR schedule"></select></div>
+          <div class="tip" role="tooltip">How the learning rate changes over the run. <b>cosine</b>: falls from full to 0 on a cosine over the run. <b>fixed</b>: stays at full. <b>decay after growth</b>: stays at full while sites are being added, then falls to 0 on a cosine by the end of the run, so late sites aren't starved and the finished set still gets a cool-down (with fixed site count it equals cosine). The cool-down matters: without it MNIST lost 1–1.5 dB.</div>
+        </div>
+        <div class="param">
+          <div class="row"><label>count schedule</label><select id="p-countSchedule" aria-label="Site count schedule"></select></div>
+          <div class="tip" role="tooltip">The curve from start to end sites (under <b>Budget</b>). <b>constant</b> (the default): one count, <b>sites</b>, for the whole run. <b>linear</b>: the same number of sites per step. <b>exponential</b>: the same factor per step, so few sites change early and many late when growing (the other way round when pruning). <b>sawtooth</b>: the exponential curve with teeth on top: each tooth grows above it by <b>amplitude</b>, then merges back down to it. Tuned and checked on held-out images, sawtooth beat the best exponential by about 0.8 dB on MNIST and 0.6 dB on Kodak at 256 px. Teeth shorter than a few steps can't go down: the summary warns when a sawtooth never merges.</div>
+        </div>
+        <div class="param" data-site-mode="grow">
+          <div class="row"><label>reach end by</label><input id="p-countEnd" type="number" step="0.05" min="0" max="1" /></div>
+          <p class="help"><span class="unit">fraction of the run (0–1)</span></p>
+          <div class="tip" role="tooltip">The count reaches <b>end sites</b> at this fraction of the iterations (a step merges at most half the sites, so a big sawtooth may take a few more steps to get back down); the rest of the run refines that set (with <b>decay after growth</b>, the LR cools down from here). Slow ramps take many small steps.</div>
+        </div>
+        <div class="param" data-site-mode="grow">
+          <div class="row"><label>step every</label><input id="p-growEvery" type="number" min="1" /></div>
+          <p class="help"><span class="unit">iterations between count steps</span></p>
+          <div class="tip" role="tooltip">Time for each batch to settle before the next is placed. Too short and the next step still sees the old error where the last batch landed. Growth finishes after (number of steps) × this, e.g. 1 → 64 with factor 2 and 25 takes 6 steps, done at iteration 150.</div>
+        </div>
+        <div class="param" data-count-schedule="sawtooth">
+          <div class="row"><label>teeth</label><input id="p-sawTeeth" type="number" min="0" step="1" /></div>
+          <p class="help"><span class="unit">teeth before the count reaches the end</span></p>
+          <div class="tip" role="tooltip">Frequency: how many grow-then-merge cycles fit between iteration 0 and <b>reach end by</b>.</div>
+        </div>
+        <div class="param" data-count-schedule="sawtooth">
+          <div class="row"><label>amplitude</label><input id="p-sawAmp" type="number" min="0" step="0.1" /></div>
+          <p class="help"><span class="unit">peak above the curve, as a fraction of it</span></p>
+          <div class="tip" role="tooltip">Each tooth peaks at (1 + this) × the exponential curve's count at that point, e.g. 0.5 = 50% more sites, then merges back down to the curve.</div>
+        </div>
+        <div class="param" data-count-schedule="sawtooth">
+          <div class="row"><label>grow : merge</label><input id="p-sawRatio" type="number" min="0.01" step="0.5" /></div>
+          <p class="help"><span class="unit">time growing per unit of time merging, within a tooth</span></p>
+          <div class="tip" role="tooltip">3 = each tooth spends 3/4 of its time growing up to the peak and 1/4 merging back down.</div>
+        </div>
+
+        <div data-site-mode="grow">
+          <h3 class="has-tip" tabindex="0">Growth rules<span class="tip" role="tooltip">How growth picks where to split and when it may stop early. Shown only when the count changes.</span></h3>
+          <div class="param">
+            <div class="row"><label>λ (stop)</label><input id="p-growLambda" data-float type="number" step="10" min="0" /></div>
+            <p class="help"><span class="unit">error per bit: 8-bit levels² (summed over R, G, B and pixels)</span></p>
+            <div class="tip" role="tooltip">Only cells whose split would remove more than λ × 128 levels² of error (a site costs 128 bits) are split; a step adds fewer sites if fewer qualify, and growth ends early once none do. Example: λ = 400 → 51,200 levels², e.g. 100 pixels each off by about 13 levels in all three channels. Higher λ stops sooner. 0 = never stop early (any site that helps at all qualifies). The log says which limit ended growth.</div>
+          </div>
+          <div class="param">
+            <div class="row"><label>persist growth</label><input id="p-errGrowth" type="checkbox" /></div>
+            <div class="tip" role="tooltip">Growth weighs each pixel by the persist weight (under <b>Objective</b>) when picking cells to split and placing the new site, so splits go where the error has persisted. λ then compares against weighted error. Needs persist weight &gt; 0.</div>
+          </div>
+        </div>
+
+        <details>
+          <summary><h3 class="has-tip" tabindex="0">Candidate search<span class="tip" role="tooltip">Each pixel blends only its 8 best-scoring sites, kept in a per-pixel candidate list. These settings control how the lists are searched as sites move: better search means more accurate renders and gradients, at more cost per iteration. "Pass" below = one search sweep over every candidate pixel. Rarely worth changing.</span></h3></summary>
+          <div class="param">
+            <div class="row"><label>freq</label><input id="p-candFreq" type="number" /></div>
+            <p class="help"><span class="unit">iterations between list refreshes</span></p>
+            <div class="tip" role="tooltip">1 = refresh every iteration (most accurate); larger is faster, but lists go stale as sites move.</div>
+          </div>
+          <div class="param">
+            <div class="row"><label>passes</label><input id="p-candUpdatePasses" type="number" /></div>
+            <p class="help"><span class="unit">passes per refresh</span></p>
+            <div class="tip" role="tooltip">Each pass merges in neighbouring pixels' lists; the first passes of a run reach far (jump flooding), later ones only adjacent pixels.</div>
+          </div>
+          <div class="param">
+            <div class="row"><label>downscale</label><input id="p-candDownscale" type="number" /></div>
+            <p class="help"><span class="unit">image pixels per candidate cell, per side (integer)</span></p>
+            <div class="tip" role="tooltip">2 = one shared list per 2×2 pixels. Faster and lighter, but sites smaller than a cell can be missed. 1 = one list per pixel.</div>
+          </div>
+          <div class="param">
+            <div class="row"><label>radius scale</label><input id="p-candRadiusScale" type="number" step="1" /></div>
+            <p class="help"><span class="unit">candidate cells per 1024 cells of grid width</span></p>
+            <div class="tip" role="tooltip">Distance of the radius probes below; scales with the grid, e.g. 64 → 48 cells on a 768-wide grid.</div>
+          </div>
+          <div class="param">
+            <div class="row"><label>radius probes</label><input id="p-candRadiusProbes" type="number" /></div>
+            <p class="help"><span class="unit">probes per pixel per pass</span></p>
+            <div class="tip" role="tooltip">Also merge the lists of this many cells in random directions at the distance above, so large sites reach far pixels. 0 = off.</div>
+          </div>
+          <div class="param">
+            <div class="row"><label>inject count</label><input id="p-candInjectCount" type="number" /></div>
+            <p class="help"><span class="unit">random sites per pixel per pass</span></p>
+            <div class="tip" role="tooltip">Also try this many sites picked at random from all sites: a global safety net so no site stays undiscovered.</div>
+          </div>
+        </details>
+
+        <div class="group-head" id="batchSection"><span>Batch</span><span class="group-tag">which images, how they run · speed and noise only</span></div>
+        <p class="plan-summary" id="batchNote"></p>
+        <div class="param">
+          <div class="row"><label for="batchFrom">first image</label><input id="batchFrom" data-no-tune type="number" min="0" value="0" /></div>
+          <div class="tip" role="tooltip">Index of the first dataset image in the batch (the range starts here; with <b>random</b>, the sample is drawn from here to the end).</div>
+        </div>
+        <div class="param">
+          <div class="row"><label for="batchCount">images</label><input id="batchCount" data-no-tune type="number" min="1" value="500" /></div>
+          <div class="tip" role="tooltip">Runs per batch. Tuning compares batch medians, so more images means less noise per comparison and slower rounds.</div>
+        </div>
+        <div class="param">
+          <div class="row"><label for="batchRandom">random</label><input id="batchRandom" type="checkbox" checked /></div>
+          <div class="tip" role="tooltip">Draw a fresh random sample each batch, from the first image to the end of the dataset. Tuning keeps its first batch's images for every comparison.</div>
+        </div>
+        <div class="param">
+          <div class="row"><label for="batchFill">fill GPU</label><input id="batchFill" type="checkbox" /></div>
+          <div class="tip" role="tooltip">Take as many images (from the first one) as one atlas holds: the GPU's texture-size limit and a pixel budget that keeps its buffers near half a gigabyte, e.g. about 5,300 MNIST digits or 10 Kodak images. Needs one atlas (a fixed site count).</div>
+        </div>
+        <div class="param">
+          <div class="row"><label for="batchTiled">one atlas</label><input id="batchTiled" type="checkbox" checked /></div>
+          <div class="tip" role="tooltip">Train every image of one size in a single run, one tile per image of a shared atlas: a dispatch covers them all. Needs a fixed site count (start sites = end sites, not sawtooth, no turnover); otherwise each image gets its own trainer. On MNIST about 10× faster than 8 separate trainers at the same PSNR; Kodak-sized images gain nothing.</div>
+        </div>
+        <div class="param">
+          <div class="row"><label for="batchJobs">at once</label><input id="batchJobs" data-no-tune type="number" min="1" value="8" /></div>
+          <p class="help"><span class="unit">separate trainers on the GPU at a time</span></p>
+          <div class="tip" role="tooltip">Only when each image gets its own trainer (no one atlas). Measured on an M-series Mac (Dawn, 1000 iterations): MNIST throughput levels off at about 8 (≈7× one at a time), Kodak at 2 (≈1.2×).</div>
+        </div>
+
+        <div class="group-head"><span>Instrumentation</span><span class="group-tag">doesn't change the result</span></div>
+        <div class="param">
+          <div class="row"><label>refresh every</label><input id="p-logFreq" data-no-tune type="number" min="1" placeholder="auto" /></div>
+          <p class="help"><span class="unit">iterations between refreshes, single runs (blank = about 20 per run)</span></p>
+          <div class="tip" role="tooltip">How often a single run pauses to read back the render and update PSNR, gradient stats, the plots, the preview images and the site overlay. Smaller = finer curves and a livelier view, slower runs. Not part of presets.</div>
+        </div>
+        <div class="param">
+          <div class="row"><label for="batchLogFreq">log every</label><input id="batchLogFreq" data-no-tune type="number" min="1" value="25" /></div>
+          <p class="help"><span class="unit">iterations between PSNR ticks, batch runs</span></p>
+          <div class="tip" role="tooltip">Iterations between PSNR log ticks in a batch (each one reads the render back). Replaces refresh every for batch runs.</div>
+        </div>
+        <div class="param">
+          <div class="row"><label for="batchSnaps">snapshots</label><input id="batchSnaps" data-no-tune type="number" min="1" value="20" /></div>
+          <p class="help"><span class="unit">site snapshots kept per batch run</span></p>
+          <div class="tip" role="tooltip">Site snapshots kept per run, evenly spaced, plus the final sites. Selecting a run lets you scrub through them.</div>
+        </div>
+
+        <div class="group-head"><span>Tuning</span><span class="group-tag">searches Training settings on Batch images</span></div>
+        <h3 class="has-tip" tabindex="0">Search<span class="tip" role="tooltip"><b>optimize all</b> tunes the Training settings that have an effect with the current values, in a fixed order (objective, optimizer, schedule, growth), except <b>sites</b> (more sites nearly always win) and the init values. How the <b>tune</b> buttons search (as node/tune.mjs): each round runs one batch at the value × the step and one at the value ÷ the step, on the same images as the first batch; when the three medians lie on a parabola that opens down with its peak within two steps, it also runs that peak (a Newton step). It moves to whichever value scored best. When none beats the current value, the step shrinks (step ← step<sup><b>tune decay</b></sup>) instead of stopping; the setting is done when the step falls below <b>tune min ratio</b>, or after <b>tune max rounds</b>.</span></h3>
         <div class="param">
           <div class="row"><label>tune ratio</label><input id="p-tuneRatio" data-no-tune type="number" step="0.1" min="1.01" value="2" /></div>
           <p class="help"><span class="unit">starting step: × up, ÷ down</span></p>
@@ -1072,7 +1134,7 @@
         <div class="param">
           <div class="row"><label></label><button type="button" class="btn" id="optimizeAllBtn" disabled>optimize all</button></div>
           <p class="help"><span class="unit">tunes each setting in turn on the same images</span></p>
-          <div class="tip" role="tooltip">Runs <b>tune</b> on every setting that has a tune button, top to bottom, for <b>optimize cycles</b> passes, all on the same batch images. The log reports the median PSNR gain per setting and overall. Click again to stop; the best values found so far are kept.</div>
+          <div class="tip" role="tooltip">Runs <b>tune</b> on every setting in the optimize order, for <b>optimize cycles</b> passes, all on the same batch images, skipping settings that have no effect with the current values (hidden fields; persist decay and cap while persist weight is 0). The log reports the median PSNR gain per setting and overall. Click again to stop; the best values found so far are kept.</div>
         </div>
       </aside>
 
@@ -1114,6 +1176,6 @@
       </section>
     </div>
 
-    <script type="module" src="train.js?v=m4-20261020"></script>
+    <script type="module" src="train.js?v=m5-20261020"></script>
   </body>
 </html>
