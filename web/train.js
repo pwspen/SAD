@@ -4113,6 +4113,35 @@ function fieldActive(input) {
   return true;
 }
 
+// Advanced's setting groups (each h3 and the settings after it, up to the
+// next heading) as <details>, closed unless opened before in this browser
+// (the open ones are remembered by heading). Candidate search is already one.
+const OPEN_GROUPS_KEY = "sad.openSettingGroups";
+
+function setupCollapsibleGroups() {
+  let open = new Set();
+  try { open = new Set(JSON.parse(localStorage.getItem(OPEN_GROUPS_KEY)) || []); } catch {}
+  const save = () => { try { localStorage.setItem(OPEN_GROUPS_KEY, JSON.stringify([...open])); } catch {} };
+  const ends = (el) => el.matches("h3, .group-head, details") || !!el.querySelector("h3");
+  for (const h3 of [...ui.paramsPanel.querySelectorAll("h3")]) {
+    if (h3.closest("summary")) continue;
+    const details = document.createElement("details");
+    const summary = document.createElement("summary");
+    h3.before(details);
+    summary.append(h3);
+    details.append(summary);
+    while (details.nextElementSibling && !ends(details.nextElementSibling)) details.append(details.nextElementSibling);
+  }
+  for (const details of ui.paramsPanel.querySelectorAll("details")) {
+    const name = details.querySelector("summary h3")?.firstChild?.textContent.trim();
+    details.open = open.has(name);
+    details.addEventListener("toggle", () => {
+      if (details.open) open.add(name); else open.delete(name);
+      save();
+    });
+  }
+}
+
 function setupAutoTune() {
   for (const input of tunableInputs()) {
     const btn = document.createElement("button");
@@ -5990,6 +6019,7 @@ async function main() {
   ui.saveTxt.addEventListener("click", exportSites);
   ui.batchBtn.addEventListener("click", openBatchSettings);
   setupAutoTune();
+  setupCollapsibleGroups();
   ui.batchFill.addEventListener("change", syncBatchFill);
   ui.batchTiled.addEventListener("change", syncBatchFill);
   ui.batchFrom.addEventListener("change", syncBatchFill);
