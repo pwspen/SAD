@@ -68,10 +68,10 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 
-import { SITE_FLOATS } from "../trainer/params.js?v=m3-20261020";
-import { encodeSites, codecSteps } from "../trainer/codec.js?v=shared-20261020";
+import { SITE_FLOATS } from "../trainer/params.js?v=w2b-20261021";
+import { encodeSites, codecSteps } from "../trainer/codec.js?v=w2b-20261021";
 import { mergedSite } from "../trainer/merge.js?v=20261019";
-import { tileOrigin } from "../trainer/batch.js?v=m3-20261020";
+import { tileOrigin } from "../trainer/batch.js?v=w2b-20261021";
 import { createHeadlessDevice, loadShadersFromDisk } from "./headless.mjs";
 import { DATASET_OPTIONS, loadParams, argsFor, loadImages, trainBatched, median, mean } from "./common.mjs";
 import { saveSites, restoreSites, writeRgbSites, rgbSitesOf, continueRun, sseGradient, spearman, slope0 } from "./lossmap.mjs";
