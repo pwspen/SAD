@@ -55,10 +55,12 @@ import { RATE_FLOATS, fitRateModel, rateBits, rateBuffer } from "./rate.js?v=rat
 import {
   colorSpaceFor,
   pcaBasis,
+  withDims,
   specializeShaders,
   encodeSiteColors,
   decodeSiteColors,
-} from "./color_spaces.js?v=klt-20261020";
+  IDENTITY_BASIS,
+} from "./color_spaces.js?v=cdims-20261021";
 
 const MAX_PREVIEW_IMAGE_READBACKS = 2;
 const MAX_PREVIEW_SITE_READBACKS = 8;
@@ -277,6 +279,10 @@ export function buildArgs(config, overrides = {}) {
     // Site color parameterization (a key of COLOR_SPACES in color_spaces.js).
     // Sites stay RGB outside the trainer; only the optimized params change.
     colorSpace: String(pick("colorSpace", "COLOR_SPACE", "rgb")),
+    // klt only: how many of the basis's axes (largest variance first) colors
+    // use, 1–3; the rest are held at 0 (withDims in color_spaces.js). 1 =
+    // colors along the target's first principal axis only (greyscale-like).
+    colorDims: Math.round(Number(pick("colorDims", "COLOR_DIMS", 3))),
     // How Adam scales the color steps (COLOR_MOMENTS).
     colorMoment: String(pick("colorMoment", "COLOR_MOMENT", "shared")),
     loss: String(pick("loss", "LOSS", "l1")),
@@ -363,6 +369,10 @@ export function buildArgs(config, overrides = {}) {
     throw new Error(`lrSchedule must be one of ${Object.keys(LR_SCHEDULES).join(", ")} (got "${args.lrSchedule}")`);
   }
   colorSpaceFor(args.colorSpace); // fail early on an unknown name
+  withDims(IDENTITY_BASIS, args.colorDims); // and on a bad colorDims
+  if (args.colorDims !== 3 && !colorSpaceFor(args.colorSpace).needsBasis) {
+    throw new Error(`colorDims ${args.colorDims} needs a basis color space (klt), not "${args.colorSpace}"`);
+  }
   if (!COLOR_MOMENTS[args.colorMoment]) {
     throw new Error(`colorMoment must be one of ${Object.keys(COLOR_MOMENTS).join(", ")} (got "${args.colorMoment}")`);
   }
@@ -397,7 +407,7 @@ export class Trainer {
 
     // klt without args.colorBasis takes its basis from the target, so its
     // shaders are compiled in prepare() rather than twice.
-    const space = colorSpaceFor(args.colorSpace, args.colorBasis ?? null);
+    const space = colorSpaceFor(args.colorSpace, args.colorBasis ? withDims(args.colorBasis, args.colorDims) : null);
     if (space.needsBasis && !args.colorBasis) this.colorSpace = space;
     else this._buildEncoders(space);
   }
@@ -439,7 +449,8 @@ export class Trainer {
     // klt without args.colorBasis: the KLT of the masked target pixels (an
     // atlas's images share it).
     if (this.colorSpace.needsBasis && !args.colorBasis) {
-      this._buildEncoders(colorSpaceFor(args.colorSpace, pcaBasis(targetRgba32f, width * height, this.maskCpu)));
+      const basis = withDims(pcaBasis(targetRgba32f, width * height, this.maskCpu), args.colorDims);
+      this._buildEncoders(colorSpaceFor(args.colorSpace, basis));
     }
 
     // Textures

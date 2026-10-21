@@ -10,7 +10,7 @@
 // Usage: node codec_test.mjs
 
 import { encodeSites, decodeSites, codecSteps, buildSharedModel } from "../trainer/codec.js?v=shared-20261020";
-import { pcaBasis } from "../trainer/color_spaces.js?v=klt-20261020";
+import { pcaBasis } from "../trainer/color_spaces.js?v=cdims-20261021";
 import { SITE_FLOATS } from "../trainer/params.js?v=m3-20261020";
 
 let failures = 0;

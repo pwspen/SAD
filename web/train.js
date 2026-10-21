@@ -5,12 +5,12 @@
 
 import { loadShaders, tileSlotsForLimit } from "../trainer/shader_loader.js?v=rate-20261020";
 import { requestTrainingDevice } from "../trainer/device.js?v=20261019";
-import { Trainer, buildArgs, GRAD_GROUPS, GRAD_CHANNELS, lrSchedule, LR_SCHEDULES, LOSSES, COLOR_MOMENTS, COUNT_SCHEDULES, LAYER_MODES, countPlan, countVaries, countHorizon } from "../trainer/trainer.js?v=m4-20261020";
+import { Trainer, buildArgs, GRAD_GROUPS, GRAD_CHANNELS, lrSchedule, LR_SCHEDULES, LOSSES, COLOR_MOMENTS, COUNT_SCHEDULES, LAYER_MODES, countPlan, countVaries, countHorizon } from "../trainer/trainer.js?v=cdims-20261021";
 import { loadImageToFloat32, loadMaskRgba32Float, whiteMaskRgba32Float } from "../trainer/textures.js?v=20261019";
 import { loadSitesFromFile, serializeSitesTxt, triggerDownload, floatImageToRgba8, computeBpp, computePsnr, BITS_PER_SITE } from "../trainer/io.js?v=20261019";
 import { SITE_FLOATS } from "../trainer/params.js?v=m3-20261020";
-import { BatchTrainer, planBatches, tileSites, tileActive, tileSize, atlasCapacity } from "../trainer/batch.js?v=m4-20261020";
-import { COLOR_SPACES } from "../trainer/color_spaces.js?v=klt-20261020";
+import { BatchTrainer, planBatches, tileSites, tileActive, tileSize, atlasCapacity } from "../trainer/batch.js?v=cdims-20261021";
+import { COLOR_SPACES } from "../trainer/color_spaces.js?v=cdims-20261021";
 import { encodeSites, codecSteps, CODEC_PLANES } from "../trainer/codec.js?v=shared-20261020";
 import { parquetMetadata, parquetReadObjects } from "./vendor/hyparquet/src/index.js";
 import {
@@ -72,6 +72,7 @@ const UI_FIELDS = [
   ["lrDirBase", "p-lrDirBase"],
   ["lrAnisoBase", "p-lrAnisoBase"],
   ["colorSpace", "p-colorSpace"],
+  ["colorDims", "p-colorDims"],
   ["colorMoment", "p-colorMoment"],
   ["loss", "p-loss"],
   ["errWeight", "p-errWeight"],

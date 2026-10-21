@@ -24,7 +24,7 @@ import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 
 import { buildSharedModel } from "../trainer/codec.js?v=shared-20261020";
-import { pcaBasis } from "../trainer/color_spaces.js?v=klt-20261020";
+import { pcaBasis } from "../trainer/color_spaces.js?v=cdims-20261021";
 import { createHeadlessDevice, loadShadersFromDisk } from "./headless.mjs";
 import { loadParams, argsFor, loadMnist, loadParquet } from "./common.mjs";
 import { probe, codecBits, poolImages } from "./probe.mjs";

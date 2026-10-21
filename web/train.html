@@ -915,6 +915,10 @@
           <div class="tip" role="tooltip">What a site's three color numbers mean while optimizing. <b>RGB</b>: red, green, blue on 0–1 (1 = 255 levels). <b>Log intensity + chroma</b>: mean natural-log brightness, then log(R/G) and log(B/G), so a pure brightness change moves one number. Blending, the loss and saved files are always RGB.</div>
         </div>
         <div class="param">
+          <div class="row"><label>color dims</label><select id="p-colorDims" aria-label="Color axes used (KLT only)"><option value="3">3</option><option value="2">2</option><option value="1">1</option></select></div>
+          <div class="tip" role="tooltip">KLT only: how many of the target's principal color axes (largest variance first) a site's color may use. The rest stay at the target's mean, so <b>1</b> gives colors along one line through the mean color (greyscale-like) and <b>2</b> a plane. The codec codes the dropped coordinates as all zeros, almost for free.</div>
+        </div>
+        <div class="param">
           <div class="row"><label>Adam scale</label><select id="p-colorMoment" aria-label="Adam second moment for the color"></select></div>
           <div class="tip" role="tooltip">How Adam sizes the color steps. <b>Per param</b>: each of the three color numbers is scaled by its own gradient history, so a number whose gradient is only rounding noise (the chroma of a grey image) still takes full-size steps and drifts. <b>Shared</b>: one scale for all three (as for position), so each number moves in proportion to its share of the color gradient.</div>
         </div>
@@ -1176,6 +1180,6 @@
       </section>
     </div>
 
-    <script type="module" src="train.js?v=m5-20261020"></script>
+    <script type="module" src="train.js?v=cdims-20261021"></script>
   </body>
 </html>

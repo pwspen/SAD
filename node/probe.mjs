@@ -44,7 +44,7 @@ import { parseArgs } from "node:util";
 
 import { SITE_FLOATS } from "../trainer/params.js?v=m3-20261020";
 import { codecSteps, encodeSites, CODEC_PLANES } from "../trainer/codec.js?v=shared-20261020";
-import { COLOR_SPACES, pcaBasis } from "../trainer/color_spaces.js?v=klt-20261020";
+import { COLOR_SPACES, pcaBasis } from "../trainer/color_spaces.js?v=cdims-20261021";
 import { createHeadlessDevice, loadShadersFromDisk } from "./headless.mjs";
 import { DATASET_OPTIONS, loadParams, argsFor, loadImages, trainBatched, median, mean } from "./common.mjs";
 

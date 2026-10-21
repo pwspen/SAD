@@ -18,6 +18,13 @@
 // specializeShaders() writes it into the WGSL as constants. The trainer takes
 // it from the masked target pixels at prepare(), so an atlas of images shares
 // one, or from args.colorBasis.
+//
+// A basis may carry `dims` k (1–3, default 3): only the first k axes are
+// used, rgb = mean + Σ_{j<k} axis_j · p_j. The other coordinates are held at
+// 0: encode zeroes them (so colors written in are projected onto the k-axis
+// subspace), decode ignores them and the VJP is 0 for them, so Adam never
+// moves them. The codec then codes their planes as all zeros. withDims()
+// sets it; specializeShaders() writes it into the WGSL as a mask.
 
 import { SITE_FLOATS } from "./params.js?v=m3-20261020";
 
@@ -76,19 +83,34 @@ export const COLOR_SPACES = {
 export const IDENTITY_BASIS = { mean: [0, 0, 0], axes: [[1, 0, 0], [0, 1, 0], [0, 0, 1]], variances: [1, 1, 1] };
 
 // Coordinates along orthonormal `axes` about `mean`: p = Aᵀ(rgb − mean),
-// rgb = mean + A p, and the VJP is Aᵀ g.
+// rgb = mean + A p, and the VJP is Aᵀ g; with basis.dims = k < 3, the
+// coordinates past k are masked to 0 in all three (basisKeep).
 function kltSpace(basis) {
   const { mean: m, axes: a } = basis;
+  const keep = basisKeep(basis);
   const dot3 = (u, v) => u[0] * v[0] + u[1] * v[1] + u[2] * v[2];
   return {
     id: 3,
     label: "KLT (PCA of the target)",
     needsBasis: true,
     basis,
-    encode: (r, g, b) => a.map((ax) => dot3(ax, [r - m[0], g - m[1], b - m[2]])),
-    decode: (p0, p1, p2) => [0, 1, 2].map((c) => m[c] + a[0][c] * p0 + a[1][c] * p1 + a[2][c] * p2),
-    vjp: (p, g) => a.map((ax) => dot3(ax, g)),
+    encode: (r, g, b) => a.map((ax, k) => keep[k] * dot3(ax, [r - m[0], g - m[1], b - m[2]])),
+    decode: (p0, p1, p2) => [0, 1, 2].map((c) => m[c] + keep[0] * a[0][c] * p0 + keep[1] * a[1][c] * p1 + keep[2] * a[2][c] * p2),
+    vjp: (p, g) => a.map((ax, k) => keep[k] * dot3(ax, g)),
   };
+}
+
+// Per axis 1 if the basis uses it (the first basis.dims), else 0.
+export function basisKeep(basis) {
+  const k = basis.dims ?? 3;
+  return [0, 1, 2].map((j) => (j < k ? 1 : 0));
+}
+
+// `basis` keeping only its first `dims` axes (1–3; see the header).
+export function withDims(basis, dims) {
+  const k = Math.round(Number(dims));
+  if (!(k >= 1 && k <= 3)) throw new Error(`colorDims must be 1, 2 or 3 (got ${dims})`);
+  return { ...basis, dims: k };
 }
 
 COLOR_SPACES.klt = kltSpace(IDENTITY_BASIS);
@@ -194,6 +216,7 @@ export function decodeSiteColors(data, count, space) {
 const COLOR_SPACE_RE = /const COLOR_SPACE : u32 = \d+u;/;
 const BASIS_AXES_RE = /const COLOR_BASIS_AXES : mat3x3<f32> = mat3x3<f32>\([^;]*\);/;
 const BASIS_MEAN_RE = /const COLOR_BASIS_MEAN : vec3<f32> = vec3<f32>\([^;]*\);/;
+const BASIS_KEEP_RE = /const COLOR_BASIS_KEEP : vec3<f32> = vec3<f32>\([^;]*\);/;
 const wgslF32 = (x) => { const s = Number(x).toPrecision(9); return /[.e]/.test(s) ? s : `${s}.0`; };
 
 // Copy of a loadShaders() result with every kernel compiled for `space`.
@@ -210,7 +233,8 @@ export function specializeShaders(shaders, space) {
       const { mean, axes } = space.basis;
       code = code
         .replace(BASIS_AXES_RE, `const COLOR_BASIS_AXES : mat3x3<f32> = mat3x3<f32>(${axes.flat().map(wgslF32).join(", ")});`)
-        .replace(BASIS_MEAN_RE, `const COLOR_BASIS_MEAN : vec3<f32> = vec3<f32>(${mean.map(wgslF32).join(", ")});`);
+        .replace(BASIS_MEAN_RE, `const COLOR_BASIS_MEAN : vec3<f32> = vec3<f32>(${mean.map(wgslF32).join(", ")});`)
+        .replace(BASIS_KEEP_RE, `const COLOR_BASIS_KEEP : vec3<f32> = vec3<f32>(${basisKeep(space.basis).map(wgslF32).join(", ")});`);
     }
     out[key] = code;
   }

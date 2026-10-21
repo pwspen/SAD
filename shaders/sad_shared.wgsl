@@ -24,10 +24,13 @@ struct PackedCandidateSite {
 // 0 = RGB, 1 = log intensity + chroma (mean log RGB, log R/G, log B/G),
 // 2 = YCoCg (real-valued, linear), 3 = KLT: coordinates along the basis
 // below (columns = orthonormal axes, about the mean), which the trainer
-// rewrites per run like COLOR_SPACE.
+// rewrites per run like COLOR_SPACE. COLOR_BASIS_KEEP masks the axes a
+// k-dimensional basis drops (colorDims < 3): their coordinates encode to 0,
+// decode ignores them and their gradient is 0.
 const COLOR_SPACE : u32 = 0u;
 const COLOR_BASIS_AXES : mat3x3<f32> = mat3x3<f32>(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0);
 const COLOR_BASIS_MEAN : vec3<f32> = vec3<f32>(0.0, 0.0, 0.0);
+const COLOR_BASIS_KEEP : vec3<f32> = vec3<f32>(1.0, 1.0, 1.0);
 const LOG_CHROMA_EPS : f32 = 0.00392156863; // 1/255
 
 fn decode_color(p : vec3<f32>) -> vec3<f32> {
@@ -37,7 +40,7 @@ fn decode_color(p : vec3<f32>) -> vec3<f32> {
       return exp(vec3<f32>(lg + p.y, lg, lg + p.z)) - LOG_CHROMA_EPS;
     }
     case 2u: { return vec3<f32>(p.x - p.z + p.y, p.x + p.z, p.x - p.z - p.y); }
-    case 3u: { return COLOR_BASIS_MEAN + COLOR_BASIS_AXES * p; }
+    case 3u: { return COLOR_BASIS_MEAN + COLOR_BASIS_AXES * (p * COLOR_BASIS_KEEP); }
     default: { return p; }
   }
 }
@@ -51,7 +54,7 @@ fn encode_color(rgb : vec3<f32>) -> vec3<f32> {
     case 2u: {
       return vec3<f32>((rgb.x + 2.0 * rgb.y + rgb.z) / 4.0, (rgb.x - rgb.z) / 2.0, (2.0 * rgb.y - rgb.x - rgb.z) / 4.0);
     }
-    case 3u: { return (rgb - COLOR_BASIS_MEAN) * COLOR_BASIS_AXES; }
+    case 3u: { return ((rgb - COLOR_BASIS_MEAN) * COLOR_BASIS_AXES) * COLOR_BASIS_KEEP; }
     default: { return rgb; }
   }
 }
@@ -65,7 +68,7 @@ fn color_vjp(p : vec3<f32>, g_rgb : vec3<f32>) -> vec3<f32> {
       return vec3<f32>(u.x + u.y + u.z, (2.0 * u.x - u.y - u.z) / 3.0, (2.0 * u.z - u.y - u.x) / 3.0);
     }
     case 2u: { return vec3<f32>(g_rgb.x + g_rgb.y + g_rgb.z, g_rgb.x - g_rgb.z, g_rgb.y - g_rgb.x - g_rgb.z); }
-    case 3u: { return g_rgb * COLOR_BASIS_AXES; }
+    case 3u: { return (g_rgb * COLOR_BASIS_AXES) * COLOR_BASIS_KEEP; }
     default: { return g_rgb; }
   }
 }
