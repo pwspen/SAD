@@ -8,6 +8,10 @@
 //      the trainer keeps |dir| = 1) with a step per site that shrinks as the
 //      decoded log_aniso grows, none at all for round sites; colors share one
 //      step, so the integer RGB can go through the lossless YCoCg-R transform.
+//      With a `colorBasis` (an orthonormal KLT, pcaBasis in color_spaces.js,
+//      shared by encoder and decoder like a codebook) the colors are instead
+//      quantized along its axes with that step: the same error as in RGB, and
+//      the three color planes are those coordinates.
 //   2. Order. Sites are sorted by grid cell in raster order (their order
 //      carries no information), and positions are coded as gaps between
 //      successive cell indices.
@@ -304,7 +308,7 @@ function thetaLevelsOf(q, aniso) {
 }
 
 // Every stage's integers for the active sites of `sites`.
-function quantize(sites, count, width, height, q) {
+function quantize(sites, count, width, height, q, basis = null) {
   const ps = stepOf(q.pos);
   const gx = Math.max(1, Math.ceil(width / ps)), gy = Math.max(1, Math.ceil(height / ps));
   const rows = [];
@@ -318,9 +322,18 @@ function quantize(sites, count, width, height, q) {
     const m = thetaLevelsOf(q, aniso);
     let theta = Math.atan2(sites[b + 8], sites[b + 7]);
     theta = ((theta % Math.PI) + Math.PI) % Math.PI;
-    const r = lin(sites[b + 4], q.color), g = lin(sites[b + 5], q.color), bl = lin(sites[b + 6], q.color);
-    // YCoCg-R (lossless on integers)
-    const co = r - bl, t = bl + (co >> 1), cg = g - t, yy = t + (cg >> 1);
+    let yy, co, cg;
+    if (basis) {
+      const d = [0, 1, 2].map((c) => sites[b + 4 + c] - basis.mean[c]);
+      [yy, co, cg] = basis.axes.map((a) => Math.round((a[0] * d[0] + a[1] * d[1] + a[2] * d[2]) / stepOf(q.color)));
+    } else {
+      // YCoCg-R (lossless on integers)
+      const r = lin(sites[b + 4], q.color), g = lin(sites[b + 5], q.color), bl = lin(sites[b + 6], q.color);
+      co = r - bl;
+      const t = bl + (co >> 1);
+      cg = g - t;
+      yy = t + (cg >> 1);
+    }
     rows.push({
       slot: i, x, y, idx: y * gx + x, m,
       planes: [aniso, m > 1 ? Math.round((theta * m) / Math.PI) % m : 0,
@@ -332,22 +345,29 @@ function quantize(sites, count, width, height, q) {
 }
 
 // Sites (coded order, decoded RGB) from the integers; `levels` per site.
-function dequantize(xs, ys, planes, levels, q) {
+function dequantize(xs, ys, planes, levels, q, basis = null) {
   const n = xs.length;
   const ps = stepOf(q.pos);
   const out = new Float32Array(n * SITE_FLOATS);
   for (let i = 0; i < n; i += 1) {
     const b = i * SITE_FLOATS;
     const [aniso, thetaQ, tau, radius, yy, co, cg] = planes.map((p) => p[i]);
-    const t = yy - (cg >> 1), g = cg + t, bl = t - (co >> 1), r = bl + co;
+    let rgb;
+    if (basis) {
+      const k = [yy, co, cg].map((v) => v * stepOf(q.color));
+      rgb = [0, 1, 2].map((c) => basis.mean[c] + basis.axes[0][c] * k[0] + basis.axes[1][c] * k[1] + basis.axes[2][c] * k[2]);
+    } else {
+      const t = yy - (cg >> 1), g = cg + t, bl = t - (co >> 1), r = bl + co;
+      rgb = [r, g, bl].map((v) => v * stepOf(q.color));
+    }
     const theta = levels[i] > 1 ? (thetaQ * Math.PI) / levels[i] : 0;
     out[b] = (xs[i] + 0.5) * ps;
     out[b + 1] = (ys[i] + 0.5) * ps;
     out[b + 2] = tau * stepOf(q.logTau);
     out[b + 3] = radius * stepOf(q.radius);
-    out[b + 4] = r * stepOf(q.color);
-    out[b + 5] = g * stepOf(q.color);
-    out[b + 6] = bl * stepOf(q.color);
+    out[b + 4] = rgb[0];
+    out[b + 5] = rgb[1];
+    out[b + 6] = rgb[2];
     out[b + 7] = Math.cos(theta);
     out[b + 8] = Math.sin(theta);
     out[b + 9] = aniso * stepOf(q.logAniso);
@@ -355,6 +375,7 @@ function dequantize(xs, ys, planes, levels, q) {
   return out;
 }
 
+// The last three are the YCoCg-R planes, or the color basis's axes K0–K2.
 export const CODEC_PLANES = ["log_aniso", "θ", "log_tau", "radius", "Y", "Co", "Cg"];
 const THETA_PLANE = 1;
 
@@ -408,15 +429,16 @@ export function codecSteps(sites, count, F, { lossDb, sse0 }) {
 
 // Encodes the active sites of `sites` (count · SITE_FLOATS, decoded RGB).
 // `steps` from codecSteps (any positive numbers work). `globalSite`: the slot
-// of the histogram layer, or −1. Returns
+// of the histogram layer, or −1. `colorBasis`: code colors along its axes
+// (decodeSites needs the same one); null = YCoCg-R. Returns
 //   { bytes, bits, n, headerBits, positionBits, planeBits: [per CODEC_PLANES],
 //     modes, decoded: the sites as decodeSites returns them (coded order),
 //     slots: each decoded site's slot in `sites`, globalIndex: the layer's
 //     index in decoded, or −1 }.
-export function encodeSites(sites, count, width, height, steps, { globalSite = -1 } = {}) {
+export function encodeSites(sites, count, width, height, steps, { globalSite = -1, colorBasis = null } = {}) {
   const q = {};
   for (const k of STEP_GROUPS) q[k] = quantizeStep(steps[k]);
-  const { rows } = quantize(sites, count, width, height, q);
+  const { rows } = quantize(sites, count, width, height, q, colorBasis);
   const n = rows.length;
   const xsPos = rows.map((r) => r.x), ysPos = rows.map((r) => r.y), idx = rows.map((r) => r.idx);
   const nbrs = priorNeighbors(xsPos, ysPos);
@@ -438,6 +460,7 @@ export function encodeSites(sites, count, width, height, steps, { globalSite = -
   const globalIndex = rows.findIndex((r) => r.slot === globalSite);
   const w = new BitWriter();
   w.eg(width); w.eg(height); w.eg(n); w.eg(globalIndex + 1);
+  w.bit(colorBasis ? 1 : 0);
   for (const k of STEP_GROUPS) w.seg(q[k]);
   specs.forEach((_, p) => { w.bit(modes[p]); w.seg(constants[p]); });
   const headerBits = w.bits;
@@ -454,16 +477,18 @@ export function encodeSites(sites, count, width, height, steps, { globalSite = -
   const bytes = w.finish();
   return {
     bytes, bits: w.bits, n, headerBits, positionBits, planeBits, modes,
-    decoded: dequantize(xsPos, ysPos, planes, levels, q),
+    decoded: dequantize(xsPos, ysPos, planes, levels, q, colorBasis),
     slots: rows.map((r) => r.slot), globalIndex,
   };
 }
 
 // Inverse of encodeSites: { sites (n · SITE_FLOATS, decoded RGB), count,
-// width, height, globalSite (index in sites, or −1) }.
-export function decodeSites(bytes) {
+// width, height, globalSite (index in sites, or −1) }. `colorBasis`: the one
+// the stream was coded with, if any.
+export function decodeSites(bytes, { colorBasis = null } = {}) {
   const r = new BitReader(bytes);
   const width = r.eg(), height = r.eg(), n = r.eg(), globalSite = r.eg() - 1;
+  if (r.bit() && !colorBasis) throw new Error("decodeSites: stream was coded along a color basis; pass it");
   const q = {};
   for (const k of STEP_GROUPS) q[k] = r.seg();
   const modes = [], constants = [];
@@ -485,5 +510,5 @@ export function decodeSites(bytes) {
                                    : { vals: planes[p], has: null, levels: null };
     codePlane(io, spec, nbrs, modes[p], constants[p], false);
   });
-  return { sites: dequantize(xs, ys, planes, levels, q), count: n, width, height, globalSite };
+  return { sites: dequantize(xs, ys, planes, levels, q, colorBasis), count: n, width, height, globalSite };
 }

@@ -15,7 +15,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 
-import { COLOR_SPACES } from "../trainer/color_spaces.js?v=ycocg-20261020";
+import { COLOR_SPACES } from "../trainer/color_spaces.js?v=klt-20261020";
 import { createHeadlessDevice, loadShadersFromDisk } from "./headless.mjs";
 import { loadParams, argsFor, loadMnist, loadParquet, trainBatched, median } from "./common.mjs";
 import { makeEvaluator, tune, LR_KEYS } from "./tune.mjs";
@@ -64,15 +64,17 @@ async function main() {
       rows[space] = {
         params: p, tuningMedian: t.best, holdout: median(meds), runs: meds,
         pooledBits: rep.audit.pooled.perSite, perImageBits: rep.audit.perImage.perSite, staticColorBits: rep.audit.staticBits,
+        pooledKltBits: rep.audit.pooledKlt.perSite, perImageKltBits: rep.audit.perImageKlt.perSite,
       };
       console.error(`         held out ${median(meds).toFixed(3)} dB; codec pooled ${rep.audit.pooled.perSite.total.toFixed(2)} ` +
                     `bits/site (color ${rep.audit.pooled.perSite.color.toFixed(2)}), per image ${rep.audit.perImage.perSite.total.toFixed(2)}`);
     }
     console.error(`\n==== ${ds.name}: ${held.length} held-out images ====`);
-    console.error(`         space      PSNR (median of ${repeats})  bits/site pooled (color)  per image   color LR`);
+    console.error(`         space      PSNR (median of ${repeats})  bits/site pooled (color): YCoCg-R codec  KLT codec      per image: YCoCg-R  KLT    color LR`);
     for (const [space, r] of Object.entries(rows)) {
-      console.error(`         ${space.padEnd(10)} ${r.holdout.toFixed(3).padEnd(22)} ${r.pooledBits.total.toFixed(2)} (${r.pooledBits.color.toFixed(2)})`.padEnd(66) +
-                    ` ${r.perImageBits.total.toFixed(2).padEnd(11)} ${r.params.lrColorBase}`);
+      const b = (x) => `${x.total.toFixed(2)} (${x.color.toFixed(2)})`.padEnd(15);
+      console.error(`         ${space.padEnd(10)} ${r.holdout.toFixed(3).padEnd(47)} ${b(r.pooledBits)}${b(r.pooledKltBits)}` +
+                    `${r.perImageBits.total.toFixed(2).padEnd(9)}${r.perImageKltBits.total.toFixed(2).padEnd(7)}${r.params.lrColorBase}`);
     }
   }
 

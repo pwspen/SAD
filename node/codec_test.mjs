@@ -7,7 +7,8 @@
 //   6. edge cases: one site, every site round, every site in one cell
 // Usage: node codec_test.mjs
 
-import { encodeSites, decodeSites, codecSteps } from "../trainer/codec.js?v=20261019";
+import { encodeSites, decodeSites, codecSteps } from "../trainer/codec.js?v=klt-20261020";
+import { pcaBasis } from "../trainer/color_spaces.js?v=klt-20261020";
 import { SITE_FLOATS } from "../trainer/params.js?v=20261019";
 
 let failures = 0;
@@ -47,7 +48,7 @@ const STEPS = { pos: 0.25, logTau: 0.05, radius: 0.01, color: 1 / 128, logAniso:
 
 function roundTrip(name, sites, count, w, h, steps, opts = {}) {
   const enc = encodeSites(sites, count, w, h, steps, opts);
-  const dec = decodeSites(enc.bytes);
+  const dec = decodeSites(enc.bytes, { colorBasis: opts.colorBasis ?? null });
   check(`${name} count`, dec.count === enc.n, `${dec.count} vs ${enc.n}`);
   check(`${name} size`, dec.width === w && dec.height === h, `${dec.width}×${dec.height}`);
   let bad = -1;
@@ -107,6 +108,35 @@ function roundTrip(name, sites, count, w, h, steps, opts = {}) {
   roundTrip("one cell", stacked, 30, 64, 64, STEPS);
   roundTrip("infinite steps", randomSites(40, 64, 64, rng(6)), 40, 64, 64,
             { pos: 1, logTau: Infinity, radius: Infinity, color: Infinity, logAniso: Infinity, theta: Infinity });
+}
+
+// 7: colors along a KLT basis: exact round trip, error within half a step per
+// axis (so ≤ √3/2 steps in RGB), and fewer color bits than YCoCg-R on colors
+// that vary along one non-grey axis.
+{
+  const w = 128, h = 128, n = 400;
+  const sites = randomSites(n, w, h, rng(8));
+  const rand = rng(9);
+  for (let i = 0; i < n; i += 1) {
+    const t = rand(), b = i * SITE_FLOATS;
+    sites.set([0.2 + 0.6 * t, 0.5 - 0.3 * t + 0.01 * rand(), 0.1 + 0.5 * t], b + 4);
+  }
+  const rgba = new Float32Array(n * 4);
+  for (let i = 0; i < n; i += 1) rgba.set([...sites.subarray(i * SITE_FLOATS + 4, i * SITE_FLOATS + 7), 1], i * 4);
+  const colorBasis = pcaBasis(rgba, n);
+  const klt = roundTrip("klt", sites, n, w, h, STEPS, { colorBasis });
+  const ycc = roundTrip("ycocg-r", sites, n, w, h, STEPS);
+  let worst = 0;
+  klt.slots.forEach((slot, i) => {
+    for (let c = 0; c < 3; c += 1) worst = Math.max(worst, Math.abs(sites[slot * SITE_FLOATS + 4 + c] - klt.decoded[i * SITE_FLOATS + 4 + c]) / STEPS.color);
+  });
+  check("klt error", worst <= 0.9, `worst ${worst.toFixed(3)} steps`);
+  const colorBits = (e) => e.planeBits.slice(4).reduce((a, b) => a + b, 0);
+  check("klt codes one-axis colors shorter", colorBits(klt) < colorBits(ycc), `${colorBits(klt)} vs ${colorBits(ycc)}`);
+  let threw = false;
+  try { decodeSites(klt.bytes); } catch { threw = true; }
+  check("klt stream needs its basis", threw, "decoded without the basis");
+  console.log(`klt: color ${(colorBits(klt) / n).toFixed(2)} bits/site vs YCoCg-R ${(colorBits(ycc) / n).toFixed(2)}`);
 }
 
 // codecSteps: equal predicted error per scalar, and a bigger budget, bigger steps

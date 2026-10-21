@@ -6,7 +6,7 @@
 
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
-import { COLOR_SPACES, specializeShaders } from "../trainer/color_spaces.js?v=ycocg-20261020";
+import { COLOR_SPACES, specializeShaders, colorSpaceFor, pcaBasis } from "../trainer/color_spaces.js?v=klt-20261020";
 
 const SHARED_URL = new URL("../shaders/sad_shared.wgsl", import.meta.url);
 
@@ -82,7 +82,7 @@ async function testGpu(common, { rgb, grad }) {
   device.queue.writeBuffer(inBuf, 0, input);
   const outBytes = n * 12 * 4;
 
-  for (const [name, space] of Object.entries(COLOR_SPACES)) {
+  for (const [name, space] of Object.entries(SPACES)) {
     const code = specializeShaders({ COMMON: common + KERNEL }, space).COMMON;
     const module = device.createShaderModule({ code });
     const info = await module.getCompilationInfo();
@@ -128,7 +128,16 @@ async function testGpu(common, { rgb, grad }) {
 }
 
 const data = samples();
-for (const [name, space] of Object.entries(COLOR_SPACES)) testJs(name, space, data);
+// klt as listed has the identity basis; also check one from correlated colors.
+const corr = new Float32Array(data.rgb.length * 4);
+data.rgb.forEach(([r, g, b], i) => corr.set([0.7 * r + 0.2 * g, 0.5 * r + 0.4 * g + 0.1 * b, 0.3 * b + 0.6 * g, 1], i * 4));
+const SPACES = { ...COLOR_SPACES, "klt (data basis)": colorSpaceFor("klt", pcaBasis(corr, data.rgb.length)) };
+const { axes } = SPACES["klt (data basis)"].basis;
+for (let i = 0; i < 3; i += 1) for (let j = 0; j < 3; j += 1) {
+  const d = axes[i][0] * axes[j][0] + axes[i][1] * axes[j][1] + axes[i][2] * axes[j][2];
+  check("klt axes orthonormal", Math.abs(d - (i === j ? 1 : 0)) < 1e-9, `axes ${i}·${j} = ${d}`);
+}
+for (const [name, space] of Object.entries(SPACES)) testJs(name, space, data);
 
 if (!process.argv.includes("--no-gpu")) {
   const shared = await readFile(fileURLToPath(SHARED_URL), "utf8");
@@ -136,7 +145,7 @@ if (!process.argv.includes("--no-gpu")) {
   globalThis.__keepGpu = await testGpu(common, data); // dawn.node segfaults if the GPU object is collected
 }
 
-const spaces = Object.keys(COLOR_SPACES).join(", ");
+const spaces = Object.keys(SPACES).join(", ");
 if (failures) {
   console.error(`${failures} check(s) failed`);
   process.exit(1);

@@ -51,10 +51,11 @@ import {
 import { CandidateLists } from "./candidates.js?v=20261019";
 import {
   colorSpaceFor,
+  pcaBasis,
   specializeShaders,
   encodeSiteColors,
   decodeSiteColors,
-} from "./color_spaces.js?v=ycocg-20261020";
+} from "./color_spaces.js?v=klt-20261020";
 
 const MAX_PREVIEW_IMAGE_READBACKS = 2;
 const MAX_PREVIEW_SITE_READBACKS = 8;
@@ -354,17 +355,27 @@ async function yieldToBrowser() {
 export class Trainer {
   constructor(device, shaders, args, { onLog = null, signal = null } = {}) {
     this.device = device;
-    this.colorSpace = colorSpaceFor(args.colorSpace);
-    shaders = specializeShaders(shaders, this.colorSpace);
-    this.shaders = shaders;
     this.args = args;
     this.onLog = onLog;
     this.signal = signal;
+    this.baseShaders = shaders;
 
     this._previewImageInFlight = 0;
     this._previewSiteInFlight = 0;
 
-    // Encoders
+    // klt without args.colorBasis takes its basis from the target, so its
+    // shaders are compiled in prepare() rather than twice.
+    const space = colorSpaceFor(args.colorSpace, args.colorBasis ?? null);
+    if (space.needsBasis && !args.colorBasis) this.colorSpace = space;
+    else this._buildEncoders(space);
+  }
+
+  // Shaders and encoders for `colorSpace` (klt's basis is compiled in).
+  _buildEncoders(colorSpace) {
+    const device = this.device, args = this.args;
+    this.colorSpace = colorSpace;
+    const shaders = this.shaders = specializeShaders(this.baseShaders, colorSpace);
+    this.gnEnc = null;
     this.initEnc = new InitGradientEncoder(device, shaders);
     this.renderEnc = new RenderEncoder(device, shaders);
     this.renderIdsEnc = new RenderEncoder(device, shaders, { hashIds: true });
@@ -381,7 +392,6 @@ export class Trainer {
   async prepare({ width, height, targetRgba32f, maskRgba32f, maskSum, initSites, initSiteCount, tiling = null }) {
     const args = this.args;
     const device = this.device;
-    const shaders = this.shaders;
 
     this.width = width;
     this.height = height;
@@ -392,6 +402,11 @@ export class Trainer {
     if (maskRgba32f) {
       this.maskCpu = new Float32Array(width * height);
       for (let i = 0; i < width * height; i += 1) this.maskCpu[i] = maskRgba32f[i * 4];
+    }
+    // klt without args.colorBasis: the KLT of the masked target pixels (an
+    // atlas's images share it).
+    if (this.colorSpace.needsBasis && !args.colorBasis) {
+      this._buildEncoders(colorSpaceFor(args.colorSpace, pcaBasis(targetRgba32f, width * height, this.maskCpu)));
     }
 
     // Textures
@@ -461,7 +476,7 @@ export class Trainer {
     this.grads = createGradsBuffer(device, this.bufferCapacity);
 
     // Candidate lists (candidates.js)
-    this.cands = new CandidateLists(device, shaders, { ...args, width, height, capacity: this.bufferCapacity, tiling });
+    this.cands = new CandidateLists(device, this.shaders, { ...args, width, height, capacity: this.bufferCapacity, tiling });
     this.candWidth = this.cands.candWidth;
     this.candHeight = this.cands.candHeight;
 

@@ -33,7 +33,9 @@
 //   the codec's YCoCg-R integers, and of the joint RGB triple; then the codec
 //   itself, once per image (as it runs) and once over every image's sites in
 //   one stream (no per-image header or model start-up), with every plane's
-//   share. The histogram layer is left out throughout.
+//   share; and the same with colors coded along a KLT basis instead of
+//   YCoCg-R: the PCA of all the sites' colors, and (klt runs) the training
+//   basis. The histogram layer is left out throughout.
 
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
@@ -41,8 +43,8 @@ import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 
 import { SITE_FLOATS } from "../trainer/params.js?v=20261019";
-import { codecSteps, encodeSites, CODEC_PLANES } from "../trainer/codec.js?v=codec-20261020";
-import { COLOR_SPACES } from "../trainer/color_spaces.js?v=ycocg-20261020";
+import { codecSteps, encodeSites, CODEC_PLANES } from "../trainer/codec.js?v=klt-20261020";
+import { COLOR_SPACES, pcaBasis } from "../trainer/color_spaces.js?v=klt-20261020";
 import { createHeadlessDevice, loadShadersFromDisk } from "./headless.mjs";
 import { DATASET_OPTIONS, loadParams, argsFor, loadImages, trainBatched, median, mean } from "./common.mjs";
 
@@ -363,32 +365,39 @@ function entropyOf(keys) {
 }
 
 // Per-plane codec bits per site: { header, position, <plane>…, total }.
-function codecBits(list, steps) {
-  const acc = { header: 0, position: 0, ...Object.fromEntries(CODEC_PLANES.map((p) => [p, 0])) };
+function codecBits(list, steps, colorBasis = null) {
+  const planes = colorBasis ? [...CODEC_PLANES.slice(0, 4), "K0", "K1", "K2"] : CODEC_PLANES;
+  const acc = { header: 0, position: 0, ...Object.fromEntries(planes.map((p) => [p, 0])) };
   let n = 0, modes = null;
   for (const im of list) {
-    const enc = encodeSites(im.sites, im.n, im.width, im.height, steps);
+    const enc = encodeSites(im.sites, im.n, im.width, im.height, steps, { colorBasis });
     acc.header += enc.headerBits;
     acc.position += enc.positionBits;
-    CODEC_PLANES.forEach((p, k) => { acc[p] += enc.planeBits[k]; });
+    planes.forEach((p, k) => { acc[p] += enc.planeBits[k]; });
     n += enc.n;
     modes = enc.modes;
   }
   const out = Object.fromEntries(Object.entries(acc).map(([k, v]) => [k, v / Math.max(1, n)]));
   out.total = Object.values(out).reduce((s, v) => s + v, 0);
-  out.color = out.Y + out.Co + out.Cg;
-  return { perSite: out, sites: n, modes: list.length === 1 ? Object.fromEntries(CODEC_PLANES.map((p, k) => [p, modes[k] ? "neighbours" : "constant"])) : null };
+  out.color = planes.slice(4).reduce((t, p) => t + out[p], 0);
+  return { perSite: out, sites: n, modes: list.length === 1 ? Object.fromEntries(planes.map((p, k) => [p, modes[k] ? "neighbours" : "constant"])) : null };
 }
 
 // perImage: each image's sites in its own coordinates. rows: E3's rows.
-export function codecAudit(perImage, rows, steps) {
+export function codecAudit(perImage, rows, steps, trainBasis = null) {
   const c = steps.color;
+  const rgba = new Float32Array(rows.length * 4);
+  rows.forEach((r, i) => rgba.set([r[2], r[3], r[4], 1], i * 4));
+  const siteBasis = pcaBasis(rgba, rows.length);
+  const kltInts = (basis) => rows.map((r) => basis.axes.map((a) => Math.round(
+    (a[0] * (r[2] - basis.mean[0]) + a[1] * (r[3] - basis.mean[1]) + a[2] * (r[4] - basis.mean[2])) / c)));
   const q = rows.map((r) => [Math.round(r[2] / c), Math.round(r[3] / c), Math.round(r[4] / c)]);
   const ycocg = q.map(([r, g, b]) => { const co = r - b, t = b + (co >> 1), cg = g - t; return [t + (cg >> 1), co, cg]; });
   const col = (arr, k) => arr.map((v) => v[k]);
   const staticBits = {
     "R+G+B": [0, 1, 2].reduce((s, k) => s + entropyOf(col(q, k)), 0),
     "Y+Co+Cg": [0, 1, 2].reduce((s, k) => s + entropyOf(col(ycocg, k)), 0),
+    "K0+K1+K2": [0, 1, 2].reduce((s, k) => s + entropyOf(col(kltInts(siteBasis), k)), 0),
     "joint RGB": entropyOf(q.map((v) => v.join(","))),
   };
   const perPlaneStatic = { Y: entropyOf(col(ycocg, 0)), Co: entropyOf(col(ycocg, 1)), Cg: entropyOf(col(ycocg, 2)) };
@@ -406,11 +415,16 @@ export function codecAudit(perImage, rows, steps) {
       if (src[0] >= 0) { pooled[at * SITE_FLOATS] += ox; pooled[at * SITE_FLOATS + 1] += oy; }
     }
   });
-  return {
-    sites: rows.length, staticBits, perPlaneStatic,
+  const pooledList = [{ sites: pooled, n: total, width: T * W, height: Math.ceil(perImage.length / T) * H }];
+  const out = {
+    sites: rows.length, staticBits, perPlaneStatic, siteBasis, trainBasis,
     perImage: codecBits(perImage, steps),
-    pooled: codecBits([{ sites: pooled, n: total, width: T * W, height: Math.ceil(perImage.length / T) * H }], steps),
+    pooled: codecBits(pooledList, steps),
+    perImageKlt: codecBits(perImage, steps, siteBasis),
+    pooledKlt: codecBits(pooledList, steps, siteBasis),
   };
+  if (trainBasis) out.pooledTrainKlt = codecBits(pooledList, steps, trainBasis);
+  return out;
 }
 
 // ---- One probed run ----
@@ -422,6 +436,7 @@ export async function probe(ctx, args, images, { e2 = true, e3 = true, audit = t
   const e1Parts = { sites: [], F: [], sse0: 0 };
   const rows = [];
   const perImage = []; // { sites (layer marked inactive), n, width, height }
+  let trainBasis = null; // klt runs: the training basis (the last atlas's)
   const record = (info, idx, bt) => {
     if (!e2 || info.type !== "batchIter") return;
     const n = bt.layout.sitesPerTile, layer = info.layer;
@@ -437,6 +452,7 @@ export async function probe(ctx, args, images, { e2 = true, e3 = true, audit = t
   };
   const after = async (bt, idx) => {
     const { F } = await bt.trainer.siteSensitivity();
+    if (bt.trainer.colorSpace.needsBasis) trainBasis = bt.trainer.colorSpace.basis;
     const final = await bt.finalize();
     const n = bt.layout.sitesPerTile, layer = bt.layerSlot;
     final.forEach((r, b) => {
@@ -468,7 +484,7 @@ export async function probe(ctx, args, images, { e2 = true, e3 = true, audit = t
     steps,
     e2: e2 ? e2Report(ticks, args.iters) : null,
     e3: e3 ? e3Report(rows, steps) : null,
-    audit: audit ? codecAudit(perImage, rows, steps) : null,
+    audit: audit ? codecAudit(perImage, rows, steps, trainBasis) : null,
   };
 }
 
@@ -507,9 +523,12 @@ export function printReport(rep, log = console.error) {
     const a = rep.audit, fmt = (o) => Object.entries(o).map(([k, v]) => `${k} ${v.toFixed(2)}`).join(", ");
     log(`Audit  | color bits/site at E3's steps. Static: ${fmt(a.staticBits)} (Y ${a.perPlaneStatic.Y.toFixed(2)}, ` +
         `Co ${a.perPlaneStatic.Co.toFixed(2)}, Cg ${a.perPlaneStatic.Cg.toFixed(2)})`);
-    for (const name of ["perImage", "pooled"]) {
+    const names = { perImage: "per image", pooled: "pooled", perImageKlt: "per image, KLT", pooledKlt: "pooled, KLT",
+                    pooledTrainKlt: "pooled, train KLT" };
+    for (const [name, label] of Object.entries(names)) {
       const b = a[name];
-      log(`         codec ${name === "perImage" ? "per image" : "pooled   "}: color ${b.perSite.color.toFixed(2)} | ${fmt(b.perSite)}` +
+      if (!b) continue;
+      log(`         codec ${label.padEnd(17)}: color ${b.perSite.color.toFixed(2)} | ${fmt(b.perSite)}` +
           (b.modes ? ` | modes ${Object.entries(b.modes).map(([k, m]) => `${k}:${m[0]}`).join(" ")}` : ""));
     }
   }
