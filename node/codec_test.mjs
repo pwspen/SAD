@@ -9,7 +9,7 @@
 
 import { encodeSites, decodeSites, codecSteps } from "../trainer/codec.js?v=klt-20261020";
 import { pcaBasis } from "../trainer/color_spaces.js?v=klt-20261020";
-import { SITE_FLOATS } from "../trainer/params.js?v=20261019";
+import { SITE_FLOATS } from "../trainer/params.js?v=cmoment-20261020";
 
 let failures = 0;
 function check(name, ok, detail) {

@@ -119,7 +119,17 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   sites[idx].radius_sq = sites[idx].radius_sq - step_rad;
 
   m_color = params.beta1 * m_color + (1.0 - params.beta1) * g_color;
-  v_color = params.beta2 * v_color + (1.0 - params.beta2) * (g_color * g_color);
+  if (params.color_moment == 1u) {
+    // Shared: one second moment for the three color params, the EMA of
+    // |g_color|² (as position), kept in all three slots. Each param's step is
+    // then its gradient relative to the whole color gradient, so a chroma
+    // param with only float noise for gradient (a greyscale target) barely
+    // moves, and the step is rotation-equivariant for orthonormal bases.
+    let v_col_scalar = params.beta2 * v_color.x + (1.0 - params.beta2) * dot(g_color, g_color);
+    v_color = vec3<f32>(v_col_scalar, v_col_scalar, v_col_scalar);
+  } else {
+    v_color = params.beta2 * v_color + (1.0 - params.beta2) * (g_color * g_color);
+  }
   let m_hat_col = m_color * b1t_corr;
   let v_hat_col = v_color * b2t_corr;
   let step_col = params.lr_color * m_hat_col / (sqrt(v_hat_col) + params.eps);

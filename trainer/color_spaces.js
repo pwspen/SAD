@@ -19,7 +19,7 @@
 // it from the masked target pixels at prepare(), so an atlas of images shares
 // one, or from args.colorBasis.
 
-import { SITE_FLOATS } from "./params.js?v=20261019";
+import { SITE_FLOATS } from "./params.js?v=cmoment-20261020";
 
 const COLOR_OFFSET = 4; // color_r/g/b within a site row (see io.js)
 

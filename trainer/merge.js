@@ -22,7 +22,7 @@
 // pixel carries the same information, precision weighs a parameter by how
 // much the loss cares about it.
 
-import { SITE_FLOATS, ADAM_FLOATS } from "./params.js?v=20261019";
+import { SITE_FLOATS, ADAM_FLOATS } from "./params.js?v=cmoment-20261020";
 
 // Logit of the site at sites[b..b+SITE_FLOATS) at pixel (x, y): the CPU copy
 // of site_logit in sad_shared.wgsl.

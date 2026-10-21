@@ -17,7 +17,7 @@ import {
   updateGradParamsBuffer,
   invScaleSqFor,
   createUniform32,
-} from "./params.js?v=20261019";
+} from "./params.js?v=cmoment-20261020";
 
 import {
   createSitesBuffer,
@@ -69,6 +69,20 @@ const ANI_START_ITER = 50;
 export const LOSSES = {
   l1: { label: "L1 (absolute error)", id: 1 },
   l2: { label: "L2 (squared error)", id: 0 },
+};
+
+// Adam second moments for the three color params (args.colorMoment): the id
+// adam.wgsl switches on. "channel" keeps one per param; "shared" keeps one for
+// the 3-vector (EMA of |g|², as position), so a param's step follows its share
+// of the color gradient: on greyscale targets chroma params with only float
+// noise for gradient stay put instead of taking lr-sized steps. Shared is the
+// default: with each space's six LR bases retuned (node/colorspaces.mjs, 2048
+// held-out images × 3), median PSNR vs "channel" on MNIST rgb −0.02 dB,
+// logchroma +0.25, ycocg +0.24, klt +0.17; CIFAR-10 −0.01, +0.06, +0.07, −0.03;
+// Kodak (8 images, 1000 sites, untuned) within ±0.1.
+export const COLOR_MOMENTS = {
+  channel: { label: "per param", id: 0 },
+  shared: { label: "shared", id: 1 },
 };
 
 // LR schedules (args.lrSchedule), over a run of `iters` iterations. No warmup:
@@ -260,6 +274,8 @@ export function buildArgs(config, overrides = {}) {
     // Site color parameterization (a key of COLOR_SPACES in color_spaces.js).
     // Sites stay RGB outside the trainer; only the optimized params change.
     colorSpace: String(pick("colorSpace", "COLOR_SPACE", "rgb")),
+    // How Adam scales the color steps (COLOR_MOMENTS).
+    colorMoment: String(pick("colorMoment", "COLOR_MOMENT", "shared")),
     loss: String(pick("loss", "LOSS", "l1")),
     // Persistent-error weighting (gradients_tiled.wgsl): each pixel's loss is
     // scaled by (1 + errWeight · min(b / mean b, errCap)) / (1 + errWeight),
@@ -334,6 +350,9 @@ export function buildArgs(config, overrides = {}) {
     throw new Error(`lrSchedule must be one of ${Object.keys(LR_SCHEDULES).join(", ")} (got "${args.lrSchedule}")`);
   }
   colorSpaceFor(args.colorSpace); // fail early on an unknown name
+  if (!COLOR_MOMENTS[args.colorMoment]) {
+    throw new Error(`colorMoment must be one of ${Object.keys(COLOR_MOMENTS).join(", ")} (got "${args.colorMoment}")`);
+  }
   if (!LOSSES[args.loss]) {
     throw new Error(`loss must be one of ${Object.keys(LOSSES).join(", ")} (got "${args.loss}")`);
   }
@@ -485,7 +504,9 @@ export class Trainer {
     this.renderParams = createParamsBuffer(device, this._paramsArgs(initSiteCount));
     this.invScaleSq = invScaleSqFor(width, height, tiling);
     this.gradParams = createGradParamsBuffer(device, initSiteCount, this.invScaleSq, this._globalCand(), this._gradEma(), tiling);
-    this.adamParams = createAdamParamsBuffer(device, { ...this._adamSize(), layerSite: this._globalCand() });
+    this.adamParams = createAdamParamsBuffer(device, {
+      ...this._adamSize(), layerSite: this._globalCand(), colorMoment: COLOR_MOMENTS[args.colorMoment].id,
+    });
     this.gradCountParams = createClearParamsBuffer(device, this.bufferCapacity * 10);
 
     if (this.bufferCapacity > initSiteCount) {
@@ -665,7 +686,7 @@ export class Trainer {
         lrDir: it >= ANI_START_ITER ? args.lrDirBase * lrScale : 0,
         lrAniso: it >= ANI_START_ITER ? args.lrAnisoBase * lrScale : 0,
         beta1: args.beta1, beta2: args.beta2, eps: args.eps, t: it + 1,
-        ...this._adamSize(), layerSite: this._globalCand(),
+        ...this._adamSize(), layerSite: this._globalCand(), colorMoment: COLOR_MOMENTS[args.colorMoment].id,
       });
 
       const shouldLog = (it % logFreq === 0) || (it === iters - 1);

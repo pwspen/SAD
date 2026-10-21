@@ -9,6 +9,7 @@
 // Per dataset, from presets/<dataset>.json with colorSpace swapped: tune the
 // six bases on --count images (from 0), then on --holdout images after them
 // run --repeats batches for the median PSNR and probe once for the bits.
+// --set key=value (repeatable) overrides the presets, e.g. --set colorMoment=channel.
 
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
@@ -29,6 +30,7 @@ async function main() {
       mnist: { type: "string" }, parquet: { type: "string" }, spaces: { type: "string" },
       count: { type: "string", default: "1024" }, holdout: { type: "string", default: "2048" },
       repeats: { type: "string", default: "3" }, out: { type: "string" },
+      set: { type: "string", multiple: true, default: [] },
     },
   });
   const count = Number(cli.count) | 0, nHold = Number(cli.holdout) | 0, repeats = Number(cli.repeats) | 0;
@@ -42,11 +44,11 @@ async function main() {
   const ctx = { device, shaders };
   console.error(`Device | ${label}`);
   const tuneOpts = { ratio: 2, decay: 0.5, minRatio: 1.1, rounds: 8, cycles: 1 };
-  const out = { tuneOpts, count, holdout: nHold, repeats, datasets: {} };
+  const out = { tuneOpts, count, holdout: nHold, repeats, sets: cli.set, datasets: {} };
 
   for (const ds of datasets) {
     const images = await ds.load(0, count), held = await ds.load(count, nHold);
-    const preset = await loadParams(resolve(HERE, `../presets/${ds.name}.json`));
+    const preset = await loadParams(resolve(HERE, `../presets/${ds.name}.json`), cli.set);
     const rows = out.datasets[ds.name] = {};
     for (const space of spaces) {
       console.error(`\n==== ${ds.name}, ${space} ====`);

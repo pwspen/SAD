@@ -10,7 +10,7 @@
 // Usage: node merge_test.mjs
 
 import { mergedSite, mergePrecision, sitePrecision, candidateEdges, neighborMerge } from "../trainer/merge.js?v=20261019";
-import { SITE_FLOATS, ADAM_FLOATS } from "../trainer/params.js?v=20261019";
+import { SITE_FLOATS, ADAM_FLOATS } from "../trainer/params.js?v=cmoment-20261020";
 
 let failures = 0;
 function check(name, ok, detail) {

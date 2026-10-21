@@ -181,7 +181,7 @@ struct AdamParams {
   width : u32,
   height : u32,
   layer_site : u32, // the histogram layer's index (trainer.js), or none; a slot per tile when tiled
-  _pad0 : u32,
+  color_moment : u32, // 0: a second moment per color param; 1: one shared (trainer.js, COLOR_MOMENTS)
   _pad1 : u32,
   _pad2 : u32,
   // Tiled: width / height above are the tile's, and positions clamp to the

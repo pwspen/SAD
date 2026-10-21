@@ -5,10 +5,10 @@
 
 import { loadShaders, tileSlotsForLimit } from "../trainer/shader_loader.js?v=20261019";
 import { requestTrainingDevice } from "../trainer/device.js?v=20261019";
-import { Trainer, buildArgs, GRAD_GROUPS, GRAD_CHANNELS, lrSchedule, LR_SCHEDULES, LOSSES, COUNT_SCHEDULES, LAYER_MODES, countPlan, countVaries, countHorizon } from "../trainer/trainer.js?v=klt-20261020";
+import { Trainer, buildArgs, GRAD_GROUPS, GRAD_CHANNELS, lrSchedule, LR_SCHEDULES, LOSSES, COLOR_MOMENTS, COUNT_SCHEDULES, LAYER_MODES, countPlan, countVaries, countHorizon } from "../trainer/trainer.js?v=cmoment-20261020";
 import { loadImageToFloat32, loadMaskRgba32Float, whiteMaskRgba32Float } from "../trainer/textures.js?v=20261019";
 import { loadSitesFromFile, serializeSitesTxt, triggerDownload, floatImageToRgba8, computeBpp, computePsnr, BITS_PER_SITE } from "../trainer/io.js?v=20261019";
-import { SITE_FLOATS } from "../trainer/params.js?v=20261019";
+import { SITE_FLOATS } from "../trainer/params.js?v=cmoment-20261020";
 import { BatchTrainer, planBatches, tileSites, tileActive, tileSize, atlasCapacity } from "../trainer/batch.js?v=klt-20261020";
 import { COLOR_SPACES } from "../trainer/color_spaces.js?v=klt-20261020";
 import { encodeSites, codecSteps, CODEC_PLANES } from "../trainer/codec.js?v=klt-20261020";
@@ -72,6 +72,7 @@ const UI_FIELDS = [
   ["lrDirBase", "p-lrDirBase"],
   ["lrAnisoBase", "p-lrAnisoBase"],
   ["colorSpace", "p-colorSpace"],
+  ["colorMoment", "p-colorMoment"],
   ["loss", "p-loss"],
   ["errWeight", "p-errWeight"],
   ["errBeta", "p-errBeta"],
@@ -215,6 +216,8 @@ function applyConfigToForm(config, overrides = {}) {
   spaceSelect.replaceChildren(...Object.entries(COLOR_SPACES).map(([key, space]) => new Option(space.label, key)));
   document.getElementById("p-lrSchedule")
     .replaceChildren(...Object.entries(LR_SCHEDULES).map(([key, label]) => new Option(label, key)));
+  document.getElementById("p-colorMoment")
+    .replaceChildren(...Object.entries(COLOR_MOMENTS).map(([key, m]) => new Option(m.label, key)));
   document.getElementById("p-loss")
     .replaceChildren(...Object.entries(LOSSES).map(([key, loss]) => new Option(loss.label, key)));
   document.getElementById("p-countSchedule")
