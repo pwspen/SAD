@@ -301,3 +301,66 @@ CIFAR (MNIST within noise). `--base aniso=0.5,posMargin=-2,beta=1` tightens the 
 they bind (21–52% of sites at them); restoring each to stock, the Newton-gain signal ranks
 the gains correctly on both datasets (aniso +0.23 / +0.30 dB, position +0.01 / +0.07,
 β +0.03 / +0.02), share × outward gradient on MNIST only.
+
+## Structure search priced in bits (E9)
+
+`structure.mjs` runs a greedy search over discrete structure decisions on J = SSE + λ · bits
+(λ in rateLambda units; SSE of the decoded, codec-quantized sites; bits from the real codec,
+every image's sites in one stream). Actions (pluggable `ACTIONS`): `drop` (per image, merge the
+pair predicted cheapest, in every image where that pays), `coarsen:<g>` / `refine:<g>` (one
+quantizer step group ×2 / ÷2), `restrict:<r>` (iso: log aniso → 0 and no θ; grey; log τ or
+radius to the median; held by projected refits through the log hook, no trainer changes) and
+`lift:<r>`. Each is priced by Gauss–Newton + g·δ (calibrated per action on images 0–1023) and
+the codec on the previewed state; each step refits the best action and a control (40
+iterations), and keeps the action if it beats the control's J. Baselines are refit as often as
+the greedy accepted actions (k), since a 40-step refit alone gains 0.4–0.8 dB at 100 iterations.
+
+```bash
+node structure.mjs --mnist ../../comp/data/mnist/t10k-images-idx3-ubyte.gz --preset ../presets/mnist.json --lambdas 0.1,0.3,1 --sites 3,4,6,8,12
+node structure.mjs --parquet ../../comp/data/cifar10/test.parquet --preset ../presets/cifar10.json --lambdas 0.1,0.3,1 --sites 3,4,6,8,12
+```
+
+Calibration (images 0–1023, per image; ρ = Spearman, slope through 0, pooled = Σ measured / Σ
+predicted after a 40-step refit; ΔR predicted on the snapped state vs measured after the refit):
+
+| action | MNIST ρ refit | MNIST pooled | MNIST ΔR slope | CIFAR ρ refit | CIFAR pooled | CIFAR ΔR slope |
+|---|---|---|---|---|---|---|
+| drop (merge) | 0.55 | 0.14 | 0.98 | 0.62 | 0.13 | 0.97 |
+| coarsen pos / logτ / radius | 0.15 / 0.11 / 0.06 | 0.39 / 0.28 / 0.43 (render) | 0.95 / 0.83 / 0.79 | 0.60 / 0.33 / 0.30 | 0.68 / 1.01 / 0.67 | 0.92 / 0.84 / 0.92 |
+| coarsen color / log aniso / θ | 0.57 / 0.27 / 0.23 | 1.00 / 0.45 / 0.31 | 0.80 / 0.97 / 1.00 | 0.72 / 0.59 / 0.44 | 1.02 / 0.83 / 0.35 | 0.93 / 0.97 / 0.98 |
+| restrict iso | 0.57 | 0.075 | 1.00 | 0.80 | 0.21 | 0.99 |
+| restrict τ / radius | 0.27 / 0.43 | 0.038 / 0.028 | 1.01 / 1.00 | 0.71 / 0.63 | 0.059 / 0.093 | 1.00 / 0.96 |
+| restrict grey | — (MNIST sites already grey: ΔD = ΔR = 0) | | | 0.94 | 0.90 | 0.97 |
+
+The codec on the previewed state predicts ΔR almost exactly (greedy steps: ρ 0.99–1.00, slope
+0.97–1.00). Raw GN+g overstates ΔD after a refit by 13–35× for restrictions, ~4× for drops,
+~3× for most quantizer steps (color is exact: the render is linear in color). Calibrated, the
+greedy steps came out at slope (measured / calibrated, held out, 3 repeats) restrict 1.05 / 0.68,
+coarsen 0.80 / 1.08, drop 1.80 / 1.65 (MNIST / CIFAR): once the cheapest merges are taken the
+rest cost more than the all-images calibration says, so about half the drop attempts on MNIST
+were rejected.
+
+Held out (images 1024–3071, median of 3 repeats; dB = median per-image PSNR of the decoded
+sites, J per image; "+k" = refit k times like the greedy; sweep = λ 0 at 3–12 sites + the
+preset's 10, frontier PSNR linear in bpp):
+
+| data | λ | greedy dB / bpp / J | rate term +k | sweep best J (+k) | sweep frontier dB at greedy bpp | accepted actions (repeat 1) |
+|---|---|---|---|---|---|---|
+| MNIST | 0.1 | 18.62 / 0.315 / 59.45 | 18.21 / 0.321 / 63.06 | 60.26 | 18.43 | drop, coarsen logτ pos θ log aniso, drop, coarsen radius |
+| MNIST | 0.3 | 16.65 / 0.211 / 102.6 | 16.89 / 0.245 / 108.8 | 96.50 | 17.04 | iso, drop, pos×2, drop, logτ, radius, θ |
+| MNIST | 1 | 13.59 / 0.067 / 158.0 | 15.44 / 0.177 / 208.0 | 155.4 | below 3 sites (2 sites: J 175) | iso, τ, radius, pos×3, color×2, drop×6–8, θ |
+| CIFAR-10 | 0.1 | 20.61 / 0.216 / 52.00 | 20.57 / 0.203 / 50.27 | 54.19 | 20.30 | drop×8–9, coarsen θ (radius, log aniso) |
+| CIFAR-10 | 0.3 | 18.26 / 0.084 / 74.79 | 19.10 / 0.133 / 81.23 | 82.63 | 17.82 | iso, radius, drop×6, pos, color |
+| CIFAR-10 | 1 | 16.69 / 0.035 / 106.8 | 18.13 / 0.109 / 162.7 | 127.5 (2 sites, +0: 123.2) | below 3 sites | iso, τ, radius, color×2, pos×2, drop×6, logτ×2 |
+
+The greedy beats the rate term at the same λ (both refit) everywhere but CIFAR λ 0.1 (+1.7 J,
+3%), and the site-count frontier on CIFAR at λ ≥ 0.3 (−6.6 / −20.7 J; +0.44 dB at its bpp) and
+on MNIST at λ 0.1 (−0.55 J, +0.19 dB). It loses to the sweep on MNIST at λ 0.3 / 1 (+6.1 / +2.4
+J): one merge per image and step, then a refit, is worse than training fewer sites from the
+start. What it picks: quantizer steps first at small λ (pos, log τ, θ, log aniso, radius all
+×2; refining never paid), then iso (all sites round, which also drops θ), τ and radius
+constant at larger λ; on CIFAR mostly site drops. Caveats: 100-iteration presets with
+INIT_LOG_TAU 5 / INIT_RADIUS 4 (untuned; the start is far from converged, so which τ / radius
+restrictions pay may shift with a tuned init, the calibration findings less so); direction and
+anisotropy don't train in a 40-step refit (iso is one-way); calibration is fit at the start
+state and drifts as the greedy goes.
