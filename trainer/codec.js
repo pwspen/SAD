@@ -33,7 +33,7 @@
 // The site layout is io.js's: [x, y, log_tau, radius, r, g, b, dir_x, dir_y,
 // log_aniso], colors decoded RGB.
 
-import { SITE_FLOATS } from "./params.js?v=w2-20261021";
+import { SITE_FLOATS } from "./params.js?v=w2b-20261021";
 
 // ---- Bit I/O ----
 

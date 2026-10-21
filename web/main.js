@@ -4,12 +4,12 @@
 // Views: Color, IDs (each site's hashColor), and Tau / Anisotropy / Radius
 // (the same blend with every site colored by that parameter, normalized).
 
-import { loadShaders, tileSlotsForLimit } from "../trainer/shader_loader.js?v=w2-20261021";
+import { loadShaders, tileSlotsForLimit } from "../trainer/shader_loader.js?v=w2b-20261021";
 import { requestTrainingDevice } from "../trainer/device.js?v=20261019";
-import { buildArgs } from "../trainer/trainer.js?v=w2-20261021";
-import { CandidateLists } from "../trainer/candidates.js?v=20261019";
-import { RenderEncoder } from "../trainer/encoders.js?v=w2-20261021";
-import { SITE_FLOATS, createParamsBuffer } from "../trainer/params.js?v=w2-20261021";
+import { buildArgs } from "../trainer/trainer.js?v=w2b-20261021";
+import { CandidateLists } from "../trainer/candidates.js?v=w2b-20261021";
+import { RenderEncoder } from "../trainer/encoders.js?v=w2b-20261021";
+import { SITE_FLOATS, createParamsBuffer } from "../trainer/params.js?v=w2b-20261021";
 import { createRgba32FloatTexture, readRgba32FloatTexture } from "../trainer/textures.js?v=20261019";
 import { parseSitesTxt, floatImageToRgba8, triggerDownload } from "../trainer/io.js?v=20261019";
 

@@ -179,6 +179,42 @@ projects K0 onto two levels. Both score median PSNR vs real-codec bpp on held-ou
   free run is already near-binary. At the stock τ init the sites keep a grey mode (~35%)
   and snapping costs ~2 dB.
 
+`quantNoise` > 0 trains quantization-aware (`shaders/wgsl/qnoise.wgsl`): each gradient pass
+sees the sites perturbed by uniform noise U(−Δ/2, Δ/2) × `quantNoise` per coded plane, Δ the
+rate model's codec steps at `rateLossDb` (refit every `rateEvery` iterations, with or without
+the rate term): positions on their grid step, log τ, radius and log aniso on theirs, colors
+along the codec's basis axes, θ by each site's level step π / m. The clean sites are copied
+aside and back around the gradient pass, so Adam updates the clean values (`qnoise_test.mjs`).
+`quantNoiseStart` delays it (fraction of `iters`): on images 0–1023 noise from iteration 0
+cost up to 1 dB clean (the early steps, from a large error, are coarse); 0.7 was best.
+
+`qat.mjs` compares, by median PSNR of the decoded sites (coded as one stream at codecSteps'
+steps for a loss budget, rendered with rebuilt candidate lists) against measured codec bpp:
+(a) post-hoc quantization at several budgets, (b) noise at each budget's steps, (c) the rate
+term at each budget, (d) both. Held-out images 1024–3071, presets as shipped (INIT_LOG_TAU 5,
+INIT_RADIUS 4), `quantNoise` 1 from 0.7, λ 0.01 / 0.03 / 0.1, budgets 0.25–4 dB, median of 3
+repeats (repeat sd ≈ 0.015 dB). ΔPSNR of rate + noise over the rate-only curve of the same λ, at
+equal bpp (* extrapolated):
+
+| dataset | λ | 0.25 dB | 0.5 dB | 1 dB | 2 dB | 4 dB |
+|---|---|---|---|---|---|---|
+| MNIST | 0.01 | +0.03 | +0.08 | +0.37 | +0.20 | +0.18* |
+| MNIST | 0.03 | −0.10 | +0.13 | +0.41 | +0.24 | +0.18* |
+| MNIST | 0.1 | −0.18 | +0.02 | +0.28 | +0.11 | −0.00* |
+| CIFAR-10 | 0.01 | −0.04 | −0.01 | +0.09 | +0.32 | +0.68* |
+| CIFAR-10 | 0.03 | −0.04 | −0.03 | +0.11 | +0.43 | +1.02* |
+| CIFAR-10 | 0.1 | −0.10 | −0.03 | +0.16 | +0.43 | +0.82* |
+
+- Noise pays at coarse budgets (1–2 dB of quantization loss, ≲ 0.3 bpp MNIST, ≲ 0.24 bpp CIFAR)
+  and costs a little at fine ones (0.25 dB). On the frontier over every λ and budget, rate +
+  noise beats rate alone by +0.2–0.3 dB on MNIST at 0.28–0.33 bpp and +0.07 above 0.36; on
+  CIFAR it is within ±0.15 dB from 0.18 bpp up, ahead only below (sparse points).
+- Noise alone beats post-hoc quantization on MNIST (+0.07 to +0.35 dB) and is even on CIFAR
+  above 0.25 bpp; the rate term matters more on CIFAR (λ 0.1: +0.6 to +1.4 dB over post-hoc).
+- Init-dependent: with MNIST's tuned init (INIT_LOG_TAU 2.862, INIT_RADIUS 1.981; one repeat,
+  λ 0.03, 0.5–2 dB) clean PSNR is 24.05 dB instead of 18.3 and noise no longer helps: noise
+  alone −0.03 dB vs post-hoc, rate + noise −0.02 / 0.00 / ≈0 vs rate alone.
+
 ## LR bases for a new dataset (units_init.mjs)
 
 `units_init.mjs` sets the six LR bases from one probe batch instead of tuning them: every

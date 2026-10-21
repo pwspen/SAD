@@ -16,7 +16,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 
-import { COLOR_SPACES } from "../trainer/color_spaces.js?v=w2-20261021";
+import { COLOR_SPACES } from "../trainer/color_spaces.js?v=w2b-20261021";
 import { createHeadlessDevice, loadShadersFromDisk } from "./headless.mjs";
 import { loadParams, argsFor, loadMnist, loadParquet, trainBatched, median } from "./common.mjs";
 import { makeEvaluator, tune, LR_KEYS } from "./tune.mjs";

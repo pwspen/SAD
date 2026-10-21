@@ -3,15 +3,15 @@
 // (mask, init-sites, candidates/lr…) in the collapsible left panel, and a
 // side-by-side target vs reconstruction view, both aspect-fit.
 
-import { loadShaders, tileSlotsForLimit } from "../trainer/shader_loader.js?v=w2-20261021";
+import { loadShaders, tileSlotsForLimit } from "../trainer/shader_loader.js?v=w2b-20261021";
 import { requestTrainingDevice } from "../trainer/device.js?v=20261019";
-import { Trainer, buildArgs, GRAD_GROUPS, GRAD_CHANNELS, lrSchedule, LR_SCHEDULES, LOSSES, COLOR_MOMENTS, COUNT_SCHEDULES, LAYER_MODES, countPlan, countVaries, countHorizon } from "../trainer/trainer.js?v=w2-20261021";
+import { Trainer, buildArgs, GRAD_GROUPS, GRAD_CHANNELS, lrSchedule, LR_SCHEDULES, LOSSES, COLOR_MOMENTS, COUNT_SCHEDULES, LAYER_MODES, countPlan, countVaries, countHorizon } from "../trainer/trainer.js?v=w2b-20261021";
 import { loadImageToFloat32, loadMaskRgba32Float, whiteMaskRgba32Float } from "../trainer/textures.js?v=20261019";
 import { loadSitesFromFile, serializeSitesTxt, triggerDownload, floatImageToRgba8, computeBpp, computePsnr, BITS_PER_SITE } from "../trainer/io.js?v=20261019";
-import { SITE_FLOATS } from "../trainer/params.js?v=w2-20261021";
-import { BatchTrainer, planBatches, tileSites, tileActive, tileSize, atlasCapacity } from "../trainer/batch.js?v=w2-20261021";
-import { COLOR_SPACES } from "../trainer/color_spaces.js?v=w2-20261021";
-import { encodeSites, codecSteps, CODEC_PLANES } from "../trainer/codec.js?v=w2-20261021";
+import { SITE_FLOATS } from "../trainer/params.js?v=w2b-20261021";
+import { BatchTrainer, planBatches, tileSites, tileActive, tileSize, atlasCapacity } from "../trainer/batch.js?v=w2b-20261021";
+import { COLOR_SPACES } from "../trainer/color_spaces.js?v=w2b-20261021";
+import { encodeSites, codecSteps, CODEC_PLANES } from "../trainer/codec.js?v=w2b-20261021";
 import { parquetMetadata, parquetReadObjects } from "./vendor/hyparquet/src/index.js";
 import {
   luma, maskWeights, laplacianBands, maskLevels, bandEnergies, IMPORTANCE, importanceMap,

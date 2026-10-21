@@ -26,7 +26,7 @@
 // moves them. The codec then codes their planes as all zeros. withDims()
 // sets it; specializeShaders() writes it into the WGSL as a mask.
 
-import { SITE_FLOATS } from "./params.js?v=w2-20261021";
+import { SITE_FLOATS } from "./params.js?v=w2b-20261021";
 
 const COLOR_OFFSET = 4; // color_r/g/b within a site row (see io.js)
 

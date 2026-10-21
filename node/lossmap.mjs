@@ -46,9 +46,9 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 
-import { SITE_FLOATS } from "../trainer/params.js?v=w2-20261021";
+import { SITE_FLOATS } from "../trainer/params.js?v=w2b-20261021";
 import { readSites } from "../trainer/buffers.js?v=20261019";
-import { encodeSiteColors, decodeSiteColors } from "../trainer/color_spaces.js?v=w2-20261021";
+import { encodeSiteColors, decodeSiteColors } from "../trainer/color_spaces.js?v=w2b-20261021";
 import { createHeadlessDevice, loadShadersFromDisk } from "./headless.mjs";
 import { DATASET_OPTIONS, loadParams, argsFor, loadImages, trainBatched, median, mean } from "./common.mjs";
 

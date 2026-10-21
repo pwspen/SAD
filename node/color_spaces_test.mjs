@@ -10,7 +10,7 @@
 
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
-import { COLOR_SPACES, specializeShaders, colorSpaceFor, pcaBasis, withDims } from "../trainer/color_spaces.js?v=w2-20261021";
+import { COLOR_SPACES, specializeShaders, colorSpaceFor, pcaBasis, withDims } from "../trainer/color_spaces.js?v=w2b-20261021";
 
 const SHARED_URL = new URL("../shaders/sad_shared.wgsl", import.meta.url);
 

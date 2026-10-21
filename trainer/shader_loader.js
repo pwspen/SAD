@@ -42,6 +42,7 @@ const SHADER_FILES = [
   "site_stats",
   "rate",
   "lr_adapt",
+  "qnoise",
 ];
 
 let _cache = null;
@@ -93,6 +94,7 @@ export async function loadShaders({ tileSlots = 128, readText = fetchText } = {}
     SITE_STATS: out.site_stats,
     RATE: out.rate,
     LR_ADAPT: out.lr_adapt,
+    QNOISE: out.qnoise,
     tileSlots,
   };
   return _cache;

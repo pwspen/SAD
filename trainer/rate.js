@@ -16,7 +16,7 @@
 // Steps Δ come from codecSteps at a fixed quantization loss (args.rateLossDb):
 // the rate is that of coding the current sites at that fidelity.
 
-import { SITE_FLOATS } from "./params.js?v=w2-20261021";
+import { SITE_FLOATS } from "./params.js?v=w2b-20261021";
 
 export const RATE_PLANES = ["log_tau", "radius", "K0", "K1", "K2", "log_aniso"];
 const RATE_HEADER = 20;
@@ -160,5 +160,38 @@ export function rateBuffer(model, { lambda, siteCount, layerSlot = null, sitesPe
       f.set([Math.log(step) + Math.log(mix.weights[j]) - 0.5 * (LOG_2PI + Math.log(s2)), mix.means[j], s2], b + 2 + 3 * j);
     }
   });
+  return f;
+}
+
+// ---- Quantization noise (qnoise.wgsl, args.quantNoise) ----
+
+export const QNOISE_FLOATS = 26;
+
+// A step as the codec stores it: 2^(e / 8), e an integer in ±160 (codec.js
+// quantizeStep; Infinity / 0 go to the largest step).
+export function codecStep(step) {
+  const e = Number.isFinite(step) && step > 0 ? Math.round(8 * Math.log2(step)) : 160;
+  return 2 ** (Math.max(-160, Math.min(160, e)) / 8);
+}
+
+// The qnoise.wgsl buffer: noise of `scale` × the codec's steps (codecSteps,
+// rounded as the codec stores them) per coded plane, colors along `basis`.
+export function quantNoiseBuffer(steps, basis, { scale = 1, siteCount, layerSlot = null, seed = 0, width, height, tiling = null }) {
+  const f = new Float32Array(QNOISE_FLOATS);
+  const u = new Uint32Array(f.buffer);
+  u[0] = siteCount >>> 0;
+  u[1] = layerSlot === null || layerSlot === undefined ? 0xffffffff : layerSlot >>> 0;
+  u[2] = tiling ? tiling.sitesPerTile >>> 0 : 0;
+  u[3] = seed >>> 0;
+  u[4] = (tiling ? tiling.tileW : width) >>> 0;
+  u[5] = (tiling ? tiling.tileH : height) >>> 0;
+  u[6] = tiling ? tiling.tilesX >>> 0 : 1;
+  f.set(["pos", "logTau", "radius", "color", "logAniso"].map((k) => scale * codecStep(steps[k])), 8);
+  // θ: the site's levels m follow from the unscaled step; the noise is
+  // scale × π / m wide.
+  f[7] = scale;
+  f[13] = scale > 0 ? codecStep(steps.theta) : 0;
+  f.set(basis.mean, 14);
+  basis.axes.forEach((ax, k) => f.set(ax, 17 + 3 * k));
   return f;
 }

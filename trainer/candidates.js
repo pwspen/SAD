@@ -15,10 +15,10 @@ import {
   createPackParamsBuffer,
   updatePackParamsBuffer,
   packJumpStep,
-} from "./params.js?v=w2-20261021";
+} from "./params.js?v=w2b-20261021";
 import { createPackedCandidatesBuffer } from "./buffers.js?v=20261019";
 import { createCandidateTexture, readRgba32FloatTexture } from "./textures.js?v=20261019";
-import { CandidatesEncoder, SeedCandidatesEncoder, CandidatePackEncoder } from "./encoders.js?v=w2-20261021";
+import { CandidatesEncoder, SeedCandidatesEncoder, CandidatePackEncoder } from "./encoders.js?v=w2b-20261021";
 
 const NO_SITE = 0xffffffff;
 
