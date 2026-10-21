@@ -31,7 +31,8 @@
 //   the real codec, median PSNR over images vs codec bits per pixel. Each λ is
 //   run with the rate term alone (the baseline curve) and with the warp; the
 //   warp's gain is ΔPSNR at matched bpp, against the baseline curve
-//   interpolated linearly in bpp (and Δbpp at matched PSNR). --lrs > 1 value:
+//   interpolated linearly in bpp over its non-dominated points (and Δbpp
+//   at matched PSNR). --lrs > 1 value:
 //   every lr is run (for tuning on images 0–1023; score held out 1024–3071).
 //   --repeats: medians over repeats. --grads dr,d also runs the warp on the
 //   squared-error gradient alone (rate term still on per site): what the
@@ -113,8 +114,9 @@ export function makeWarp({ kernels = 16, lr = 0.1, planes = PLANES, rate = true,
       const sorted = Float64Array.from(vs).sort();
       const lo = qs(sorted, 0.01), hi = qs(sorted, 0.99);
       if (!(hi > lo)) return;
-      const h = (hi - lo) / (kernels - 1);
-      const mu = Array.from({ length: kernels }, (_, k) => lo + k * h);
+      // --kernels 1: one bump of width hi − lo at the centre, ≈ a shift of the plane.
+      const h = kernels > 1 ? (hi - lo) / (kernels - 1) : hi - lo;
+      const mu = Array.from({ length: kernels }, (_, k) => (kernels > 1 ? lo + k * h : (lo + hi) / 2));
       const G = new Float64Array(kernels);
       for (let r = 0; r < rows.length; r += 1) for (let k = 0; k < kernels; k += 1) G[k] += gs[r] * Math.exp(-((vs[r] - mu[k]) ** 2) / (2 * h * h));
       const st = state[j];
@@ -194,9 +196,14 @@ export async function runOnce(ctx, params, images, { warp = null, every = 1, sta
   return out;
 }
 
-// Baseline PSNR at `bpp` from a curve [{ bpp, psnr }] (linear in bpp; NaN outside).
+// The curve's non-dominated points (no other has fewer bpp and more PSNR):
+// small λ can sit above λ = 0 on PSNR, which makes λ = 0 a dominated point.
+export const frontier = (curve) => curve.filter((p) => !curve.some((q) => q !== p && q.bpp <= p.bpp && q.psnr >= p.psnr && (q.bpp < p.bpp || q.psnr > p.psnr)));
+
+// Baseline PSNR at `bpp` from a curve [{ bpp, psnr }] (its frontier, linear
+// in bpp; NaN outside).
 export function psnrAt(curve, bpp) {
-  const c = [...curve].sort((a, b) => a.bpp - b.bpp);
+  const c = frontier(curve).sort((a, b) => a.bpp - b.bpp);
   for (let i = 0; i + 1 < c.length; i += 1) {
     if (bpp >= c[i].bpp && bpp <= c[i + 1].bpp) {
       const t = (bpp - c[i].bpp) / Math.max(1e-12, c[i + 1].bpp - c[i].bpp);
@@ -206,9 +213,9 @@ export function psnrAt(curve, bpp) {
   return NaN;
 }
 
-// Baseline bpp at `psnr` (the curve sorted by PSNR; NaN outside).
+// Baseline bpp at `psnr` (its frontier sorted by PSNR; NaN outside).
 export function bppAt(curve, psnr) {
-  const c = [...curve].sort((a, b) => a.psnr - b.psnr);
+  const c = frontier(curve).sort((a, b) => a.psnr - b.psnr);
   for (let i = 0; i + 1 < c.length; i += 1) {
     if (psnr >= c[i].psnr && psnr <= c[i + 1].psnr) {
       const t = (psnr - c[i].psnr) / Math.max(1e-12, c[i + 1].psnr - c[i].psnr);

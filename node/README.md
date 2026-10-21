@@ -90,6 +90,30 @@ compares held-out PSNR and codec bits.
 KLT of the target. `rate.mjs` checks the estimate against the real codec per plane and
 sweeps λ against the site count by median PSNR vs measured bits per pixel.
 
+`warp.mjs` (3a) adds a shared monotone warp per coded plane, φ(v) = v + Σ a_k b_k(v)
+(Gaussian bumps), applied to every site of the atlas and stepped from the log hook on the
+kernel-smoothed histogram of per-site gradients of squared error + λ · bits (no trainer
+changes); `binarize.mjs` (3c) measures the MNIST luma (K0) distribution across λ and
+projects K0 onto two levels. Both score median PSNR vs real-codec bpp on held-out images
+1024–3071 (header comments for the method). Findings, 100 iterations, 10 sites:
+
+- The presets' `INIT_LOG_TAU` 5 / `INIT_RADIUS` 4 were never tuned. tune.mjs on images
+  0–1023: MNIST 2.862 / 1.981, 18.44 → 24.18 dB; CIFAR-10 2.822 / 4, 21.48 → 21.63 dB.
+  The runs below use those (MNIST also with its LR bases retuned at that init where noted).
+- Warp (lr 0.3 tuned on 0–1023, 16 bumps, every iteration), ΔPSNR at matched bpp against
+  the rate-only frontier, 3 repeats: MNIST +0.9–1.3 dB over 0.21–0.41 bpp (LRs retuned;
+  +1.4–1.5 at init-only), CIFAR-10 +0.04–0.20 dB (mean 0.10). Most of it is an optimizer
+  effect, not a rate one: at λ = 0 the warp already gains +1.2 dB MNIST / +0.11 CIFAR, and at
+  λ ≥ 1 it gains nothing. One bump (a per-plane shift) loses. Driven by the squared error
+  alone (rate term still on per site) the warp undoes the rate term's clustering and is
+  dominated by the λ · bits-driven warp at every bpp.
+- Binarization (tuned init): as λ grows the K0 mixture collapses onto black and white
+  (sites within 0.1 of either: 55% at λ 0, 83–95% at 0.1, 99% at 0.3); projecting K0 onto
+  {0, 1} from mid-run costs no PSNR anywhere from λ 0 to 0.3 (+0.03…+0.23 dB at the same
+  λ, −0.002…−0.04 bpp; K0 3.3 → 0.6 codec bits/site at λ 0) and is neutral at λ 1, where the
+  free run is already near-binary. At the stock τ init the sites keep a grey mode (~35%)
+  and snapping costs ~2 dB.
+
 ## LR bases for a new dataset (units_init.mjs)
 
 `units_init.mjs` sets the six LR bases from one probe batch instead of tuning them: every
