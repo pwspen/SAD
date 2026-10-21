@@ -668,6 +668,14 @@ const VIEWS = {
                       "circle is one run; the box spans the quartiles, the thick line the median and the whiskers " +
                       "1.5× the interquartile range. Drawn once the batch has finished; hover a run to find it " +
                       "in the other batch plots, click to load it." },
+  batchBpp:   { stage: "batch", label: "Batch: PSNR vs bpp", kind: "plot", source: "train", on: ["batch"],
+                draw: drawBatchViews, hit: hitBatchBpp, click: clickBatchRun,
+                note: `Every run of the last batch on the raw rate the PSNR vs bpp card plots: ` +
+                      `x = sites × ${BITS_PER_SITE} bits / pixels, y = PSNR. A faint trail traces each run's log ticks ` +
+                      "in iteration order; the dot at its end is the final render. A run's image size moves it " +
+                      "sideways (a smaller image costs less bpp at the same site count), so mixed-size datasets " +
+                      "spread horizontally. Grey: finished; blue: still running; hover a trail or dot to find its " +
+                      "run; once the batch has finished, click it to load it into the other views. X is log-scaled." },
   tune:       { stage: "tune", label: "Auto-tune: PSNR vs setting", kind: "plot", source: "train", on: ["tune"],
                 draw: drawTunePlot, hit: hitTune,
                 note: "The setting the last auto-tune climbed (a tune button or optimize all, one setting at a " +
@@ -691,7 +699,7 @@ const LAYOUTS = {
   batch: {
     label: "Batch",
     areas: `"batchHist   batchPsnr   tune"
-            "batchDigits batchDigits batchDigits"`,
+            "batchBpp    batchDigits batchDigits"`,
   },
   run: {
     label: "Run",
@@ -4656,13 +4664,14 @@ function openBatchSettings() {
 const BATCH_RUNNING_COLOR = SERIES_COLORS[0];
 const BATCH_AVG_COLOR = SERIES_COLORS[5];
 const batchHoverRun = () => VIEWS.batchPsnr.hoverKey ?? VIEWS.batchHist.hoverKey ??
-  VIEWS.batchDigits.hoverKey ?? null;
+  VIEWS.batchDigits.hoverKey ?? VIEWS.batchBpp.hoverKey ?? null;
 
 // All batch cards share hover and selection, so each draws all three.
 function drawBatchViews() {
   if (VIEWS.batchPsnr.canvas) drawBatchPsnr(VIEWS.batchPsnr);
   if (VIEWS.batchHist.canvas) drawBatchHist(VIEWS.batchHist);
   if (VIEWS.batchDigits.canvas) drawBatchDigits(VIEWS.batchDigits);
+  if (VIEWS.batchBpp.canvas) drawBatchBpp(VIEWS.batchBpp);
 }
 
 // Bumped whenever a batch's runs change (scheduleBatchDraw, runBatch), so the
@@ -5042,6 +5051,138 @@ function hitBatchDigits(g, mx, my) {
   let best = null, bestD = 100;
   for (const pt of g.points) {
     const dd = (g.x(pt.x) - mx) ** 2 + (g.y(pt.psnr) - my) ** 2;
+    if (dd < bestD) { bestD = dd; best = pt.run; }
+  }
+  return best;
+}
+
+// ---- Batch: PSNR vs bpp ----
+
+// One point per run log tick plus the final render, each at its own raw rate
+// (its site count over its image's pixels), so mixed-size batches spread out.
+function batchBppPoints(runs) {
+  const pts = [];
+  for (const r of runs) {
+    if (!r.width || !r.height) continue;
+    const bpp = (sites) => computeBpp(sites, r.width, r.height);
+    for (const d of r.curve) {
+      if (Number.isFinite(d.psnr) && d.sites > 0) pts.push({ run: r.id, it: d.it, sites: d.sites, x: bpp(d.sites), y: d.psnr });
+    }
+    if (r.status === "done" && r.final) {
+      const x = bpp(r.final.activeSites);
+      if (x > 0 && Number.isFinite(r.final.psnr)) {
+        pts.push({ run: r.id, final: true, sites: r.final.activeSites, x, y: r.final.psnr });
+      }
+    }
+  }
+  return pts;
+}
+
+function batchBppTip(run, pt) {
+  return {
+    rows: [{ cells: [run.name] },
+           { cells: [`${pt.sites} sites · ${fmtSig(pt.x)} bpp (${BITS_PER_SITE} bits/site) · ` +
+                     `${pt.y.toFixed(2)} dB${pt.final ? "" : ` @ it ${pt.it}`}`] }],
+    footer: state.batch.running ? undefined : "click to open",
+  };
+}
+
+// Draws one run's whole rate–distortion trail above the cached layer.
+function batchBppTrail(p, g, pts, color, width = 2) {
+  if (!pts?.length) return;
+  drawLine(p, g, pts.map((pt) => [pt.x, pt.y]), color, { width });
+}
+
+function drawBatchBpp(view) {
+  const p = beginPlot(view);
+  if (!p) return;
+  const b = state.batch;
+  const runs = b?.runs ?? [];
+  const points = batchBppPoints(runs);
+  // Binned once here: the cached layer draws trails from it, and the live
+  // highlight needs the selected / hovered run's trail too.
+  const byRun = new Map();
+  for (const pt of points) {
+    let list = byRun.get(pt.run);
+    if (!list) byRun.set(pt.run, list = []);
+    list.push(pt);
+  }
+  const g = view.geom = batchLayer(view, p, String(batchVersion), () => {
+    if (!points.length) {
+      const g0 = plotAxes(plotBox(p), { min: 0.1, max: 1, log: true }, { min: 0, max: 40 });
+      drawAxes(p, g0, { xTitle: "bpp", yTitle: "PSNR (dB)", xFmt: fmtSig });
+      drawEmpty(p, g0, b?.running ? "Waiting for the first log ticks…" : "Run a batch (Batch… in the top bar)");
+      return { ...g0, empty: true };
+    }
+    let xMin = Infinity, xMax = -Infinity, lo = Infinity, hi = -Infinity;
+    for (const pt of points) {
+      xMin = Math.min(xMin, pt.x); xMax = Math.max(xMax, pt.x);
+      lo = Math.min(lo, pt.y); hi = Math.max(hi, pt.y);
+    }
+    // At least a decade of x range, centred on the data (as the PSNR vs bpp
+    // card does, so the two plots stay comparable).
+    const span = Math.max(1, Math.log10(xMax / xMin) * 1.2);
+    const mid = (Math.log10(xMin) + Math.log10(xMax)) / 2;
+    const g = plotAxes(plotBox(p), { min: 10 ** (mid - span / 2), max: 10 ** (mid + span / 2), log: true },
+                       linRange(lo, hi, [0, 40]));
+    drawAxes(p, g, { xTitle: `bpp (${BITS_PER_SITE} bits/site)`, yTitle: "PSNR (dB)",
+                     xFmt: fmtSig, xSpacing: 40 });
+    // Faint trails so thousands of overlapping runs still read as a band,
+    // grouped per stroke like the PSNR-vs-iteration batch plot. The trails
+    // skip points the axes can't show the way drawLine's pen lift does.
+    const { ctx } = p;
+    ctx.save();
+    ctx.globalAlpha = Math.max(0.12, Math.min(0.7, 4 / Math.sqrt(Math.max(1, runs.length))));
+    ctx.lineWidth = 1;
+    ctx.lineJoin = "round";
+    const groups = [[p.col.dim, runs.filter((r) => r.status !== "running")],
+                    [BATCH_RUNNING_COLOR, runs.filter((r) => r.status === "running")]];
+    for (const [color, list] of groups) {
+      ctx.strokeStyle = color;
+      for (let s = 0; s < list.length; s += BATCH_CURVES_PER_STROKE) {
+        ctx.beginPath();
+        for (const r of list.slice(s, s + BATCH_CURVES_PER_STROKE)) {
+          let pen = false;
+          for (const pt of byRun.get(r.id) ?? []) {
+            if (!g.ok(pt.x, pt.y)) { pen = false; continue; }
+            if (pen) ctx.lineTo(g.x(pt.x), g.y(pt.y)); else ctx.moveTo(g.x(pt.x), g.y(pt.y));
+            pen = true;
+          }
+        }
+        ctx.stroke();
+      }
+    }
+    ctx.restore();
+    // The final render of every finished run, on top of its trail.
+    for (const pt of points) if (pt.final) drawMarker(p, g, pt.x, pt.y, p.col.dim, 3.5);
+    return { ...g, points };
+  });
+  if (g.empty) return;
+  const sel = b.selected != null ? runs[b.selected] : null;
+  if (sel) {
+    batchBppTrail(p, g, byRun.get(sel.id), PSNR_LINE_COLOR);
+    const selPts = byRun.get(sel.id);
+    if (selPts?.length) {
+      const last = selPts.at(-1);
+      drawMarker(p, g, last.x, last.y, PSNR_LINE_COLOR, 4.5);
+    }
+  }
+  const hov = batchHoverRun() != null ? runs[batchHoverRun()] : null;
+  if (hov && hov !== sel) batchBppTrail(p, g, byRun.get(hov.id), p.col.text);
+  const hovPts = hov ? byRun.get(hov.id) : null;
+  if (hovPts?.length) {
+    const tip = hovPts.at(-1); // the final render, or the latest tick while running
+    drawMarker(p, g, tip.x, tip.y, hov === sel ? PSNR_LINE_COLOR : p.col.text, 4.5);
+    drawTooltip(p, g, g.x(tip.x), g.y(tip.y), batchBppTip(hov, tip));
+  }
+}
+
+// The run whose trail or final dot passes nearest the cursor, within 10 px.
+function hitBatchBpp(g, mx, my) {
+  if (!g.points) return null;
+  let best = null, bestD = 100;
+  for (const pt of g.points) {
+    const dd = (g.x(pt.x) - mx) ** 2 + (g.y(pt.y) - my) ** 2;
     if (dd < bestD) { bestD = dd; best = pt.run; }
   }
   return best;
