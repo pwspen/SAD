@@ -5,12 +5,12 @@
 
 import { loadShaders, tileSlotsForLimit } from "../trainer/shader_loader.js?v=20261019";
 import { requestTrainingDevice } from "../trainer/device.js?v=20261019";
-import { Trainer, buildArgs, GRAD_GROUPS, GRAD_CHANNELS, lrSchedule, LR_SCHEDULES, LOSSES, COUNT_SCHEDULES, LAYER_MODES, countPlan, countVaries, countHorizon } from "../trainer/trainer.js?v=codec-20261020";
+import { Trainer, buildArgs, GRAD_GROUPS, GRAD_CHANNELS, lrSchedule, LR_SCHEDULES, LOSSES, COUNT_SCHEDULES, LAYER_MODES, countPlan, countVaries, countHorizon } from "../trainer/trainer.js?v=ycocg-20261020";
 import { loadImageToFloat32, loadMaskRgba32Float, whiteMaskRgba32Float } from "../trainer/textures.js?v=20261019";
 import { loadSitesFromFile, serializeSitesTxt, triggerDownload, floatImageToRgba8, computeBpp, computePsnr, BITS_PER_SITE } from "../trainer/io.js?v=20261019";
 import { SITE_FLOATS } from "../trainer/params.js?v=20261019";
-import { BatchTrainer, planBatches, tileSites, tileActive, tileSize, atlasCapacity } from "../trainer/batch.js?v=codec-20261020";
-import { COLOR_SPACES } from "../trainer/color_spaces.js?v=20261019";
+import { BatchTrainer, planBatches, tileSites, tileActive, tileSize, atlasCapacity } from "../trainer/batch.js?v=ycocg-20261020";
+import { COLOR_SPACES } from "../trainer/color_spaces.js?v=ycocg-20261020";
 import { encodeSites, codecSteps, CODEC_PLANES } from "../trainer/codec.js?v=20261020b";
 import { parquetMetadata, parquetReadObjects } from "./vendor/hyparquet/src/index.js";
 import {

@@ -70,6 +70,10 @@ quantizer step Δ, the median 1/√F of the Gauss–Newton diagonal, the spread 
 values) and how well each explains the LRs; E2, how much of the per-site gradient a
 per-value-bin mean explains, early and late in the run; E3, per-parameter entropy at the
 codec steps against the total correlation a joint model could remove.
+It also audits the codec: color bits per site under static RGB, YCoCg-R and joint
+models, against the codec itself per image and over every image's sites in one stream.
+`colorspaces.mjs` tunes the six LR bases separately for each training color space and
+compares held-out PSNR and codec bits.
 `e1.mjs` tunes the six LR bases on MNIST and CIFAR-10, replaces them with one constant
 × each unit, and scores everything on held-out images, within and across datasets.
 

@@ -54,7 +54,7 @@ import {
   specializeShaders,
   encodeSiteColors,
   decodeSiteColors,
-} from "./color_spaces.js?v=20261019";
+} from "./color_spaces.js?v=ycocg-20261020";
 
 const MAX_PREVIEW_IMAGE_READBACKS = 2;
 const MAX_PREVIEW_SITE_READBACKS = 8;

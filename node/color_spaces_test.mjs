@@ -6,7 +6,7 @@
 
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
-import { COLOR_SPACES, specializeShaders } from "../trainer/color_spaces.js?v=20261019";
+import { COLOR_SPACES, specializeShaders } from "../trainer/color_spaces.js?v=ycocg-20261020";
 
 const SHARED_URL = new URL("../shaders/sad_shared.wgsl", import.meta.url);
 

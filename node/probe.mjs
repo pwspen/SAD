@@ -25,6 +25,15 @@
 //   most a joint model could save at high rate. TC from a k-nearest-neighbour
 //   estimate of the copula entropy, minus the same on columns shuffled
 //   independently (the estimator's bias), and from a Gaussian copula.
+// Codec audit. E3's per-parameter sum is a static model of RGB shared by
+//   every image; the real codec differs in three ways: it codes YCoCg-R
+//   integers, predicts each value from neighbouring sites (or a per-image
+//   constant), and its adaptive models start from scratch in every image.
+//   At E3's steps, bits per site for the color: static entropies of RGB, of
+//   the codec's YCoCg-R integers, and of the joint RGB triple; then the codec
+//   itself, once per image (as it runs) and once over every image's sites in
+//   one stream (no per-image header or model start-up), with every plane's
+//   share. The histogram layer is left out throughout.
 
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
@@ -32,8 +41,8 @@ import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 
 import { SITE_FLOATS } from "../trainer/params.js?v=20261019";
-import { codecSteps } from "../trainer/codec.js?v=codec-20261020";
-import { COLOR_SPACES } from "../trainer/color_spaces.js?v=20261019";
+import { codecSteps, encodeSites, CODEC_PLANES } from "../trainer/codec.js?v=codec-20261020";
+import { COLOR_SPACES } from "../trainer/color_spaces.js?v=ycocg-20261020";
 import { createHeadlessDevice, loadShadersFromDisk } from "./headless.mjs";
 import { DATASET_OPTIONS, loadParams, argsFor, loadImages, trainBatched, median, mean } from "./common.mjs";
 
@@ -343,14 +352,76 @@ export function e3Report(rows, steps, { maxRows = 6000, seed = 1 } = {}) {
   };
 }
 
+// ---- Codec audit ----
+
+function entropyOf(keys) {
+  const counts = new Map();
+  for (const k of keys) counts.set(k, (counts.get(k) ?? 0) + 1);
+  let h = 0;
+  for (const c of counts.values()) h -= (c / keys.length) * Math.log2(c / keys.length);
+  return h + (counts.size - 1) / (2 * keys.length * Math.LN2);
+}
+
+// Per-plane codec bits per site: { header, position, <plane>…, total }.
+function codecBits(list, steps) {
+  const acc = { header: 0, position: 0, ...Object.fromEntries(CODEC_PLANES.map((p) => [p, 0])) };
+  let n = 0, modes = null;
+  for (const im of list) {
+    const enc = encodeSites(im.sites, im.n, im.width, im.height, steps);
+    acc.header += enc.headerBits;
+    acc.position += enc.positionBits;
+    CODEC_PLANES.forEach((p, k) => { acc[p] += enc.planeBits[k]; });
+    n += enc.n;
+    modes = enc.modes;
+  }
+  const out = Object.fromEntries(Object.entries(acc).map(([k, v]) => [k, v / Math.max(1, n)]));
+  out.total = Object.values(out).reduce((s, v) => s + v, 0);
+  out.color = out.Y + out.Co + out.Cg;
+  return { perSite: out, sites: n, modes: list.length === 1 ? Object.fromEntries(CODEC_PLANES.map((p, k) => [p, modes[k] ? "neighbours" : "constant"])) : null };
+}
+
+// perImage: each image's sites in its own coordinates. rows: E3's rows.
+export function codecAudit(perImage, rows, steps) {
+  const c = steps.color;
+  const q = rows.map((r) => [Math.round(r[2] / c), Math.round(r[3] / c), Math.round(r[4] / c)]);
+  const ycocg = q.map(([r, g, b]) => { const co = r - b, t = b + (co >> 1), cg = g - t; return [t + (cg >> 1), co, cg]; });
+  const col = (arr, k) => arr.map((v) => v[k]);
+  const staticBits = {
+    "R+G+B": [0, 1, 2].reduce((s, k) => s + entropyOf(col(q, k)), 0),
+    "Y+Co+Cg": [0, 1, 2].reduce((s, k) => s + entropyOf(col(ycocg, k)), 0),
+    "joint RGB": entropyOf(q.map((v) => v.join(","))),
+  };
+  const perPlaneStatic = { Y: entropyOf(col(ycocg, 0)), Co: entropyOf(col(ycocg, 1)), Cg: entropyOf(col(ycocg, 2)) };
+  // Every image's sites as one image: tiles in a near-square grid.
+  const W = Math.max(...perImage.map((im) => im.width)), H = Math.max(...perImage.map((im) => im.height));
+  const T = Math.ceil(Math.sqrt(perImage.length));
+  const total = perImage.reduce((s, im) => s + im.n, 0);
+  const pooled = new Float32Array(total * SITE_FLOATS);
+  let at = 0;
+  perImage.forEach((im, b) => {
+    const ox = (b % T) * W, oy = Math.floor(b / T) * H;
+    for (let i = 0; i < im.n; i += 1, at += 1) {
+      const src = im.sites.subarray(i * SITE_FLOATS, (i + 1) * SITE_FLOATS);
+      pooled.set(src, at * SITE_FLOATS);
+      if (src[0] >= 0) { pooled[at * SITE_FLOATS] += ox; pooled[at * SITE_FLOATS + 1] += oy; }
+    }
+  });
+  return {
+    sites: rows.length, staticBits, perPlaneStatic,
+    perImage: codecBits(perImage, steps),
+    pooled: codecBits([{ sites: pooled, n: total, width: T * W, height: Math.ceil(perImage.length / T) * H }], steps),
+  };
+}
+
 // ---- One probed run ----
 
 // Trains `images` once with `args`, recording E2's per-tick gradients and,
 // after the run, the Gauss–Newton diagonal for E1 and the final sites for E3.
-export async function probe(ctx, args, images, { e2 = true, e3 = true } = {}) {
+export async function probe(ctx, args, images, { e2 = true, e3 = true, audit = true } = {}) {
   const ticks = [];
   const e1Parts = { sites: [], F: [], sse0: 0 };
   const rows = [];
+  const perImage = []; // { sites (layer marked inactive), n, width, height }
   const record = (info, idx, bt) => {
     if (!e2 || info.type !== "batchIter") return;
     const n = bt.layout.sitesPerTile, layer = info.layer;
@@ -370,6 +441,9 @@ export async function probe(ctx, args, images, { e2 = true, e3 = true } = {}) {
     const n = bt.layout.sitesPerTile, layer = bt.layerSlot;
     final.forEach((r, b) => {
       const img = images[idx[b]];
+      const own = Float32Array.from(r.sites);
+      if (layer !== null && layer !== undefined) own[layer * SITE_FLOATS] = -1;
+      perImage.push({ sites: own, n, width: img.width, height: img.height });
       e1Parts.sse0 += 3 * img.width * img.height * 10 ** (-r.psnr / 10);
       for (let i = 0; i < n; i += 1) {
         if (i === layer || !(r.sites[i * SITE_FLOATS] >= 0)) continue;
@@ -394,6 +468,7 @@ export async function probe(ctx, args, images, { e2 = true, e3 = true } = {}) {
     steps,
     e2: e2 ? e2Report(ticks, args.iters) : null,
     e3: e3 ? e3Report(rows, steps) : null,
+    audit: audit ? codecAudit(perImage, rows, steps) : null,
   };
 }
 
@@ -427,6 +502,16 @@ export function printReport(rep, log = console.error) {
       log(`         ${name.padEnd(17)} ${s.marginalBits.toFixed(2).padEnd(11)} ${s.tcKnn.toFixed(2).padEnd(8)} (${s.tcBias.toFixed(2)})   ${f3(s.tcGaussian)}`);
     }
     log(`         color PCA: first axis ${(100 * e.colorPca.firstAxisShare).toFixed(1)}% of variance, along RGB ${e.colorPca.axis.join(", ")}`);
+  }
+  if (rep.audit) {
+    const a = rep.audit, fmt = (o) => Object.entries(o).map(([k, v]) => `${k} ${v.toFixed(2)}`).join(", ");
+    log(`Audit  | color bits/site at E3's steps. Static: ${fmt(a.staticBits)} (Y ${a.perPlaneStatic.Y.toFixed(2)}, ` +
+        `Co ${a.perPlaneStatic.Co.toFixed(2)}, Cg ${a.perPlaneStatic.Cg.toFixed(2)})`);
+    for (const name of ["perImage", "pooled"]) {
+      const b = a[name];
+      log(`         codec ${name === "perImage" ? "per image" : "pooled   "}: color ${b.perSite.color.toFixed(2)} | ${fmt(b.perSite)}` +
+          (b.modes ? ` | modes ${Object.entries(b.modes).map(([k, m]) => `${k}:${m[0]}`).join(" ")}` : ""));
+    }
   }
 }
 

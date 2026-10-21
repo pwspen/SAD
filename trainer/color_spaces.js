@@ -55,6 +55,16 @@ export const COLOR_SPACES = {
       return [u[0] + u[1] + u[2], (2 * u[0] - u[1] - u[2]) / 3, (2 * u[2] - u[1] - u[0]) / 3];
     },
   },
+  // Real-valued YCoCg, the linear transform the codec's YCoCg-R approximates
+  // on integers: Y = (R + 2G + B) / 4, Co = (R − B) / 2, Cg = (2G − R − B) / 4.
+  // Luma and the two chroma axes get their own Adam scales.
+  ycocg: {
+    id: 2,
+    label: "YCoCg",
+    encode: (r, g, b) => [(r + 2 * g + b) / 4, (r - b) / 2, (2 * g - r - b) / 4],
+    decode: (y, co, cg) => [y - cg + co, y + cg, y - cg - co],
+    vjp: (p, g) => [g[0] + g[1] + g[2], g[0] - g[2], g[1] - g[0] - g[2]],
+  },
 };
 
 export function colorSpaceFor(name) {
