@@ -643,8 +643,9 @@ const VIEWS = {
                 draw: drawTunePlot, hit: hitTune,
                 note: "The setting the last auto-tune climbed (a tune button or optimize all, one setting at a " +
                       "time): one dot per value tried, at the median final PSNR of its batch on the same images. " +
-                      "Orange: the best so far; the dashed line marks where it started. x is log-scaled, since " +
-                      "each round multiplies or divides by the tune ratio." },
+                      "Orange: the best so far; green diamonds: Newton steps (the peak of a parabola through a " +
+                      "round's three medians); the dashed line marks where it started. x is log-scaled, since " +
+                      "each round multiplies or divides by the step." },
   clusterMap: { label: `Snap clusters on the image (k = ${SNAP_MAP_K})`, kind: "image", source: "derived",
                 blank: "#f1f1ec", on: ["render"], draw: drawClusterMap,
                 note: "The latest render, washed out, with each site's centroid in its cluster's color from the " +
@@ -1808,6 +1809,7 @@ function drawLrPlot(view) {
 // ---- Auto-tune: median PSNR vs the setting's value ----
 
 const TUNE_DOT_COLOR = SERIES_COLORS[0];
+const TUNE_NEWTON_COLOR = SERIES_COLORS[2];
 
 function tunePoints() {
   return [...(state.tuneTrace?.points ?? [])].sort((a, b) => a.v - b.v);
@@ -1852,15 +1854,33 @@ function drawTunePlot(view) {
   }
   drawRefLine(p, g, { x: trace.start, label: "start" });
   drawLine(p, g, pts.map((pt) => [pt.v, pt.median]), col.soft, { width: 1 });
-  for (const pt of pts) drawMarker(p, g, pt.v, pt.median, pt.v === trace.best ? PSNR_LINE_COLOR : TUNE_DOT_COLOR);
+  const mark = (pt, r = 4) => (pt.newton ? drawDiamond : drawMarker)(p, g, pt.v, pt.median, tuneColor(pt, trace), r);
+  for (const pt of pts) mark(pt);
   const hover = view.hoverKey != null ? pts[view.hoverKey] : null;
   if (hover) {
-    drawMarker(p, g, hover.v, hover.median, hover.v === trace.best ? PSNR_LINE_COLOR : TUNE_DOT_COLOR, 6);
+    mark(hover, 6);
     drawTooltip(p, g, g.x(hover.v), g.y(hover.median), {
       rows: [{ cells: [`${trace.name} ${hover.v}`, `${hover.median.toFixed(3)} dB`] }],
-      footer: (hover.round ? `round ${hover.round}` : "starting value") + (hover.v === trace.best ? " · best" : ""),
+      footer: (hover.round ? `round ${hover.round}` : "starting value") + (hover.newton ? " · Newton step" : "") +
+              (hover.v === trace.best ? " · best" : ""),
     });
   }
+}
+
+// Best: orange; Newton steps (the parabola's peak): green diamonds; the rest blue.
+const tuneColor = (pt, trace) => (pt.v === trace.best ? PSNR_LINE_COLOR : pt.newton ? TUNE_NEWTON_COLOR : TUNE_DOT_COLOR);
+
+function drawDiamond(p, g, x, y, color, r = 4) {
+  if (!g.ok(x, y)) return;
+  const { ctx, col } = p, cx = g.x(x), cy = g.y(y), d = r * 1.35;
+  ctx.beginPath();
+  ctx.moveTo(cx, cy - d); ctx.lineTo(cx + d, cy); ctx.lineTo(cx, cy + d); ctx.lineTo(cx - d, cy);
+  ctx.closePath();
+  ctx.fillStyle = color;
+  ctx.fill();
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = col.surface;
+  ctx.stroke();
 }
 
 function hitTune(g, mx) {
@@ -3838,17 +3858,23 @@ function medianOf(values) {
   return v.length % 2 ? v[m] : (v[m - 1] + v[m]) / 2;
 }
 
-// Auto-tune one float setting on the current batch settings: from the current
-// value, try × and ÷ the tune ratio (each a full batch on the same images),
-// move to whichever raises the median final PSNR most, and repeat from there
-// (values already measured aren't re-run). Halts when neither beats the
-// current value, after tune max rounds, or on stop.
+// Auto-tune one float setting on the current batch settings, as node/tune.mjs
+// does headless. Each round, in log space around the current value: try × and
+// ÷ the step r (each a full batch on the same images; values already measured
+// aren't re-run), plus the peak of a parabola through the three medians when it
+// opens down with its peak inside (−2, 2) steps and not on a value already run
+// (a Newton step); move to the best measured value. When that is still the
+// current one, decay the step, r ← r^decay, instead of stopping. Done when r
+// falls below tune min ratio, after tune max rounds, or on stop.
 function tuneSettings() {
-  const ratio = Number(document.getElementById("p-tuneRatio").value);
-  const rounds = Math.floor(Number(document.getElementById("p-tuneRounds").value));
+  const num = (id) => Number(document.getElementById(id).value);
+  const ratio = num("p-tuneRatio"), decay = num("p-tuneDecay"), minRatio = num("p-tuneMinRatio");
+  const rounds = Math.floor(num("p-tuneRounds"));
   if (!(ratio > 1)) throw new Error("tune ratio must be above 1");
+  if (!(decay > 0 && decay < 1)) throw new Error("tune decay must be between 0 and 1");
+  if (!(minRatio > 1)) throw new Error("tune min ratio must be above 1");
   if (!(rounds >= 1)) throw new Error("tune max rounds must be at least 1");
-  return { up: ratio, down: 1 / ratio, rounds };
+  return { ratio, decay, minRatio, rounds };
 }
 
 // Float fields, plus integer ones marked data-tune="int" (tuned in whole
@@ -3867,8 +3893,9 @@ function setupAutoTune() {
     btn.type = "button";
     btn.className = "tune-btn";
     btn.textContent = "tune";
-    btn.title = "Auto-tune: run a batch at this value × and ÷ the tune ratio (under Tuning) with the current batch " +
-                "settings, keep whichever raises the median PSNR, repeat until neither helps. Click again to stop.";
+    btn.title = "Auto-tune: run a batch at this value × and ÷ the step (and at the peak of a parabola through " +
+                "them) with the current batch settings, keep whichever raises the median PSNR, shrink the step " +
+                "when none does, until it falls below tune min ratio (under Tuning). Click again to stop.";
     btn.addEventListener("click", () => {
       if (state.tune) {
         if (state.tune.input === input) state.tune.stop();
@@ -3905,41 +3932,62 @@ function tuneName(input) {
 const fmtDb = (db) => `${db >= 0 ? "+" : ""}${db.toFixed(3)} dB`;
 
 // Hill-climbs one setting from `t.best` (median `t.bestMedian`, measured on
-// `items`), updating `t` as it goes so the caller can keep the best value even
-// when stopped. Resolves to false when stopped or a batch didn't finish.
+// `items`) with tuneSettings' search, updating `t` as it goes so the caller can
+// keep the best value even when stopped. t.step is the setting's step (optimize
+// all keeps it between cycles; tune ratio when unset). Resolves to false when
+// stopped or a batch didn't finish.
 async function climbSetting(input, t, tune, items, isStopped, prefix = "") {
   const name = tuneName(input);
   const seen = new Map([[t.best, t.bestMedian]]); // same images, so no need to re-run a value
   const trace = state.tuneTrace = { name, start: t.best, best: t.best, points: [{ v: t.best, median: t.bestMedian, round: 0 }] };
   refreshViews("tune");
-  for (let round = 1; round <= tune.rounds; round += 1) {
-    const center = t.best;
-    const centerMedian = t.bestMedian;
-    const tried = [];
-    for (const f of [tune.up, tune.down]) {
-      const v = tuneValue(input, center * f);
-      if (v === center || tried.some((x) => x.v === v)) continue;
+  t.step ??= tune.ratio;
+  for (let round = 1; round <= tune.rounds && t.step >= tune.minRatio; round += 1) {
+    const r = t.step, center = t.best, centerMedian = t.bestMedian;
+    // x: a value's position in steps from the center (clamping and int rounding move it off ±1).
+    const xOf = (v) => (v / center > 0 ? Math.log(v / center) / Math.log(r) : NaN);
+    const pts = [{ x: 0, v: center, median: centerMedian }];
+    const measure = async (v, newton = false) => {
       let median = seen.get(v);
       if (median === undefined) {
         setTuneValue(input, v);
-        setStatus(`${prefix}Auto-tune ${name}: round ${round}, trying ${v} (best ${center} @ ${centerMedian.toFixed(3)} dB)`);
-        const r = await runBatch({ items, quiet: true });
-        if (!r || isStopped()) return false;
-        median = r.median;
+        setStatus(`${prefix}Auto-tune ${name}: round ${round} (step ×${r.toFixed(3)}), trying ${v}` +
+                  `${newton ? " (Newton)" : ""} (best ${center} @ ${centerMedian.toFixed(3)} dB)`);
+        const res = await runBatch({ items, quiet: true });
+        if (!res || isStopped()) return false;
+        median = res.median;
         seen.set(v, median);
-        trace.points.push({ v, median, round });
+        trace.points.push({ v, median, round, newton });
       }
-      tried.push({ v, median });
+      pts.push({ x: xOf(v), v, median, newton });
       if (median > t.bestMedian) { t.best = v; t.bestMedian = median; }
       trace.best = t.best;
       refreshViews("tune");
+      return true;
+    };
+    for (const f of [r, 1 / r]) {
+      const v = tuneValue(input, center * f);
+      if (!pts.some((p) => p.v === v) && !(await measure(v))) return false;
     }
-    appendLog(`Auto-tune ${name} round ${round}: ` +
-              tried.map((x) => `${x.v} → ${x.median.toFixed(3)}`).join(", ") +
+    // Parabola through the three points (divided differences), and its peak when it opens down.
+    if (pts.length === 3 && pts.every((p) => Number.isFinite(p.x))) {
+      const [p0, p1, p2] = [...pts].sort((a, b) => a.x - b.x);
+      const d1 = (p1.median - p0.median) / (p1.x - p0.x), d2 = (p2.median - p1.median) / (p2.x - p1.x);
+      const a = (d2 - d1) / (p2.x - p0.x);
+      const xs = a < 0 ? (p0.x + p1.x) / 2 - d1 / (2 * a) : NaN;
+      if (Math.abs(xs) < 2 && pts.every((p) => Math.abs(p.x - xs) > 0.25)) {
+        const v = tuneValue(input, center * r ** xs);
+        if (pts.every((p) => p.v !== v) && !(await measure(v, true))) return false;
+      }
+    }
+    const moved = t.best !== center;
+    if (!moved) t.step = r ** tune.decay;
+    appendLog(`Auto-tune ${name} round ${round} (step ×${r.toFixed(3)}): ` +
+              pts.slice(1).map((x) => `${x.v}${x.newton ? " (Newton)" : ""} → ${x.median.toFixed(3)}`).join(", ") +
               ` vs ${center} → ${centerMedian.toFixed(3)} dB; ` +
-              (t.best === center ? "neither helps, done." : `moving to ${t.best}.`));
-    if (t.best === center) return true;
-    if (round === tune.rounds) appendLog(`Auto-tune ${name}: stopped after ${tune.rounds} rounds.`);
+              (moved ? `moving to ${t.best}.` : `none helps, step → ×${t.step.toFixed(3)}` +
+                       (t.step < tune.minRatio ? `, below ×${tune.minRatio}: done.` : ".")));
+    if (round === tune.rounds && t.step >= tune.minRatio) appendLog(`Auto-tune ${name}: stopped after ${tune.rounds} rounds.`);
   }
   return true;
 }
@@ -3970,6 +4018,7 @@ async function optimizeAll(btn) {
       return;
     }
     const inputs = tunableInputs(false);
+    const steps = new Map(); // each setting's step, kept between cycles so later ones search finer
     state.tune.progress = { units: 1 + cycles * inputs.length, done: -1 };
     nextTuneUnit(true);
     setStatus("Optimize all: baseline");
@@ -3988,17 +4037,19 @@ async function optimizeAll(btn) {
           appendLog(`Optimize all: skipping ${name} (needs a non-zero value to scale).`);
           continue;
         }
-        const t = { best: start, bestMedian: current };
+        const t = { best: start, bestMedian: current, step: steps.get(input) };
         const prefix = `Optimize all ${cycle}/${cycles}, ${i + 1}/${inputs.length}: `;
         let ok;
         try {
           ok = await climbSetting(input, t, tune, items, isStopped, prefix);
         } finally {
           setTuneValue(input, t.best);
+          steps.set(input, t.step);
           gains.push({ cycle, name, from: start, to: t.best, gain: t.bestMedian - current });
           current = t.bestMedian;
         }
-        appendLog(`Optimize all: ${name} ${start} → ${t.best}, ${fmtDb(gains.at(-1).gain)}`);
+        appendLog(`Optimize all: ${name} ${start} → ${t.best}, ${fmtDb(gains.at(-1).gain)}, step ×${t.step.toFixed(3)}` +
+                  (t.step < tune.minRatio ? " (done)" : ""));
         if (!ok) return;
       }
     }

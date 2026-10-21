@@ -90,3 +90,46 @@ compares held-out PSNR and codec bits.
 KLT of the target. `rate.mjs` checks the estimate against the real codec per plane and
 sweeps λ against the site count by median PSNR vs measured bits per pixel.
 
+## LR bases for a new dataset (units_init.mjs)
+
+`units_init.mjs` sets the six LR bases from one probe batch instead of tuning them: every
+group's effective rate (base × `lrMult`) becomes K · Δ_g, Δ_g the codec quantizer step of
+that group measured on the new data (`probe.mjs`' E1 unit), K one constant. `--tune-mult`
+then tunes `lrMult` alone (one free number instead of six); `--holdout` scores the start
+preset, K · Δ, K · Δ with `lrMult` tuned and any `--compare` presets on the images after the
+probe ones. `--fit` / `--tuned` go the other way: from LRs already tuned on a dataset, K₀ =
+geometric mean of lr / Δ, then `lrMult` tuned on K₀ · Δ gives K. The result JSON holds the
+settings as a preset (`presetJson`).
+
+```bash
+node units_init.mjs --parquet ../../comp/data/cifar10/test.parquet --count 1024 \
+  --preset ../presets/mnist.json --tune-mult --holdout 2048 --compare ../presets/cifar10.json
+node units_init.mjs --parquet ../../comp/data/cifar10/test.parquet --count 1024 \
+  --tuned ../presets/cifar10.json --preset ../presets/mnist.json        # K for CIFAR-10
+```
+
+K depends on the settings Δ is probed at (the probe run's final error and Gauss–Newton
+diagonal), so fit and apply with the same probe preset. With Δ probed at
+`presets/mnist.json` on test images 0–1023: K = 0.02046 on MNIST, 0.01126 on CIFAR-10; the
+default `--k` is their geometric mean, 0.01518. Validation, each dataset with the other's K,
+median PSNR (dB) on held-out test images 1024–3071, median of 3 repeats:
+
+| target | probed at | K from | other dataset's tuned preset | K · Δ | K · Δ, lrMult tuned | fully tuned preset |
+|---|---|---|---|---|---|---|
+| CIFAR-10 | mnist.json | MNIST (0.02046) | 21.009 (mnist.json) | 20.492 | 20.976 (lrMult 4.14) | 21.330 (cifar10.json) |
+| MNIST | mnist.json | CIFAR-10 (0.01126) | 14.747 (cifar10.json) | 15.944 | 16.317 (lrMult 10.4) | 17.527 (mnist.json) |
+| MNIST | cifar10.json | CIFAR-10 (0.01385, Δ at cifar10.json) | 14.698 (cifar10.json) | 14.801 | 14.899 | 17.546 (mnist.json) |
+
+- K · Δ is a starting point, not a substitute for tuning: with `lrMult` tuned it matched the
+  MNIST-tuned bases on CIFAR-10 (−0.03 dB) and beat CIFAR's on MNIST by 1.6 dB, but stayed
+  0.35 / 1.2 dB under the fully tuned presets. Untuned (K from the other dataset) it lost
+  0.5 dB on CIFAR: K is only good to within about ×1.6 (the tuned `lrMult` moved it that
+  much), so add `--tune-mult`.
+- Probe at settings that already suit the data roughly. The last row probes MNIST at
+  CIFAR's preset (2.8 dB under MNIST's own): Δ came out poor (Δ_dir 0.94 vs 5.4 at
+  mnist.json, and Δ varied up to ±50% between repeats), and K · Δ gained only 0.2 dB.
+  `--passes` (re-probing at the new bases) did not fix it.
+- E1 (e1.mjs: K · Δ within −0.05 / −0.12 dB of each dataset's own K) probed both datasets
+  at the same, then-untuned MNIST preset, which suited both moderately; the table agrees
+  with it once Δ is probed at the same settings on both.
+
