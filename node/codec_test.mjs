@@ -5,9 +5,11 @@
 //   4. the histogram layer's index survives the reordering
 //   5. coarser steps cost fewer bits; clustered sites cost less than noise
 //   6. edge cases: one site, every site round, every site in one cell
+//   7. colors along a KLT basis
+//   8. a shared model (buildSharedModel) fit on other images: round trip, and cheaper
 // Usage: node codec_test.mjs
 
-import { encodeSites, decodeSites, codecSteps } from "../trainer/codec.js?v=klt-20261020";
+import { encodeSites, decodeSites, codecSteps, buildSharedModel } from "../trainer/codec.js?v=shared-20261020";
 import { pcaBasis } from "../trainer/color_spaces.js?v=klt-20261020";
 import { SITE_FLOATS } from "../trainer/params.js?v=20261019";
 
@@ -48,7 +50,7 @@ const STEPS = { pos: 0.25, logTau: 0.05, radius: 0.01, color: 1 / 128, logAniso:
 
 function roundTrip(name, sites, count, w, h, steps, opts = {}) {
   const enc = encodeSites(sites, count, w, h, steps, opts);
-  const dec = decodeSites(enc.bytes, { colorBasis: opts.colorBasis ?? null });
+  const dec = decodeSites(enc.bytes, { colorBasis: opts.colorBasis ?? null, shared: opts.shared ?? null });
   check(`${name} count`, dec.count === enc.n, `${dec.count} vs ${enc.n}`);
   check(`${name} size`, dec.width === w && dec.height === h, `${dec.width}×${dec.height}`);
   let bad = -1;
@@ -137,6 +139,47 @@ function roundTrip(name, sites, count, w, h, steps, opts = {}) {
   try { decodeSites(klt.bytes); } catch { threw = true; }
   check("klt stream needs its basis", threw, "decoded without the basis");
   console.log(`klt: color ${(colorBits(klt) / n).toFixed(2)} bits/site vs YCoCg-R ${(colorBits(ycc) / n).toFixed(2)}`);
+}
+
+// 8: shared model. Fit on one set of small "images" (few sites, shared
+// statistics), coded on a disjoint held-out set: exact round trip (also after
+// a JSON round trip of the model, with a color basis, an odd image size, no
+// layer, one site, no sites), and fewer bits than coding each image alone.
+{
+  const image = (rand) => {
+    const n = 6 + Math.floor(rand() * 6), s = randomSites(n, 28, 28, rand);
+    for (let i = 0; i < n; i += 1) {
+      const b = i * SITE_FLOATS, v = rand() < 0.3 ? 0 : 0.8 + 0.2 * rand();
+      s.set([v, v, v], b + 4);
+      s[b + 2] = 4 + 0.5 * rand();
+      s[b + 3] = 3 + rand();
+      if (rand() < 0.5) s[b + 9] = 0;
+    }
+    return { sites: s, n, width: 28, height: 28, globalSite: 0 };
+  };
+  const rand = rng(10);
+  const train = Array.from({ length: 200 }, () => image(rand));
+  const test = Array.from({ length: 100 }, () => image(rand));
+  const steps = { ...STEPS, pos: 1, color: 1 / 32 };
+  const shared = buildSharedModel(train, steps);
+  const json = JSON.parse(JSON.stringify(shared));
+  let alone = 0, withShared = 0, sites = 0, header = 0;
+  test.forEach((im, k) => {
+    const enc = roundTrip(`shared ${k}`, im.sites, im.n, 28, 28, null, { globalSite: im.globalSite, shared: k % 2 ? json : shared });
+    alone += encodeSites(im.sites, im.n, 28, 28, steps, { globalSite: im.globalSite }).bits;
+    withShared += enc.bits; sites += enc.n; header += enc.headerBits;
+  });
+  check("shared is cheaper", withShared < 0.8 * alone, `${withShared} vs ${alone} bits`);
+  const one = randomSites(1, 28, 28, rng(11)), none = randomSites(3, 28, 28, rng(12), { inactive: 3 });
+  roundTrip("shared odd size", randomSites(40, 61, 37, rng(13)), 40, 61, 37, null, { shared });
+  roundTrip("shared one site", one, 1, 28, 28, null, { shared });
+  roundTrip("shared no sites", none, 3, 28, 28, null, { shared, globalSite: 1 });
+  const rgba = new Float32Array(train.length * 4);
+  train.forEach((im, i) => rgba.set([...im.sites.subarray(4, 7), 1], i * 4));
+  const kltShared = buildSharedModel(train, steps, { colorBasis: pcaBasis(rgba, train.length) });
+  test.slice(0, 10).forEach((im, k) => roundTrip(`shared klt ${k}`, im.sites, im.n, 28, 28, null, { globalSite: 0, shared: kltShared }));
+  console.log(`shared: ${(withShared / sites).toFixed(1)} bits/site held out (header ${(header / sites).toFixed(1)}) ` +
+              `vs ${(alone / sites).toFixed(1)} per image alone; strengths ${JSON.stringify(shared.strengths)}`);
 }
 
 // codecSteps: equal predicted error per scalar, and a bigger budget, bigger steps

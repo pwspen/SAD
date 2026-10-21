@@ -11,7 +11,7 @@ import { loadSitesFromFile, serializeSitesTxt, triggerDownload, floatImageToRgba
 import { SITE_FLOATS } from "../trainer/params.js?v=20261019";
 import { BatchTrainer, planBatches, tileSites, tileActive, tileSize, atlasCapacity } from "../trainer/batch.js?v=rate-20261020";
 import { COLOR_SPACES } from "../trainer/color_spaces.js?v=klt-20261020";
-import { encodeSites, codecSteps, CODEC_PLANES } from "../trainer/codec.js?v=klt-20261020";
+import { encodeSites, codecSteps, CODEC_PLANES } from "../trainer/codec.js?v=shared-20261020";
 import { parquetMetadata, parquetReadObjects } from "./vendor/hyparquet/src/index.js";
 import {
   luma, maskWeights, laplacianBands, maskLevels, bandEnergies, IMPORTANCE, importanceMap,
@@ -2720,13 +2720,16 @@ async function runCodec(sites, count, trainer) {
   const { width, height } = trainer;
   const pixels = width * height;
   const globalSite = trainer.layerIndex ?? -1;
+  // klt runs code colors along the run's own basis (the codec's colorBasis),
+  // others with YCoCg-R.
+  const colorBasis = trainer.colorSpace?.needsBasis ? trainer.colorSpace.basis : null;
   const { basePsnr } = await trainer.decodedPsnr(sites);
   const sse0 = samples * 10 ** (-basePsnr / 10);
   const rows = [];
   for (const lossDb of CODEC_LOSSES) {
     await new Promise((r) => setTimeout(r, 0));
     const steps = codecSteps(sites, count, F, { lossDb, sse0 });
-    const enc = encodeSites(sites, count, width, height, steps, { globalSite });
+    const enc = encodeSites(sites, count, width, height, steps, { globalSite, colorBasis });
     // Decoded sites back in their slots, so the layer keeps its index.
     const placed = Float32Array.from(sites);
     enc.slots.forEach((slot, i) => placed.set(enc.decoded.subarray(i * SITE_FLOATS, (i + 1) * SITE_FLOATS), slot * SITE_FLOATS));
@@ -2736,7 +2739,7 @@ async function runCodec(sites, count, trainer) {
   }
   const report = rows.find((r) => r.lossDb === CODEC_REPORT_LOSS);
   return {
-    basePsnr, rows, pixels,
+    basePsnr, rows, pixels, klt: !!colorBasis,
     report: { bpp: report.bpp, psnr: report.psnr, bitsPerSite: report.bitsPerSite, n: report.n },
   };
 }
@@ -2769,11 +2772,13 @@ function drawCodec(view) {
   const per = (bits) => (bits / Math.max(1, enc.n)).toFixed(2);
   const stepOf = { log_aniso: steps.logAniso, "θ": steps.theta, log_tau: steps.logTau, radius: steps.radius,
                    Y: steps.color, Co: steps.color, Cg: steps.color };
+  // klt runs: the color planes are the run's KLT axes, not YCoCg-R
+  const planeLabel = (name, i) => (r.klt && i >= 4 ? `K${i - 4}` : name);
   drawTable(p, box, mid + 4, box.right, ["stage", "bits/site", "step", "pred."], [
     ["header", per(enc.headerBits), "", ""],
     ["position", per(enc.positionBits), fmtSig(steps.pos) + " px", "gaps"],
-    ...CODEC_PLANES.map((name, i) => [name, per(enc.planeBits[i]), Number.isFinite(stepOf[name]) ? fmtSig(stepOf[name]) : "∞",
-                                      enc.modes[i] ? "nbr" : "const"]),
+    ...CODEC_PLANES.map((name, i) => [planeLabel(name, i), per(enc.planeBits[i]),
+                                      Number.isFinite(stepOf[name]) ? fmtSig(stepOf[name]) : "∞", enc.modes[i] ? "nbr" : "const"]),
     { color: CODED_COLOR, cells: ["total", per(enc.bits), "", ""] },
   ]);
   ctx.fillStyle = col.soft;

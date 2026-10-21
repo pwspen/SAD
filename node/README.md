@@ -72,6 +72,11 @@ per-value-bin mean explains, early and late in the run; E3, per-parameter entrop
 codec steps against the total correlation a joint model could remove.
 It also audits the codec: color bits per site under static RGB, YCoCg-R and joint
 models, against the codec itself per image and over every image's sites in one stream.
+`shared_codec.mjs` fits the codec's dataset-level shared model (`buildSharedModel` in
+`trainer/codec.js`: steps, color basis, plane constants and primed model frequencies) on
+images 0–1023 and reports bits per site by stage on held-out images 1024–3071: each image
+coded alone, with the shared model, and pooled into one stream. MNIST / CIFAR-10 presets,
+held out: 76.4 / 76.4 bits/site per image, 36.1 / 36.6 shared, 36.4 / 37.1 pooled.
 `colorspaces.mjs` tunes the six LR bases separately for each training color space and
 compares held-out PSNR and codec bits.
 `e1.mjs` tunes the six LR bases on MNIST and CIFAR-10, replaces them with one constant
