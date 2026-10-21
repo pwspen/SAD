@@ -33,7 +33,10 @@
 //   times, interleaved; ΔPSNR is the mean over images of the per-image PSNR
 //   minus the same repeat's baseline (paired), mean ± sd over repeats. The
 //   signal is also read at the extended bound, to see whether sites pile up
-//   there again.
+//   there again. --base tightens bounds first (e.g. aniso=0.5,posMargin=-2,
+//   beta=1, a negative margin keeping sites inside the tile): the baseline
+//   runs there and each variant restores one bound to stock, so the signal
+//   is tested where it fires.
 
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
@@ -144,7 +147,15 @@ function finishStats(acc) {
   return out;
 }
 
-export const VARIANTS = (margin) => [
+// Stock bounds: each extended past the stock value. With `base` (tightened
+// bounds, e.g. { aniso: 0.5, posMargin: -2, beta: 1 }): the baseline runs
+// at those, and each variant puts one of them back to stock, a check that the
+// signal ranks gains where bounds do bind.
+export const VARIANTS = (margin, base = null) => base ? [
+  { name: "baseline", bounds: { ...BASE, ...base }, clamp: null },
+  ...Object.keys(base).map((k) => ({ name: `${k} ${base[k]} → ${BASE[k]}`, bounds: { ...BASE, ...base, [k]: BASE[k] },
+                                     clamp: k === "posMargin" ? "position" : k })),
+] : [
   { name: "baseline", bounds: BASE, clamp: null },
   { name: "aniso ±8", bounds: { ...BASE, aniso: 8 }, clamp: "aniso" },
   { name: "aniso ±12", bounds: { ...BASE, aniso: 12 }, clamp: "aniso" },
@@ -152,8 +163,8 @@ export const VARIANTS = (margin) => [
   { name: "beta ±16", bounds: { ...BASE, beta: 16 }, clamp: "beta" },
 ];
 
-export async function clampsExperiment(ctx, args, images, { repeats = 3, margin = 4, only = null } = {}) {
-  const variants = VARIANTS(margin).filter((v) => !only || v.clamp === null || only.includes(v.clamp));
+export async function clampsExperiment(ctx, args, images, { repeats = 3, margin = 4, only = null, base = null } = {}) {
+  const variants = VARIANTS(margin, base).filter((v) => !only || v.clamp === null || only.includes(v.clamp));
   const runs = variants.map((v) => ({ ...v, reps: [] }));
   for (let r = 0; r < repeats; r += 1) {
     for (const v of runs) {
@@ -166,23 +177,23 @@ export async function clampsExperiment(ctx, args, images, { repeats = 3, margin 
       console.error(`Run    | repeat ${r + 1}/${repeats} ${v.name.padEnd(16)} mean ${mean(psnrs).toFixed(3)} dB, median ${median(psnrs).toFixed(3)} dB, ${seconds.toFixed(1)}s`);
     }
   }
-  const base = runs[0];
+  const ref = runs[0];
   for (const v of runs) {
-    v.delta = v.reps.map((rep, r) => mean(rep.psnrs.map((p, i) => p - base.reps[r].psnrs[i])));
-    v.deltaMedian = v.reps.map((rep, r) => rep.medianPsnr - base.reps[r].medianPsnr);
+    v.delta = v.reps.map((rep, r) => mean(rep.psnrs.map((p, i) => p - ref.reps[r].psnrs[i])));
+    v.deltaMedian = v.reps.map((rep, r) => rep.medianPsnr - ref.reps[r].medianPsnr);
     v.deltaMean = mean(v.delta);
     v.deltaSd = Math.sqrt(mean(v.delta.map((d) => (d - v.deltaMean) ** 2)) * repeats / Math.max(1, repeats - 1));
   }
   // Signal from the baseline runs, averaged over repeats.
   const signal = Object.fromEntries(CLAMPS.map((k) => [k, Object.fromEntries(
-    Object.keys(base.reps[0].stats[k]).map((f) => [f, mean(base.reps.map((rep) => rep.stats[k][f]))]))]));
+    Object.keys(ref.reps[0].stats[k]).map((f) => [f, mean(ref.reps.map((rep) => rep.stats[k][f]))]))]));
   const ext = runs.filter((v) => v.clamp);
   const ranking = {
     shareTimesOut: spearman(ext.map((v) => signal[v.clamp].shareTimesOut), ext.map((v) => v.deltaMean)),
     predGainDb: spearman(ext.map((v) => signal[v.clamp].predGainDb), ext.map((v) => v.deltaMean)),
     atShare: spearman(ext.map((v) => signal[v.clamp].atShare), ext.map((v) => v.deltaMean)),
   };
-  const baseSpread = base.reps.map((rep) => rep.meanPsnr);
+  const baseSpread = ref.reps.map((rep) => rep.meanPsnr);
   return {
     images: images.length, repeats, margin, signal, ranking,
     baselineRepeatSd: Math.sqrt(mean(baseSpread.map((x) => (x - mean(baseSpread)) ** 2)) * repeats / Math.max(1, repeats - 1)),
@@ -203,6 +214,7 @@ export function printReport(rep, log = console.error) {
     log(`         ${k.padEnd(11)} ${(100 * s.atShare).toFixed(2).padStart(7)}%  ${g3(s.meanOut).padEnd(10)} ${(100 * s.outShare).toFixed(0).padStart(4)}%      ` +
         `${g3(s.shareTimesOut).padEnd(11)} ${g3(s.predGainDb)}`);
   }
+  log(`         bounds ${JSON.stringify(rep.variants[0].bounds)}`);
   log(`Extend | variant           ΔPSNR mean ± sd (dB)   Δ median   at new bound   (baseline repeat sd ${rep.baselineRepeatSd.toFixed(3)} dB)`);
   for (const v of rep.variants) {
     if (!v.clamp) continue;
@@ -219,13 +231,13 @@ async function main() {
     options: {
       ...DATASET_OPTIONS, from: { type: "string", default: "1024" }, count: { type: "string", default: "2048" },
       repeats: { type: "string", default: "3" }, "pos-margin": { type: "string", default: "4" },
-      only: { type: "string" }, out: { type: "string" }, help: { type: "boolean", short: "h", default: false },
+      only: { type: "string" }, base: { type: "string" }, out: { type: "string" }, help: { type: "boolean", short: "h", default: false },
     },
   });
   if (cli.help || (!cli.mnist && !cli.parquet && !cli.images)) {
     process.stdout.write("Usage: node clamps.mjs (--mnist <idx3.gz> | --parquet <file> | --images <dir>) [--from 1024] [--count 2048]\n" +
                          "                       [--preset json] [--set key=value …] [--repeats 3] [--pos-margin 4]\n" +
-                         "                       [--only aniso,position,beta] [--out json]\n");
+                         "                       [--only aniso,position,beta] [--base aniso=0.5,posMargin=-2,beta=1] [--out json]\n");
     process.exit(cli.help ? 0 : 1);
   }
   const { args, config } = await argsFor(await loadParams(cli.preset, cli.set));
@@ -235,6 +247,7 @@ async function main() {
   console.error(`Device | ${label}`);
   const rep = await clampsExperiment({ device, shaders }, args, images, {
     repeats: Number(cli.repeats), margin: Number(cli["pos-margin"]), only: cli.only ? cli.only.split(",") : null,
+    base: cli.base ? Object.fromEntries(cli.base.split(",").map((kv) => { const [k, v] = kv.split("="); if (!(k in BASE)) throw new Error(`--base: unknown bound ${k}`); return [k, Number(v)]; })) : null,
   });
   printReport(rep);
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
