@@ -9,9 +9,9 @@
 //   8. a shared model (buildSharedModel) fit on other images: round trip, and cheaper
 // Usage: node codec_test.mjs
 
-import { encodeSites, decodeSites, codecSteps, buildSharedModel } from "../trainer/codec.js?v=shared-20261020";
-import { pcaBasis } from "../trainer/color_spaces.js?v=klt-20261020";
-import { SITE_FLOATS } from "../trainer/params.js?v=m3-20261020";
+import { encodeSites, decodeSites, codecSteps, buildSharedModel } from "../trainer/codec.js?v=w2-20261021";
+import { pcaBasis, withDims, colorSpaceFor } from "../trainer/color_spaces.js?v=w2-20261021";
+import { SITE_FLOATS } from "../trainer/params.js?v=w2-20261021";
 
 let failures = 0;
 function check(name, ok, detail) {
@@ -139,6 +139,28 @@ function roundTrip(name, sites, count, w, h, steps, opts = {}) {
   try { decodeSites(klt.bytes); } catch { threw = true; }
   check("klt stream needs its basis", threw, "decoded without the basis");
   console.log(`klt: color ${(colorBits(klt) / n).toFixed(2)} bits/site vs YCoCg-R ${(colorBits(ycc) / n).toFixed(2)}`);
+
+  // A k-axis basis (colorDims k < 3): colors projected onto it as the trainer
+  // leaves them, the dropped planes take no bits and the header shrinks, and
+  // the round trip stays exact (the error within half a step per kept axis).
+  for (const dims of [2, 1]) {
+    const basis = withDims(colorBasis, dims), space = colorSpaceFor("klt", basis);
+    const proj = Float32Array.from(sites);
+    for (let i = 0; i < n; i += 1) {
+      const b = i * SITE_FLOATS;
+      proj.set(space.decode(...space.encode(...proj.subarray(b + 4, b + 7))), b + 4);
+    }
+    const full = encodeSites(proj, n, w, h, STEPS, { colorBasis });
+    const enc = roundTrip(`klt ${dims} dims`, proj, n, w, h, STEPS, { colorBasis: basis });
+    check(`klt ${dims} dims skips planes`, enc.planeBits.slice(4 + dims).every((b) => b === 0), enc.planeBits.join(","));
+    check(`klt ${dims} dims shorter`, enc.bits < full.bits && enc.headerBits < full.headerBits,
+          `${enc.bits} vs ${full.bits} bits, header ${enc.headerBits} vs ${full.headerBits}`);
+    let worst = 0;
+    enc.slots.forEach((slot, i) => {
+      for (let c = 0; c < 3; c += 1) worst = Math.max(worst, Math.abs(proj[slot * SITE_FLOATS + 4 + c] - enc.decoded[i * SITE_FLOATS + 4 + c]) / STEPS.color);
+    });
+    check(`klt ${dims} dims error`, worst <= 0.9, `worst ${worst.toFixed(3)} steps`);
+  }
 }
 
 // 8: shared model. Fit on one set of small "images" (few sites, shared
@@ -178,6 +200,12 @@ function roundTrip(name, sites, count, w, h, steps, opts = {}) {
   train.forEach((im, i) => rgba.set([...im.sites.subarray(4, 7), 1], i * 4));
   const kltShared = buildSharedModel(train, steps, { colorBasis: pcaBasis(rgba, train.length) });
   test.slice(0, 10).forEach((im, k) => roundTrip(`shared klt ${k}`, im.sites, im.n, 28, 28, null, { globalSite: 0, shared: kltShared }));
+  // Grey sites with a one-axis basis: the dropped planes are not coded.
+  const klt1 = JSON.parse(JSON.stringify(buildSharedModel(train, steps, { colorBasis: withDims(pcaBasis(rgba, train.length), 1) })));
+  test.slice(0, 10).forEach((im, k) => {
+    const enc = roundTrip(`shared klt 1 dim ${k}`, im.sites, im.n, 28, 28, null, { globalSite: 0, shared: klt1 });
+    check(`shared klt 1 dim skips planes ${k}`, enc.planeBits[5] === 0 && enc.planeBits[6] === 0, enc.planeBits.join(","));
+  });
   console.log(`shared: ${(withShared / sites).toFixed(1)} bits/site held out (header ${(header / sites).toFixed(1)}) ` +
               `vs ${(alone / sites).toFixed(1)} per image alone; strengths ${JSON.stringify(shared.strengths)}`);
 }

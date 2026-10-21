@@ -11,7 +11,9 @@
 //      With a `colorBasis` (an orthonormal KLT, pcaBasis in color_spaces.js,
 //      shared by encoder and decoder like a codebook) the colors are instead
 //      quantized along its axes with that step: the same error as in RGB, and
-//      the three color planes are those coordinates.
+//      the three color planes are those coordinates. A basis with dims k < 3
+//      (withDims in color_spaces.js) codes only the first k: the rest are 0
+//      and not coded at all (no header, no residuals).
 //   2. Order. Sites are sorted by grid cell in raster order (their order
 //      carries no information), and positions are coded as gaps between
 //      successive cell indices.
@@ -31,7 +33,7 @@
 // The site layout is io.js's: [x, y, log_tau, radius, r, g, b, dir_x, dir_y,
 // log_aniso], colors decoded RGB.
 
-import { SITE_FLOATS } from "./params.js?v=m3-20261020";
+import { SITE_FLOATS } from "./params.js?v=w2-20261021";
 
 // ---- Bit I/O ----
 
@@ -369,7 +371,8 @@ function quantize(sites, count, width, height, q, basis = null) {
     let yy, co, cg;
     if (basis) {
       const d = [0, 1, 2].map((c) => sites[b + 4 + c] - basis.mean[c]);
-      [yy, co, cg] = basis.axes.map((a) => Math.round((a[0] * d[0] + a[1] * d[1] + a[2] * d[2]) / stepOf(q.color)));
+      [yy, co, cg] = basis.axes.map((a, k) => (planeCoded(basis, COLOR_PLANE0 + k)
+        ? Math.round((a[0] * d[0] + a[1] * d[1] + a[2] * d[2]) / stepOf(q.color)) : 0));
     } else {
       // YCoCg-R (lossless on integers)
       const r = lin(sites[b + 4], q.color), g = lin(sites[b + 5], q.color), bl = lin(sites[b + 6], q.color);
@@ -422,6 +425,10 @@ function dequantize(xs, ys, planes, levels, q, basis = null) {
 // The last three are the YCoCg-R planes, or the color basis's axes K0–K2.
 export const CODEC_PLANES = ["log_aniso", "θ", "log_tau", "radius", "Y", "Co", "Cg"];
 const THETA_PLANE = 1;
+const COLOR_PLANE0 = 4;
+
+// Whether plane p is coded: all but the color axes a k-axis basis drops.
+const planeCoded = (basis, p) => !basis || p < COLOR_PLANE0 + (basis.dims ?? 3);
 
 // Positions: raster gaps between cell indices, context = the previous gap's bucket.
 function codePositions(io, idx, n, enc, ms = new ModelSet()) {
@@ -488,7 +495,10 @@ function sharedStream(io, S, st, enc, ms = new ModelSet(S.tables, S.incs)) {
   st.n = codeInt(io, intModels(false, ms, "hn/"), enc ? st.n : undefined);
   st.globalIndex = codeInt(io, intModels(false, ms, "hg/"), enc ? st.globalIndex + 1 : undefined) - 1;
   if (!enc) { st.modes = []; st.constants = []; }
-  for (let p = 0; p < CODEC_PLANES.length; p += 1) sharedPlaneHeader(io, S, st, p, enc, ms);
+  for (let p = 0; p < CODEC_PLANES.length; p += 1) {
+    if (planeCoded(S.colorBasis, p)) sharedPlaneHeader(io, S, st, p, enc, ms);
+    else if (!enc) { st.modes.push(0); st.constants.push(0); }
+  }
   const headerBits = io.bits;
   if (!enc) st.idx = new Array(st.n);
   codePositions(io, st.idx, st.n, enc, ms);
@@ -501,7 +511,7 @@ function sharedStream(io, S, st, enc, ms = new ModelSet(S.tables, S.incs)) {
   }
   const planeBits = CODEC_PLANES.map((_, p) => {
     const before = io.bits;
-    sharedPlane(io, S, st, p, enc, ms);
+    if (planeCoded(S.colorBasis, p)) sharedPlane(io, S, st, p, enc, ms);
     return io.bits - before;
   });
   return { headerBits, positionBits, planeBits };
@@ -528,6 +538,7 @@ function sharedPlane(io, S, st, p, enc, ms) {
 function sharedState(a, width, height, globalIndex, S) {
   const st = { width, height, n: a.n, globalIndex, idx: a.idx, nbrs: a.nbrs, planes: a.planes, modes: [], constants: [] };
   a.specs.forEach((spec, p) => {
+    if (!planeCoded(S.colorBasis, p)) { st.modes[p] = 0; st.constants[p] = 0; return; }
     const own = ownConstant(spec);
     let best = Infinity;
     for (let mode = 0; mode < SHARED_MODES; mode += 1) {
@@ -672,7 +683,8 @@ export function codecSteps(sites, count, F, { lossDb, sse0 }) {
 // Encodes the active sites of `sites` (count · SITE_FLOATS, decoded RGB).
 // `steps` from codecSteps (any positive numbers work). `globalSite`: the slot
 // of the histogram layer, or −1. `colorBasis`: code colors along its axes
-// (decodeSites needs the same one); null = YCoCg-R. `shared`: a shared model
+// (decodeSites needs the same one, dims included; dims k < 3 codes only the
+// first k); null = YCoCg-R. `shared`: a shared model
 // (buildSharedModel) to code against instead; its steps and color basis then
 // replace `steps` and `colorBasis`, and modes are 0/1/2 (see Shared model).
 // Returns
@@ -698,7 +710,7 @@ export function encodeSites(sites, count, width, height, steps, { globalSite = -
   w.eg(width); w.eg(height); w.eg(n); w.eg(globalIndex + 1);
   w.bit(colorBasis ? 1 : 0);
   for (const k of STEP_GROUPS) w.seg(q[k]);
-  specs.forEach((_, p) => { w.bit(modes[p]); w.seg(constants[p]); });
+  specs.forEach((_, p) => { if (planeCoded(colorBasis, p)) { w.bit(modes[p]); w.seg(constants[p]); } });
   const headerBits = w.bits;
 
   const io = new EncodeIO(w);
@@ -706,7 +718,7 @@ export function encodeSites(sites, count, width, height, steps, { globalSite = -
   const positionBits = io.bits;
   const planeBits = specs.map((s, p) => {
     const before = io.bits;
-    codePlane(io, s, nbrs, modes[p], constants[p], true);
+    if (planeCoded(colorBasis, p)) codePlane(io, s, nbrs, modes[p], constants[p], true);
     return io.bits - before;
   });
   io.finish();
@@ -730,8 +742,9 @@ export function decodeSites(bytes, { colorBasis = null, shared = null } = {}) {
   for (const k of STEP_GROUPS) q[k] = r.seg();
   const modes = [], constants = [];
   for (let p = 0; p < CODEC_PLANES.length; p += 1) {
-    modes.push(r.bit());
-    constants.push(r.seg());
+    const coded = planeCoded(colorBasis, p);
+    modes.push(coded ? r.bit() : 0);
+    constants.push(coded ? r.seg() : 0);
   }
   const io = new DecodeIO(r);
   const idx = new Array(n);
@@ -745,7 +758,7 @@ export function decodeSites(bytes, { colorBasis = null, shared = null } = {}) {
     if (p === THETA_PLANE) levels = planes[0].map((a) => thetaLevelsOf(q, a)); // log_aniso is decoded by now
     const spec = p === THETA_PLANE ? { vals: planes[p], has: levels.map((m) => m > 1), levels }
                                    : { vals: planes[p], has: null, levels: null };
-    codePlane(io, spec, nbrs, modes[p], constants[p], false);
+    if (planeCoded(colorBasis, p)) codePlane(io, spec, nbrs, modes[p], constants[p], false);
   });
   return { sites: dequantize(xs, ys, planes, levels, q, colorBasis), count: n, width, height, globalSite };
 }

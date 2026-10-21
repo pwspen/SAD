@@ -1,7 +1,7 @@
 // Sites .txt parsing + serialization. PNG download helper.
 // The .txt format matches what the former native backends read and wrote.
 
-import { SITE_FLOATS } from "./params.js?v=m3-20261020";
+import { SITE_FLOATS } from "./params.js?v=w2-20261021";
 
 // Returns { data: Float32Array of length count*SITE_FLOATS, width, height, count,
 // globalSite } (globalSite: the row every pixel blends besides its candidate

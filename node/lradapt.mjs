@@ -15,7 +15,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 
-import { LR_GROUP_KEYS } from "../trainer/trainer.js?v=lra-20261021";
+import { LR_GROUP_KEYS } from "../trainer/trainer.js?v=w2-20261021";
 import { createHeadlessDevice, loadShadersFromDisk } from "./headless.mjs";
 import { DATASET_OPTIONS, loadParams, argsFor, loadImages, trainBatched, median } from "./common.mjs";
 import { LR_KEYS } from "./tune.mjs";
