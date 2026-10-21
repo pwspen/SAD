@@ -11,7 +11,7 @@ import { colorSpaceFor, specializeShaders, encodeSiteColors, decodeSiteColors } 
 import { QuantNoiseEncoder } from "../trainer/encoders.js?v=w2b-20261021";
 import { readSites } from "../trainer/buffers.js?v=20261019";
 import { quantNoiseBuffer, codecStep, QNOISE_FLOATS } from "../trainer/rate.js?v=w2b-20261021";
-import { BatchTrainer } from "../trainer/batch.js?v=w2b-20261021";
+import { BatchTrainer } from "../trainer/batch.js?v=rui-20261021";
 import { createHeadlessDevice, loadShadersFromDisk } from "./headless.mjs";
 import { argsFor } from "./common.mjs";
 

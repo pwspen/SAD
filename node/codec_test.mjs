@@ -9,7 +9,7 @@
 //   8. a shared model (buildSharedModel) fit on other images: round trip, and cheaper
 // Usage: node codec_test.mjs
 
-import { encodeSites, decodeSites, codecSteps, buildSharedModel } from "../trainer/codec.js?v=w2b-20261021";
+import { encodeSites, decodeSites, codecSteps, buildSharedModel } from "../trainer/codec.js?v=rui-20261021";
 import { pcaBasis, withDims, colorSpaceFor } from "../trainer/color_spaces.js?v=w2b-20261021";
 import { SITE_FLOATS } from "../trainer/params.js?v=w2b-20261021";
 

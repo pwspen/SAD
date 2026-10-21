@@ -10,7 +10,7 @@ import { gunzipSync } from "node:zlib";
 import { PNG } from "pngjs";
 
 import { buildArgs } from "../trainer/trainer.js?v=w2b-20261021";
-import { BatchTrainer, planBatches } from "../trainer/batch.js?v=w2b-20261021";
+import { BatchTrainer, planBatches } from "../trainer/batch.js?v=rui-20261021";
 import { parquetMetadata, parquetReadObjects } from "../web/vendor/hyparquet/src/index.js";
 import { loadJson, loadPngToFloat32 } from "./headless.mjs";
 

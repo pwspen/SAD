@@ -9,9 +9,9 @@ import { Trainer, buildArgs, GRAD_GROUPS, GRAD_CHANNELS, lrSchedule, LR_SCHEDULE
 import { loadImageToFloat32, loadMaskRgba32Float, whiteMaskRgba32Float } from "../trainer/textures.js?v=20261019";
 import { loadSitesFromFile, serializeSitesTxt, triggerDownload, floatImageToRgba8, computeBpp, computePsnr, BITS_PER_SITE } from "../trainer/io.js?v=20261019";
 import { SITE_FLOATS } from "../trainer/params.js?v=w2b-20261021";
-import { BatchTrainer, planBatches, tileSites, tileActive, tileSize, atlasCapacity } from "../trainer/batch.js?v=w2b-20261021";
+import { BatchTrainer, planBatches, tileSites, tileActive, tileSize, atlasCapacity } from "../trainer/batch.js?v=rui-20261021";
 import { COLOR_SPACES } from "../trainer/color_spaces.js?v=w2b-20261021";
-import { encodeSites, codecSteps, CODEC_PLANES } from "../trainer/codec.js?v=w2b-20261021";
+import { encodeSites, codecSteps, CODEC_PLANES, codecBits, poolImages, buildSharedModel } from "../trainer/codec.js?v=rui-20261021";
 import { parquetMetadata, parquetReadObjects } from "./vendor/hyparquet/src/index.js";
 import {
   luma, maskWeights, laplacianBands, maskLevels, bandEnergies, IMPORTANCE, importanceMap,
@@ -37,6 +37,7 @@ const SNAP_MAP_K = 4; // snap-analysis fit drawn on the image (one of SNAP_KS)
 // the one a run's coded point on the PSNR vs bpp plot uses.
 const CODEC_LOSSES = [0.02, 0.05, 0.1, 0.2, 0.5, 1, 2];
 const CODEC_REPORT_LOSS = 0.1;
+const BATCH_CODING_MAX = 256; // images per half for Batch: coding's shared model
 const CODED_COLOR = "#1baf7a";
 // Datasets live outside this repo, as Hugging Face parquet files (see
 // DATASETS): ../comp/data/<key>/<file>, which resolves under the kodak-bench
@@ -74,6 +75,9 @@ const UI_FIELDS = [
   ["colorSpace", "p-colorSpace"],
   ["colorDims", "p-colorDims"],
   ["colorMoment", "p-colorMoment"],
+  ["rateLambda", "p-rateLambda"],
+  ["rateLossDb", "p-rateLossDb"],
+  ["rateEvery", "p-rateEvery"],
   ["loss", "p-loss"],
   ["errWeight", "p-errWeight"],
   ["errBeta", "p-errBeta"],
@@ -676,6 +680,17 @@ const VIEWS = {
                       "sideways (a smaller image costs less bpp at the same site count), so mixed-size datasets " +
                       "spread horizontally. Grey: finished; blue: still running; hover a trail or dot to find its " +
                       "run; once the batch has finished, click it to load it into the other views. X is log-scaled." },
+  batchCoding: { stage: "batch", label: "Batch: coding", kind: "plot", source: "derived", on: ["batch"],
+                draw: drawBatchCoding,
+                note: "Bits per site of the last (tiled) batch's final sites through trainer/codec.js, at the " +
+                      "steps for rate fidelity's quantization loss, every way the codec can run: each image " +
+                      "alone (alone: its own header, models starting from nothing, as the Entropy coding card " +
+                      "and the PSNR vs bpp card's green points measure), with a shared dataset model (shared: fit on the " +
+                      `even-numbered images, measured on the odd ones, up to ${BATCH_CODING_MAX} each), and every ` +
+                      "image's sites as one stream (pooled). Model: the rate term's estimate (rate.js) for the " +
+                      "same sites and steps; it models what a pooled or shared stream pays, not the header or " +
+                      "positions. KLT runs code colors along the run's basis, others as YCoCg-R; color is the " +
+                      "three color planes together. The histogram layer is left out." },
   tune:       { stage: "tune", label: "Auto-tune: PSNR vs setting", kind: "plot", source: "train", on: ["tune"],
                 draw: drawTunePlot, hit: hitTune,
                 note: "The setting the last auto-tune climbed (a tune button or optimize all, one setting at a " +
@@ -699,7 +714,7 @@ const LAYOUTS = {
   batch: {
     label: "Batch",
     areas: `"batchHist   batchPsnr   tune"
-            "batchBpp    batchDigits batchDigits"`,
+            "batchBpp    batchDigits batchCoding"`,
   },
   run: {
     label: "Run",
@@ -2830,6 +2845,100 @@ function drawCodec(view) {
                w / 2, h - 8);
 }
 
+// ---- Batch: coding ----
+// The finished batch's sites coded one image at a time, against a shared
+// model fit on half the images, and as one pooled stream, next to the rate
+// model's estimate (batch.coding, from trainTiledBatch). Computed once per
+// batch, on the main thread, so the shared model sees at most
+// BATCH_CODING_MAX images per half.
+
+const BATCH_CODING_ROWS = ["header", "position", "log_aniso", "θ", "log_tau", "radius", "color"];
+
+function batchCodingJob() {
+  const b = state.batch;
+  const entry = b?.coding?.[0];
+  if (!entry || b.running) return null;
+  if (state.batchCoding?.batch === b) return state.batchCoding;
+  const job = { batch: b, status: "running", result: null, error: null };
+  state.batchCoding = job;
+  setTimeout(() => {
+    try {
+      job.result = batchCoding(b, entry);
+      job.status = "done";
+    } catch (err) {
+      job.error = err.message;
+      job.status = "error";
+      console.error(err);
+    }
+    if (state.batchCoding === job && VIEWS.batchCoding.canvas) drawBatchCoding(VIEWS.batchCoding);
+  }, 0);
+  return job;
+}
+
+function batchCoding(b, entry) {
+  const { steps } = entry.estimate;
+  const list = entry.runs.map((i) => b.runs[i]).filter((r) => r.status === "done").map((r) => {
+    const snap = r.snaps.at(-1);
+    const sites = Float32Array.from(snap.sites);
+    if (snap.layer !== null && snap.layer !== undefined) sites[snap.layer * SITE_FLOATS] = -1;
+    return { sites, n: snap.count, width: r.width, height: r.height };
+  });
+  const per = (bits) => {
+    const o = { ...bits.perSite };
+    o.color = ["Y", "Co", "Cg", "K0", "K1", "K2"].reduce((t, k) => t + (o[k] ?? 0), 0);
+    return { perSite: o, sites: bits.sites };
+  };
+  const pixels = list.reduce((t, im) => t + im.width * im.height, 0);
+  const cols = {
+    alone: per(codecBits(list, steps, entry.basis)),
+    pooled: per(codecBits(poolImages(list), steps, entry.basis)),
+  };
+  if (list.length >= 4) {
+    const fit = list.filter((_, i) => i % 2 === 0).slice(0, BATCH_CODING_MAX);
+    const held = list.filter((_, i) => i % 2 === 1).slice(0, BATCH_CODING_MAX);
+    const shared = buildSharedModel(fit, steps, { colorBasis: entry.basis });
+    cols.shared = per(codecBits(held, steps, null, shared));
+  }
+  const est = entry.estimate, n = Math.max(1, est.sites), pl = est.planes;
+  const model = { log_aniso: pl.log_aniso / n, "θ": pl["θ"] / n, log_tau: pl.log_tau / n, radius: pl.radius / n,
+                  color: (pl.K0 + pl.K1 + pl.K2) / n };
+  model.total = Object.values(model).reduce((t, v) => t + v, 0);
+  return { cols, model, pixels, images: list.length, klt: !!entry.basis, lossDb: b.args.rateLossDb };
+}
+
+function drawBatchCoding(view) {
+  const p = beginPlot(view);
+  if (!p) return;
+  const { ctx, col, w, h } = p;
+  const box = { left: 12, right: w - 12, top: PLOT_PAD.top, bottom: h - 28 };
+  const job = batchCodingJob();
+  const msg = state.batch?.running ? "Runs when the batch finishes"
+    : !state.batch ? "Run a batch (Batch… in the top bar)"
+    : !state.batch.coding ? "Needs a tiled batch"
+    : job.status === "running" ? "Coding…"
+    : job.status === "error" ? `Coding failed: ${job.error}` : null;
+  if (msg) {
+    drawEmpty(p, box, msg);
+    return;
+  }
+  const r = job.result;
+  const names = Object.keys(r.cols);
+  const f = (v) => (Number.isFinite(v) ? v.toFixed(2) : "—");
+  drawTable(p, box, box.left, box.right, ["bits/site", ...names, "model"], [
+    ...BATCH_CODING_ROWS.map((row) => [row, ...names.map((c) => f(r.cols[c].perSite[row])), f(r.model[row])]),
+    { color: CODED_COLOR, cells: ["total", ...names.map((c) => f(r.cols[c].perSite.total)), f(r.model.total)] },
+  ]);
+  ctx.fillStyle = col.soft;
+  ctx.font = PLOT_FONT;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "bottom";
+  const pooled = r.cols.pooled;
+  ctx.fillText(`${r.images} images · ${r.lossDb} dB steps · bpp alone ` +
+               `${fmtSig(r.cols.alone.perSite.total * pooled.sites / r.pixels)}, pooled ` +
+               `${fmtSig(pooled.perSite.total * pooled.sites / r.pixels)} · ${r.klt ? "KLT" : "YCoCg-R"}`,
+               w / 2, h - 8);
+}
+
 // ---- Site sensitivity histogram ----
 // Per GRAD_GROUPS parameter group, a histogram over active sites of the
 // summed Gauss–Newton diagonal F (log bins from the 2nd percentile up; lower
@@ -3636,7 +3745,9 @@ async function startTraining() {
       if (info.type === "msg") {
         appendLog(info.message);
       } else if (info.type === "iter") {
-        const line = `Iter ${String(info.it).padStart(4)} | PSNR: ${info.psnr.toFixed(2)} dB | ` +
+        // With the rate term on: the model's estimate at its last refit (bits per coded site).
+        const rate = info.rate ? ` | est. ${(info.rate.total / Math.max(1, info.rate.sites)).toFixed(1)} bits/site` : "";
+        const line = `Iter ${String(info.it).padStart(4)} | PSNR: ${info.psnr.toFixed(2)} dB${rate} | ` +
                      `Active: ${info.activeSites}/${info.totalSites} | ${info.itsPerSec.toFixed(1)} it/s | ${info.elapsedSec.toFixed(1)}s`;
         appendLog(line);
         state.lastRender = { rgba: info.renderRgba, width: info.width, height: info.height };
@@ -4301,6 +4412,17 @@ async function trainTiledBatch(batch, dataset, signal) {
         for (const run of runs) run.status = "stopped";
         break;
       }
+      // The rate model and its codec steps fit to this atlas's final sites
+      // (whether or not the rate term trained them), for Batch: coding.
+      try {
+        await bt.trainer._rateRefit(bt.trainer.siteCount);
+        (batch.coding ??= []).push({
+          runs: idx.slice(), estimate: bt.trainer.rateLast,
+          basis: bt.trainer.colorSpace.needsBasis ? bt.trainer.colorSpace.basis : null,
+        });
+      } catch (err) {
+        console.error(err);
+      }
       const finals = await bt.finalize();
       finals.forEach((f, b) => {
         const run = runs[b];
@@ -4672,6 +4794,7 @@ function drawBatchViews() {
   if (VIEWS.batchHist.canvas) drawBatchHist(VIEWS.batchHist);
   if (VIEWS.batchDigits.canvas) drawBatchDigits(VIEWS.batchDigits);
   if (VIEWS.batchBpp.canvas) drawBatchBpp(VIEWS.batchBpp);
+  if (VIEWS.batchCoding.canvas) drawBatchCoding(VIEWS.batchCoding);
 }
 
 // Bumped whenever a batch's runs change (scheduleBatchDraw, runBatch), so the

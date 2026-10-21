@@ -923,6 +923,21 @@
           <div class="tip" role="tooltip">How Adam sizes the color steps. <b>Per param</b>: each of the three color numbers is scaled by its own gradient history, so a number whose gradient is only rounding noise (the chroma of a grey image) still takes full-size steps and drifts. <b>Shared</b>: one scale for all three (as for position), so each number moves in proportion to its share of the color gradient.</div>
         </div>
         <div class="param">
+          <div class="row"><label>rate λ</label><input id="p-rateLambda" type="number" step="0.01" min="0" /></div>
+          <p class="help"><span class="unit">squared error per bit (0 = off)</span></p>
+          <div class="tip" role="tooltip">Trains on squared error + λ × the estimated coded bits (trainer/rate.js). Every coded number (log τ, radius, the colors along the target's principal axes, log aniso, and θ's level count) gets a small probability model, refit to the sites every <b>rate refit every</b> iterations; a site pays −log₂ of the probability of its quantizer bin, so sites are pulled toward values that code cheaply. The estimate tracks the real codec within a few tenths of a bit per site (the <b>Batch: coding</b> card compares them). On CIFAR-10 at 10 sites, λ 0.03 kept PSNR at 17% fewer measured bits, and λ 0.1–0.3 gave about +0.65 dB over dropping sites at the same bits; above λ ≈ 1 dropping sites does better.</div>
+        </div>
+        <div class="param" data-needs="p-rateLambda">
+          <div class="row"><label>rate fidelity</label><input id="p-rateLossDb" type="number" step="0.1" min="0.001" /></div>
+          <p class="help"><span class="unit">dB of quantization loss</span></p>
+          <div class="tip" role="tooltip">The quantizer the rate is measured at: the codec's steps for this much predicted PSNR loss (codecSteps). Coarser (more dB) means fewer bits per value, so the same λ trades less PSNR. No effect while rate λ is 0.</div>
+        </div>
+        <div class="param" data-needs="p-rateLambda">
+          <div class="row"><label>rate refit every</label><input id="p-rateEvery" type="number" step="1" min="1" /></div>
+          <p class="help"><span class="unit">iterations</span></p>
+          <div class="tip" role="tooltip">How often the probability models are refit to the sites (each refit reads the sites back and runs one sensitivity pass). No effect while rate λ is 0.</div>
+        </div>
+        <div class="param">
           <div class="row"><label>persist weight</label><input id="p-errWeight" type="number" step="0.5" min="0" /></div>
           <p class="help"><span class="unit">α (0 = off)</span></p>
           <div class="tip" role="tooltip">Pulls harder on error that stays put. Every pixel keeps a running average of its signed error; where the error keeps the same sign iteration after iteration, the average stays large, and where it flips (noise, a boundary sweeping past) it cancels. Each pixel's loss is multiplied by (1 + α · its average error² over the image mean, capped) / (1 + α), so the mean weight stays near 1 and pixels with persistent error count up to (1 + α · cap) / (1 + α) times more. Costs one extra read and write per pixel per iteration.</div>
@@ -1180,6 +1195,6 @@
       </section>
     </div>
 
-    <script type="module" src="train.js?v=w2b-20261021"></script>
+    <script type="module" src="train.js?v=rui3-20261021"></script>
   </body>
 </html>

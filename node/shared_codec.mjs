@@ -23,7 +23,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 
-import { buildSharedModel } from "../trainer/codec.js?v=w2b-20261021";
+import { buildSharedModel } from "../trainer/codec.js?v=rui-20261021";
 import { pcaBasis } from "../trainer/color_spaces.js?v=w2b-20261021";
 import { createHeadlessDevice, loadShadersFromDisk } from "./headless.mjs";
 import { loadParams, argsFor, loadMnist, loadParquet } from "./common.mjs";

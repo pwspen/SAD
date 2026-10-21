@@ -25,10 +25,10 @@ import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 
 import { SITE_FLOATS } from "../trainer/params.js?v=w2b-20261021";
-import { codecSteps, encodeSites } from "../trainer/codec.js?v=w2b-20261021";
+import { codecSteps, encodeSites } from "../trainer/codec.js?v=rui-20261021";
 import { encodeSiteColors } from "../trainer/color_spaces.js?v=w2b-20261021";
 import { readSites } from "../trainer/buffers.js?v=20261019";
-import { tilePsnrs, tileOrigin } from "../trainer/batch.js?v=w2b-20261021";
+import { tilePsnrs, tileOrigin } from "../trainer/batch.js?v=rui-20261021";
 import { createHeadlessDevice, loadShadersFromDisk } from "./headless.mjs";
 import { DATASET_OPTIONS, loadParams, argsFor, loadImages, trainBatched, median } from "./common.mjs";
 
