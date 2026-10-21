@@ -27,26 +27,37 @@ import { DATASET_OPTIONS, loadParams, argsFor, loadImages, trainBatched, median 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PLANE_NAMES = ["log_aniso", "θ", "log_tau", "radius", "K0", "K1", "K2"];
 
+// Refits the rate model to a trained atlas' final sites and codes them as one
+// stream (histogram layer left out): { estimate, codec } bits per plane, sites.
+// Also used by warp.mjs and binarize.mjs.
+export async function codecMeasure(t) {
+  const n = t.siteCount;
+  await t._rateRefit(n); // fits the model and the steps to the final sites (λ is irrelevant here)
+  const est = t.rateLast;
+  const sites = await t._readSitesRgb(n);
+  for (let i = 0; i < n; i += 1) if (t._isLayer(i)) sites[i * SITE_FLOATS] = -1;
+  const enc = encodeSites(sites, n, t.width, t.height, est.steps, { colorBasis: t.rateBasis });
+  const codec = Object.fromEntries(PLANE_NAMES.map((k, p) => [k, enc.planeBits[p]]));
+  codec.position = enc.positionBits;
+  codec.header = enc.headerBits;
+  return { estimate: { ...est.planes }, codec, sites: enc.n, steps: est.steps };
+}
+
+// Adds one atlas' codecMeasure into `out` ({ estimate, codec, sites }).
+export function addMeasure(out, m) {
+  const add = (o, k, v) => { o[k] = (o[k] ?? 0) + v; };
+  out.estimate ??= {};
+  out.codec ??= {};
+  for (const [k, v] of Object.entries(m.estimate)) add(out.estimate, k, v);
+  for (const [k, v] of Object.entries(m.codec)) add(out.codec, k, v);
+  out.sites = (out.sites ?? 0) + m.sites;
+}
+
 async function run(ctx, params, images) {
   const { args } = await argsFor(params);
   args.logFreq = args.iters;
   const out = { estimate: null, codec: null, pixels: 0, sites: 0 };
-  const after = async (bt) => {
-    const t = bt.trainer, n = t.siteCount;
-    await t._rateRefit(n); // fits the model and the steps to the final sites (λ is irrelevant here)
-    const est = t.rateLast;
-    const sites = await t._readSitesRgb(n);
-    for (let i = 0; i < n; i += 1) if (t._isLayer(i)) sites[i * SITE_FLOATS] = -1;
-    const enc = encodeSites(sites, n, t.width, t.height, est.steps, { colorBasis: t.rateBasis });
-    const add = (o, k, v) => { o[k] = (o[k] ?? 0) + v; };
-    out.estimate ??= {};
-    out.codec ??= {};
-    for (const [k, v] of Object.entries(est.planes)) add(out.estimate, k === "radius" ? "radius" : k, v);
-    PLANE_NAMES.forEach((k, p) => add(out.codec, k, enc.planeBits[p]));
-    add(out.codec, "position", enc.positionBits);
-    add(out.codec, "header", enc.headerBits);
-    out.sites += enc.n;
-  };
+  const after = async (bt) => addMeasure(out, await codecMeasure(bt.trainer));
   const { results } = await trainBatched({ ...ctx, args, quiet: true }, images, { after });
   out.pixels = images.reduce((s, im) => s + im.width * im.height, 0);
   out.psnr = median(results.map((r) => r.psnr));
@@ -100,7 +111,9 @@ async function main() {
   process.exit(0);
 }
 
-main().catch((err) => {
-  console.error(err.stack || String(err));
-  process.exit(1);
-});
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  main().catch((err) => {
+    console.error(err.stack || String(err));
+    process.exit(1);
+  });
+}
