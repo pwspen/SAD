@@ -47,7 +47,7 @@ async function run(ctx, params, images, perImage = false) {
     const t = bt.trainer, n = t.siteCount;
     await t._rateRefit(n); // the codec steps for the final sites
     const s = await t._readSitesRgb(n);
-    for (let i = 0; i < n; i += 1) if (t._isLayer(i)) s[i * SITE_FLOATS] = -1;
+    for (let i = 0; i < n; i += 1) if (t._uncoded(i)) s[i * SITE_FLOATS] = -1;
     const enc = encodeSites(s, n, t.width, t.height, t.rateLast.steps, { colorBasis: t.rateBasis });
     const add = (k, v) => { codec[k] = (codec[k] ?? 0) + v; };
     PLANE_NAMES.forEach((k, p) => add(k, enc.planeBits[p]));

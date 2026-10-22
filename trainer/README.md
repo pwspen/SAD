@@ -44,6 +44,30 @@ paired against no layer, ± standard error over digits) it gains 0.78 ± 0.28 dB
 3.06 ± 0.41 at 32 (the MNIST preset); on Kodak at 256 px it stays mostly behind (β ≈ −4.7, ~4%
 of pixels) and costs 0.13 ± 0.03 dB.
 
+Two less hand-set variants. `layer: "mean"` learns the layer's color too and starts it from the
+target's mean color at β = 0 (no histogram). `layer: "site"` starts there and learns everything,
+as an ordinary site (position, τ, aniso, color; radius as β so its step is in logit units). It is
+still blended at every pixel, but it goes through the rate term, quantization noise and the codec
+like the others; `learn` and `mean` are left out of the bits. Rate–distortion on held-out images
+1024–3071 (presets, klt k = 3, 3–16 sites, median of 2 repeats; `colordims.mjs`, codec bpp),
+ΔPSNR against `learn` at equal bpp:
+
+| sites | MNIST off | MNIST mean | MNIST site | CIFAR off | CIFAR mean | CIFAR site |
+|---|---|---|---|---|---|---|
+| 3 | −3.26 | −0.61 | −3.05 | −0.77 | +0.35 | −1.11 |
+| 6 | −4.26 | −1.38 | −3.35 | −0.52 | +0.12 | −0.65 |
+| 10 | −4.09 | −1.76 | −2.81 | −0.35 | +0.09 | −0.44 |
+| 12 | −3.69 | −1.41 | −2.14 | −0.27 | +0.11 | −0.42 |
+
+The learned color converges to the histogram peak anyway (black on MNIST: R ≈ −1/255). On MNIST,
+`mean` loses because of where it starts. A grey layer at β = 0 hurts at first, so β drops (median
+−0.83 at 10 sites vs +1.01 for `learn`), the sites take the background, and the layer stays
+behind. On CIFAR, where the peak is a weaker prior, the mean start is slightly better. `site`
+gains only ~0.1 dB over `mean` from its extra freedom, and the codec charges it 70–85 bits per
+image as an outlier (log τ ~13, radius ~22, color 12–14, position 9–12 bits), so it is the worst
+layer at equal bpp. It still beats no layer on MNIST and loses to it on CIFAR. `learn` and `mean`
+are compared with `off` and `site` without paying for their own ~4 numbers.
+
 `errWeight` > 0 weights the loss toward persistent error. The gradient pass keeps, per pixel, an
 EWMA ē of the signed error (decay `errBeta` per iteration, ramped in from a plain average) and
 scales the pixel's loss by the stop-gradient weight (1 + α · min(b / mean b, `errCap`)) / (1 + α),

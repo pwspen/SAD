@@ -1,6 +1,7 @@
 // Adam step over the interleaved f32-bit `grads` buffer (layout in
 // gradients_tiled.wgsl); clears each site's gradients after use.
-// The histogram layer (params.layer_site) only changes its depth. Tiled
+// The histogram layer (params.layer_site) changes its depth, and per
+// params.layer_learn its color (1) or everything (2). Tiled
 // (Tiling), width and height are a tile's, the layer is that slot of every
 // tile, and positions clamp to the site's own tile.
 
@@ -42,7 +43,11 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
     slot = idx % params.tiling.sitesPerTile;
     origin = site_tile_origin(params.tiling, idx);
   }
-  if (slot == params.layer_site) {
+  let is_layer = slot == params.layer_site;
+  // What of the site moves besides depth and color (all of it but the layer
+  // in modes 0 and 1).
+  let shape = !is_layer || params.layer_learn == 2u;
+  if (is_layer && params.layer_learn == 0u) {
     // The histogram layer (trainer.js, LAYER_MODES): only its depth
     // β = τ · radius · inv_scale moves, at the log-τ LR (logit units), with
     // dL/dβ = dL/dradius / (τ · inv_scale) and Adam moments in the radius slots.
@@ -93,30 +98,43 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   let tt = max(1.0, f32(params.t) - adam[base + 20u]);
   let b1t_corr = 1.0 / (1.0 - pow(params.beta1, tt));
   let b2t_corr = 1.0 / (1.0 - pow(params.beta2, tt));
+  // The layer's radius moves as its depth β = radius · k (as above), at τ
+  // before this step.
+  let layer_k = exp(sites[idx].log_tau) / f32(max(params.width, params.height));
 
-  m_pos = params.beta1 * m_pos + (1.0 - params.beta1) * g_pos;
-  let g2_pos = dot(g_pos, g_pos);
-  let v_pos_scalar = params.beta2 * v_pos.x + (1.0 - params.beta2) * g2_pos;
-  let m_hat_pos = m_pos * b1t_corr;
-  let v_hat_pos = v_pos_scalar * b2t_corr;
-  let step_pos = params.lr_pos * m_hat_pos / (sqrt(v_hat_pos) + params.eps);
-  sites[idx].position = clamp(sites[idx].position - step_pos,
-    origin, origin + vec2<f32>(f32(params.width - 1u), f32(params.height - 1u)));
-  v_pos = vec2<f32>(v_pos_scalar, v_pos_scalar);
+  if (shape) {
+    m_pos = params.beta1 * m_pos + (1.0 - params.beta1) * g_pos;
+    let g2_pos = dot(g_pos, g_pos);
+    let v_pos_scalar = params.beta2 * v_pos.x + (1.0 - params.beta2) * g2_pos;
+    let m_hat_pos = m_pos * b1t_corr;
+    let v_hat_pos = v_pos_scalar * b2t_corr;
+    let step_pos = params.lr_pos * m_hat_pos / (sqrt(v_hat_pos) + params.eps);
+    sites[idx].position = clamp(sites[idx].position - step_pos,
+      origin, origin + vec2<f32>(f32(params.width - 1u), f32(params.height - 1u)));
+    v_pos = vec2<f32>(v_pos_scalar, v_pos_scalar);
 
-  m_log_tau = params.beta1 * m_log_tau + (1.0 - params.beta1) * g_log_tau;
-  v_log_tau = params.beta2 * v_log_tau + (1.0 - params.beta2) * (g_log_tau * g_log_tau);
-  let m_hat_tau = m_log_tau * b1t_corr;
-  let v_hat_tau = v_log_tau * b2t_corr;
-  let step_tau = params.lr_tau * m_hat_tau / (sqrt(v_hat_tau) + params.eps);
-  sites[idx].log_tau = sites[idx].log_tau - step_tau;
+    m_log_tau = params.beta1 * m_log_tau + (1.0 - params.beta1) * g_log_tau;
+    v_log_tau = params.beta2 * v_log_tau + (1.0 - params.beta2) * (g_log_tau * g_log_tau);
+    let m_hat_tau = m_log_tau * b1t_corr;
+    let v_hat_tau = v_log_tau * b2t_corr;
+    let step_tau = params.lr_tau * m_hat_tau / (sqrt(v_hat_tau) + params.eps);
+    sites[idx].log_tau = sites[idx].log_tau - step_tau;
+  }
 
-  m_radius_sq = params.beta1 * m_radius_sq + (1.0 - params.beta1) * g_radius_sq;
-  v_radius_sq = params.beta2 * v_radius_sq + (1.0 - params.beta2) * (g_radius_sq * g_radius_sq);
-  let m_hat_rad = m_radius_sq * b1t_corr;
-  let v_hat_rad = v_radius_sq * b2t_corr;
-  let step_rad = params.lr_radius * m_hat_rad / (sqrt(v_hat_rad) + params.eps);
-  sites[idx].radius_sq = sites[idx].radius_sq - step_rad;
+  if (is_layer) {
+    let g = g_radius_sq / layer_k;
+    m_radius_sq = params.beta1 * m_radius_sq + (1.0 - params.beta1) * g;
+    v_radius_sq = params.beta2 * v_radius_sq + (1.0 - params.beta2) * g * g;
+    let step_beta = params.lr_tau * (m_radius_sq * b1t_corr) / (sqrt(v_radius_sq * b2t_corr) + params.eps);
+    sites[idx].radius_sq = clamp(sites[idx].radius_sq * layer_k - step_beta, -8.0, 8.0) / layer_k;
+  } else {
+    m_radius_sq = params.beta1 * m_radius_sq + (1.0 - params.beta1) * g_radius_sq;
+    v_radius_sq = params.beta2 * v_radius_sq + (1.0 - params.beta2) * (g_radius_sq * g_radius_sq);
+    let m_hat_rad = m_radius_sq * b1t_corr;
+    let v_hat_rad = v_radius_sq * b2t_corr;
+    let step_rad = params.lr_radius * m_hat_rad / (sqrt(v_hat_rad) + params.eps);
+    sites[idx].radius_sq = sites[idx].radius_sq - step_rad;
+  }
 
   m_color = params.beta1 * m_color + (1.0 - params.beta1) * g_color;
   if (params.color_moment == 1u) {
@@ -138,27 +156,29 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   sites[idx].color_g = new_col.y;
   sites[idx].color_b = new_col.z;
 
-  let curr_dir = safe_dir(site_aniso_dir(sites[idx]));
-  let g_tan = safe_g_dir - curr_dir * dot(safe_g_dir, curr_dir);
-  m_dir = params.beta1 * m_dir + (1.0 - params.beta1) * g_tan;
-  let g2_dir = dot(g_tan, g_tan);
-  let v_dir_scalar = params.beta2 * v_dir.x + (1.0 - params.beta2) * g2_dir;
-  let m_hat_dir = m_dir * b1t_corr;
-  let v_hat_dir = v_dir_scalar * b2t_corr;
-  let step_dir = params.lr_dir * m_hat_dir / (sqrt(v_hat_dir) + params.eps);
-  var new_dir = curr_dir - step_dir;
-  new_dir = safe_dir(new_dir);
-  sites[idx].aniso_dir_x = new_dir.x;
-  sites[idx].aniso_dir_y = new_dir.y;
-  v_dir = vec2<f32>(v_dir_scalar, v_dir_scalar);
+  if (shape) {
+    let curr_dir = safe_dir(site_aniso_dir(sites[idx]));
+    let g_tan = safe_g_dir - curr_dir * dot(safe_g_dir, curr_dir);
+    m_dir = params.beta1 * m_dir + (1.0 - params.beta1) * g_tan;
+    let g2_dir = dot(g_tan, g_tan);
+    let v_dir_scalar = params.beta2 * v_dir.x + (1.0 - params.beta2) * g2_dir;
+    let m_hat_dir = m_dir * b1t_corr;
+    let v_hat_dir = v_dir_scalar * b2t_corr;
+    let step_dir = params.lr_dir * m_hat_dir / (sqrt(v_hat_dir) + params.eps);
+    var new_dir = curr_dir - step_dir;
+    new_dir = safe_dir(new_dir);
+    sites[idx].aniso_dir_x = new_dir.x;
+    sites[idx].aniso_dir_y = new_dir.y;
+    v_dir = vec2<f32>(v_dir_scalar, v_dir_scalar);
 
-  m_log_aniso = params.beta1 * m_log_aniso + (1.0 - params.beta1) * g_log_aniso;
-  v_log_aniso = params.beta2 * v_log_aniso + (1.0 - params.beta2) * (g_log_aniso * g_log_aniso);
-  let m_hat_aniso = m_log_aniso * b1t_corr;
-  let v_hat_aniso = v_log_aniso * b2t_corr;
-  let step_aniso = params.lr_aniso * m_hat_aniso / (sqrt(v_hat_aniso) + params.eps);
-  sites[idx].log_aniso = sites[idx].log_aniso - step_aniso;
-  sites[idx].log_aniso = clamp(sites[idx].log_aniso, -5.0, 5.0);
+    m_log_aniso = params.beta1 * m_log_aniso + (1.0 - params.beta1) * g_log_aniso;
+    v_log_aniso = params.beta2 * v_log_aniso + (1.0 - params.beta2) * (g_log_aniso * g_log_aniso);
+    let m_hat_aniso = m_log_aniso * b1t_corr;
+    let v_hat_aniso = v_log_aniso * b2t_corr;
+    let step_aniso = params.lr_aniso * m_hat_aniso / (sqrt(v_hat_aniso) + params.eps);
+    sites[idx].log_aniso = sites[idx].log_aniso - step_aniso;
+    sites[idx].log_aniso = clamp(sites[idx].log_aniso, -5.0, 5.0);
+  }
 
   adam[base + 0u] = m_pos.x;
   adam[base + 1u] = m_pos.y;

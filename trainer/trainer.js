@@ -187,15 +187,29 @@ export function countCapacity(args, start = args.startSites) {
 // added to -τ(d - r) is exactly a radius change, which the optimizer undoes.
 // MNIST: +0.78 / +3.06 dB at 8 / 32 sites; Kodak at 256 px: -0.13 dB, the
 // layer staying behind (β ≈ -4.7, ~4% of pixels).
+// "mean": the same flat site with its color learned too, both from a plain
+// start (the target's mean color, β = 0): no histogram. "site": an ordinary
+// site that starts there and learns everything (position, τ, aniso, color;
+// its radius as β, so the step is in logit units), still blended at every
+// pixel, and coded (rate term, quantization noise, codec) like the others;
+// only "learn" and "mean" are left out of the bits.
+// At equal codec bpp (README): "mean" -0.6…-1.8 dB vs "learn" on MNIST (β
+// drops while the color is still grey), +0.1…+0.35 on CIFAR-10; "site" pays
+// 70–85 bits/image as a codec outlier for ~0.1 dB over "mean".
 export const LAYER_MODES = {
   off: "off",
   learn: "learned depth",
+  mean: "learned depth + color, from the mean",
+  site: "ordinary site (coded), from the mean",
 };
+// What adam.wgsl learns of the layer (AdamParams.layer_learn) per mode.
+const LAYER_LEARN = { off: 0, learn: 0, mean: 1, site: 2 };
 // τ of the layer and its depth range; β is stored as radius β / (τ · inv_scale).
 const LEARN_LOG_TAU = -4;
 const LAYER_BETA_MAX = 8; // also in adam.wgsl
-// colorPeak of each image tile of an atlas (batch.js) of width `width`.
-function tilePeaks(target, mask, width, tiling) {
+// `stat` (colorPeak or meanColor) of each image tile of an atlas (batch.js)
+// of width `width`.
+function tilePeaks(target, mask, width, tiling, stat = colorPeak) {
   const { tileW, tileH, tilesX, count } = tiling;
   const n = tileW * tileH;
   const sub = new Float32Array(n * 4);
@@ -208,7 +222,7 @@ function tilePeaks(target, mask, width, tiling) {
       sub.set(target.subarray(row * 4, (row + tileW) * 4), y * tileW * 4);
       if (subMask) subMask.set(mask.subarray(row, row + tileW), y * tileW);
     }
-    peaks.push(colorPeak(sub, n, subMask));
+    peaks.push(stat(sub, n, subMask));
   }
   return peaks;
 }
@@ -256,6 +270,19 @@ export function colorPeak(target, n, mask = null) {
   let key = 0, cnt = -1;
   for (const [k, c] of exact) if (c > cnt) { key = k; cnt = c; }
   return { color: [(key >> 16) / 255, ((key >> 8) & 255) / 255, (key & 255) / 255], mass: total ? bestMass / total : 0 };
+}
+
+// The target's mean color over the masked pixels: { color (0..1 RGB), mass
+// (null: no peak) }, as colorPeak's result.
+export function meanColor(target, n, mask = null) {
+  const sum = [0, 0, 0];
+  let total = 0;
+  for (let p = 0; p < n; p += 1) {
+    if (mask && !(mask[p] > 0)) continue;
+    for (let c = 0; c < 3; c += 1) sum[c] += target[p * 4 + c];
+    total += 1;
+  }
+  return { color: sum.map((v) => v / Math.max(1, total)), mass: null };
 }
 
 // Collect default args from a training_config.json-style object + user
@@ -513,7 +540,8 @@ export class Trainer {
     // kernel skips. The schedule runs over the ordinary sites, and the layer
     // counts against startSites and endSites alike (countArgs), so start =
     // end holds the count.
-    const useLayer = args.layer === "learn";
+    const useLayer = args.layer !== "off";
+    const layerStat = args.layer === "learn" ? colorPeak : meanColor;
     let baseSiteCount;
     if (tiling) {
       // Every tile's sitesPerTile slots are placed at once; the layer is the
@@ -523,14 +551,14 @@ export class Trainer {
         throw new Error("Batched training needs a fixed site count (start sites = end sites, no sawtooth, no turnover)");
       }
       const n = tiling.sitesPerTile;
-      if (useLayer) this.histPeaks = tilePeaks(targetRgba32f, this.maskCpu, width, tiling);
+      if (useLayer) this.histPeaks = tilePeaks(targetRgba32f, this.maskCpu, width, tiling, layerStat);
       this.layerIndex = useLayer ? n - 1 : null;
       this.countArgs = args;
       this.usesGrow = false;
       this.bufferCapacity = initSiteCount = baseSiteCount = tiling.tiles * n;
     } else {
       if (!initSites) initSiteCount = useLayer ? Math.max(1, args.startSites - 1) : args.startSites;
-      if (useLayer) this.histPeak = colorPeak(targetRgba32f, width * height, this.maskCpu);
+      if (useLayer) this.histPeak = layerStat(targetRgba32f, width * height, this.maskCpu);
       baseSiteCount = initSiteCount;
       this.layerIndex = useLayer ? baseSiteCount : null;
       if (useLayer) initSiteCount += 1;
@@ -572,7 +600,7 @@ export class Trainer {
     this.invScaleSq = invScaleSqFor(width, height, tiling);
     this.gradParams = createGradParamsBuffer(device, initSiteCount, this.invScaleSq, this._globalCand(), this._gradEma(), tiling);
     this.adamParams = createAdamParamsBuffer(device, {
-      ...this._adamSize(), layerSite: this._globalCand(), colorMoment: COLOR_MOMENTS[args.colorMoment].id,
+      ...this._adamSize(), layerSite: this._globalCand(), layerLearn: LAYER_LEARN[args.layer], colorMoment: COLOR_MOMENTS[args.colorMoment].id,
     });
     this.gradCountParams = createClearParamsBuffer(device, this.bufferCapacity * 10);
 
@@ -629,7 +657,11 @@ export class Trainer {
       this._log(`Initialized sites: ${initSiteCount} (active ${this.activeEstimate})`);
     }
     if (useLayer && tiling) {
-      this._log(`Histogram layer: slot ${this.layerIndex} of each of ${tiling.count} tiles, from each image's own peak`);
+      this._log(`Histogram layer (${args.layer}): slot ${this.layerIndex} of each of ${tiling.count} tiles, from each image's own ` +
+                (args.layer === "learn" ? "peak" : "mean"));
+    } else if (useLayer && args.layer !== "learn") {
+      const c = this.histPeak.color.map((v) => Math.round(v * 255)).join(", ");
+      this._log(`Histogram layer (${args.layer}): rgb(${c}), the mean → site ${this.layerIndex}, depth β starts at 0`);
     } else if (useLayer) {
       const c = this.histPeak.color.map((v) => Math.round(v * 255)).join(", ");
       this._log(`Histogram layer: rgb(${c}) covers ${(100 * this.histPeak.mass).toFixed(1)}% of pixels → ` +
@@ -709,7 +741,8 @@ export class Trainer {
       site[1] = oy + (h - 1) / 2;
       site[2] = LEARN_LOG_TAU;
       // Logit -τ(d - r·inv_scale) at d = 0 is the depth β.
-      site[3] = this._layerBeta0(peak) * Math.max(w, h) / Math.exp(LEARN_LOG_TAU);
+      const beta0 = this.args.layer === "learn" ? this._layerBeta0(peak) : 0;
+      site[3] = beta0 * Math.max(w, h) / Math.exp(LEARN_LOG_TAU);
       site.set(peak.color, 4);
       site[7] = 1;
       site[8] = 0;
@@ -754,7 +787,7 @@ export class Trainer {
         lrDir: it >= ANI_START_ITER ? args.lrDirBase * lrScale * lm[4] : 0,
         lrAniso: it >= ANI_START_ITER ? args.lrAnisoBase * lrScale * lm[5] : 0,
         beta1: args.beta1, beta2: args.beta2, eps: args.eps, t: it + 1,
-        ...this._adamSize(), layerSite: this._globalCand(), colorMoment: COLOR_MOMENTS[args.colorMoment].id,
+        ...this._adamSize(), layerSite: this._globalCand(), layerLearn: LAYER_LEARN[args.layer], colorMoment: COLOR_MOMENTS[args.colorMoment].id,
       });
 
       const shouldLog = (it % logFreq === 0) || (it === iters - 1);
@@ -1537,6 +1570,13 @@ export class Trainer {
     this.lrAdaptLog.push({ it, rho, mults: Array.from(this.lrMults) });
   }
 
+  // The layer's slot when it is left out of the bits (rate term, quantization
+  // noise, codec: every mode but "site"), or null.
+  _uncodedSlot() { return this.args.layer === "site" ? null : this.layerIndex; }
+
+  // Whether slot i is a site the codec leaves out (the uncoded layer).
+  _uncoded(i) { return this._uncodedSlot() !== null && this._isLayer(i); }
+
   // Whether slot i is the histogram layer (in any tile).
   _isLayer(i) {
     if (this.layerIndex === null || this.layerIndex === undefined) return false;
@@ -1557,7 +1597,7 @@ export class Trainer {
       if (this.maskCpu && !(this.maskCpu[i] > 0)) continue;
       for (let c = 0; c < 3; c += 1) sse += (rgba[i * 4 + c] - this.target[i * 4 + c]) ** 2;
     }
-    const skip = (i) => this._isLayer(i);
+    const skip = (i) => this._uncoded(i);
     const coded = Float32Array.from(sites);
     for (let i = 0; i < siteCount; i += 1) if (skip(i)) coded[i * SITE_FLOATS] = -1;
     const steps = codecSteps(coded, siteCount, F, { lossDb: args.rateLossDb, sse0: sse });
@@ -1565,7 +1605,7 @@ export class Trainer {
       { components: args.rateComponents, prev: this.rateModel, skip });
     this.rateLast = { ...rateBits(this.rateModel, sites, siteCount, skip), steps, sse };
     this.device.queue.writeBuffer(this.rateBuf, 0, rateBuffer(this.rateModel, {
-      lambda: args.rateLambda, siteCount, layerSlot: this.layerIndex, sitesPerTile: this.tiling ? this.tiling.sitesPerTile : 0,
+      lambda: args.rateLambda, siteCount, layerSlot: this._uncodedSlot(), sitesPerTile: this.tiling ? this.tiling.sitesPerTile : 0,
     }));
   }
 
@@ -1581,7 +1621,7 @@ export class Trainer {
       this._qnSeed = (Math.random() * 0x7fffffff) >>> 0;
     }
     this.device.queue.writeBuffer(this._qnBuf, 0, quantNoiseBuffer(this.rateModel.steps, this.rateBasis, {
-      scale: this.args.quantNoise, siteCount, layerSlot: this.layerIndex, seed: (this._qnSeed + it * 0x9e3779b9) >>> 0,
+      scale: this.args.quantNoise, siteCount, layerSlot: this._uncodedSlot(), seed: (this._qnSeed + it * 0x9e3779b9) >>> 0,
       width: this.width, height: this.height, tiling: this.tiling,
     }));
     encoder.copyBufferToBuffer(this.sitesBuf, 0, this._qnClean, 0, bytes);

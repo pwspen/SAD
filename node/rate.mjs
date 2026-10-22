@@ -35,7 +35,7 @@ export async function codecMeasure(t) {
   await t._rateRefit(n); // fits the model and the steps to the final sites (λ is irrelevant here)
   const est = t.rateLast;
   const sites = await t._readSitesRgb(n);
-  for (let i = 0; i < n; i += 1) if (t._isLayer(i)) sites[i * SITE_FLOATS] = -1;
+  for (let i = 0; i < n; i += 1) if (t._uncoded(i)) sites[i * SITE_FLOATS] = -1;
   const enc = encodeSites(sites, n, t.width, t.height, est.steps, { colorBasis: t.rateBasis });
   const codec = Object.fromEntries(PLANE_NAMES.map((k, p) => [k, enc.planeBits[p]]));
   codec.position = enc.positionBits;

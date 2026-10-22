@@ -52,7 +52,7 @@ async function evaluate(bt, dbs) {
   }
   const out = { clean: Array.from(tilePsnrs(clean, bt.images, layout)), dbs: {} };
   const coded = Float32Array.from(sites);
-  for (let i = 0; i < n; i += 1) if (t._isLayer(i)) coded[i * SITE_FLOATS] = -1;
+  for (let i = 0; i < n; i += 1) if (t._uncoded(i)) coded[i * SITE_FLOATS] = -1;
   for (const db of dbs) {
     const steps = codecSteps(coded, n, F, { lossDb: db, sse0: sse });
     const enc = encodeSites(coded, n, t.width, t.height, steps, { colorBasis: t.rateBasis });
