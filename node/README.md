@@ -396,3 +396,40 @@ The codec does not classify: its shared model is factorized per plane (value his
 and raster position gaps), with no model of where on the image which values sit, so the
 clusters it settles into share value statistics, not shapes (325 → 322 bits/image).
 
+
+## Gap to RECOMBINER on CIFAR-10 (qat.mjs)
+
+Where SAD's ~2 dB gap to [RECOMBINER](https://arxiv.org/abs/2309.17182) (ICLR 2024; 23.59 dB at
+0.297 bpp, its lowest CIFAR-10 point) comes from. `qat.mjs` arms a (post-hoc) and c (rate term,
+λ 0.01 / 0.03 / 0.1) on held-out test images 1024–3071, presets/cifar10.json at 10 and 12 sites,
+100 / 1000 / 3000 iterations (cosine LR stretched over the run, lrMult untuned past 100), budgets
+0.25–4 dB; post-hoc 3 repeats (spread ≤ 0.07 dB), rate 1. Bits are the pooled stream (close to the
+shared model: 36.4 vs 36.1 bits/site above). PSNR at a bpp is the upper hull over sites, arms and
+budgets, interpolated; "clean" is the unquantized PSNR at the same point.
+
+```bash
+node qat.mjs --parquet ../../comp/data/cifar10/test.parquet --from 1024 --count 2048 \
+  --preset ../presets/cifar10.json --set sites=10 --set iters=1000 --arms c --lambdas 0.01,0.03,0.1 --db 0.5,1,2
+```
+
+| frontier | 0.25 bpp | 0.297 bpp (clean) | 0.35 bpp | 0.45 bpp |
+|---|---|---|---|---|
+| 100 it, post-hoc | 20.33 | 20.97 (21.68) | 21.45 | — |
+| 100 it, + rate term | 20.95 | 21.36 (22.03) | 21.74 | — |
+| 1000 it, post-hoc | — | 20.72 (23.14) | 21.90 | 22.98 |
+| 1000 it, + rate term | 21.44 | 22.03 (22.67) | 22.62 | 23.41 |
+| 3000 it, post-hoc | — | 20.38 (23.28) | 21.71 | 22.97 |
+
+Medians over images; the mean (`mean` in the rows, which RECOMBINER likely reports) is +0.22–0.25 dB
+higher at the 0.297 bpp neighbours, so the best is ≈ 22.25 dB mean against 23.59.
+
+- Training longer alone does not pay at matched rate: clean PSNR rises 1.46 / 1.64 dB (10 / 12 sites)
+  from 100 to 1000 iterations and 0.14 more by 3000, but the converged sites cost ~11 more bits each
+  at the same budget (30.8 → 41.7 bits/site at 1 dB, 10 sites), so post-hoc at 0.297 bpp falls
+  (20.97 → 20.72 → 20.38). Priced by the rate term during training it does: +0.67 dB at 0.297.
+- At 0.297 bpp, gap 2.62 dB (100 it, post-hoc, median) = rate term 0.39 + convergence 0.67 +
+  remaining 1.56 (≈ 1.34 by means). Of the remainder, quantization loss at the frontier is 0.64 dB
+  (clean − coded), so even lossless coding at the same bits leaves ≥ 0.7 dB: the representation and
+  its lack of a learned prior, not rounding or iterations.
+- Not run: the rate term at 3000 iterations (post-hoc clean gains only 0.14 past 1000), lrMult retuned
+  for long runs.

@@ -16,7 +16,7 @@
 // tile, the layer kept as trained) are rendered as a decoder would (candidate
 // lists rebuilt) and scored per image. Reported: median decoded PSNR over
 // images and measured codec bits per pixel (all bits / all pixels), medians
-// over repeats, plus the unquantized PSNR (lists rebuilt the same way).
+// over repeats (and the mean decoded PSNR over images), plus the unquantized PSNR (lists rebuilt the same way).
 // --arms picks a subset (a,b,c,d).
 
 import { mkdir, writeFile } from "node:fs/promises";
@@ -94,7 +94,7 @@ async function run(ctx, params, images, dbs) {
   }
   return {
     train: median(results.map((r) => r.psnr)), clean: median(clean),
-    dbs: Object.fromEntries(dbs.map((db) => [db, { psnr: median(per[db].psnrs), bpp: per[db].bits / pixels,
+    dbs: Object.fromEntries(dbs.map((db) => [db, { psnr: median(per[db].psnrs), mean: per[db].psnrs.reduce((a, b) => a + b, 0) / images.length, bpp: per[db].bits / pixels,
                                                    bitsPerSite: per[db].bits / per[db].sites, psnrs: per[db].psnrs }])),
   };
 }
@@ -134,11 +134,11 @@ async function main() {
     for (let k = 0; k < repeats; k += 1) reps.push(await run(ctx, c.params, images, c.dbs));
     for (const db of c.dbs) {
       const m = (f) => median(reps.map(f));
-      const r = { arm: c.arm, name: c.name, db, psnr: m((x) => x.dbs[db].psnr), bpp: m((x) => x.dbs[db].bpp),
+      const r = { arm: c.arm, name: c.name, db, psnr: m((x) => x.dbs[db].psnr), mean: m((x) => x.dbs[db].mean), bpp: m((x) => x.dbs[db].bpp),
                   bitsPerSite: m((x) => x.dbs[db].bitsPerSite), clean: m((x) => x.clean), train: m((x) => x.train),
                   repPsnr: reps.map((x) => x.dbs[db].psnr), repBpp: reps.map((x) => x.dbs[db].bpp), params: c.params };
       rows.push(r);
-      console.error(`${c.name.padEnd(18)} | ${db} dB | decoded ${r.psnr.toFixed(3)} dB at ${r.bpp.toFixed(4)} bpp ` +
+      console.error(`${c.name.padEnd(18)} | ${db} dB | decoded ${r.psnr.toFixed(3)} dB (mean ${r.mean.toFixed(3)}) at ${r.bpp.toFixed(4)} bpp ` +
                     `(${r.bitsPerSite.toFixed(2)} bits/site) | clean ${r.clean.toFixed(3)} | reps ${r.repPsnr.map((v) => v.toFixed(3)).join(" ")}`);
     }
   }
