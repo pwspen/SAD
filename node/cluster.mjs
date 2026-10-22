@@ -17,7 +17,10 @@
 //              model (codec.js buildSharedModel) fit on its members, and each
 //              image goes to the cluster whose model codes its sites in the
 //              fewest bits; repeated (--rounds) like k-means, from the site-map
-//              clusters. Images are the sites, the distance is bits.
+//              clusters. Images are the sites, the distance is bits. The
+//              models code positions as an occupancy map in --pos-regions ×
+//              --pos-regions blocks (default 14; 0 = raster gaps, which
+//              see only how far apart sites are, not where they are).
 // Scoring, per clustering: purity (every cluster named by its majority label,
 // the best a one-label-per-cluster rule can do), and the peek protocol over
 // --draws random draws (one random member's label names each cluster; the
@@ -94,7 +97,7 @@ function pixelFeatures(images) {
 // Codelength clustering from `init` labels: refit a shared model per cluster,
 // reassign by fewest bits, until fewer than 0.2% move or `rounds`. An empty
 // cluster is reseeded with the image coded worst under its own cluster.
-function codelength(items, steps, basis, k, init, rounds, log) {
+function codelength(items, steps, basis, k, init, rounds, posRegions, log) {
   const labels = Int32Array.from(init);
   const bits = new Float64Array(items.length * k);
   let models = null;
@@ -102,7 +105,7 @@ function codelength(items, steps, basis, k, init, rounds, log) {
     const t0 = performance.now();
     models = Array.from({ length: k }, (_, c) => {
       const members = items.filter((_, i) => labels[i] === c);
-      return members.length ? buildSharedModel(members, steps, { colorBasis: basis }) : null;
+      return members.length ? buildSharedModel(members, steps, { colorBasis: basis, posRegions }) : null;
     });
     items.forEach((im, i) => {
       for (let c = 0; c < k; c += 1) {
@@ -167,7 +170,7 @@ async function main() {
     options: {
       ...DATASET_OPTIONS, k: { type: "string", default: "10" }, draws: { type: "string", default: "1000" },
       rounds: { type: "string", default: "8" }, map: { type: "string", default: "14" }, "map-sigma": { type: "string", default: "2" },
-      seed: { type: "string", default: "1" }, out: { type: "string" },
+      "pos-regions": { type: "string", default: "14" }, seed: { type: "string", default: "1" }, out: { type: "string" },
     },
   });
   const { args, config } = await argsFor(await loadParams(cli.preset, cli.set));
@@ -200,8 +203,10 @@ async function main() {
   const sm = siteMap(enc.items, enc.basis, grid, sigma);
   const smLabels = kMeans(sm.X, images.length, sm.d, k, { maxIters: 100 }).labels;
   report("site map", smLabels);
-  log(`Codec  | codelength clustering from the site-map clusters`);
-  report("codelength", codelength(enc.items, enc.steps, enc.basis, k, smLabels, Number(cli.rounds) | 0, log));
+  const posRegions = Number(cli["pos-regions"]) | 0;
+  log(`Codec  | codelength clustering from the site-map clusters, positions ${posRegions ? `as occupancy in ${posRegions}×${posRegions} regions` : "as gaps"}, ` +
+      `position step ${enc.steps.pos.toPrecision(3)} px`);
+  report("codelength", codelength(enc.items, enc.steps, enc.basis, k, smLabels, Number(cli.rounds) | 0, posRegions, log));
 
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
   const outPath = cli.out || resolve(HERE, `../results/cluster_${stamp}.json`);

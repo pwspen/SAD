@@ -6,7 +6,8 @@
 //   5. coarser steps cost fewer bits; clustered sites cost less than noise
 //   6. edge cases: one site, every site round, every site in one cell
 //   7. colors along a KLT basis
-//   8. a shared model (buildSharedModel) fit on other images: round trip, and cheaper
+//   8. a shared model (buildSharedModel) fit on other images: round trip, and cheaper;
+//      positions as an occupancy map (posRegions): round trip
 // Usage: node codec_test.mjs
 
 import { encodeSites, decodeSites, codecSteps, buildSharedModel } from "../trainer/codec.js?v=rui-20261021";
@@ -206,6 +207,21 @@ function roundTrip(name, sites, count, w, h, steps, opts = {}) {
     const enc = roundTrip(`shared klt 1 dim ${k}`, im.sites, im.n, 28, 28, null, { globalSite: 0, shared: klt1 });
     check(`shared klt 1 dim skips planes ${k}`, enc.planeBits[5] === 0 && enc.planeBits[6] === 0, enc.planeBits.join(","));
   });
+  // Positions as an occupancy map: round trips (several sites in one cell included).
+  const occ = JSON.parse(JSON.stringify(buildSharedModel(train, steps, { posRegions: 4 })));
+  let gapBits = 0, occBits = 0;
+  test.forEach((im, k) => {
+    const enc = roundTrip(`shared occupancy ${k}`, im.sites, im.n, 28, 28, null, { globalSite: im.globalSite, shared: occ });
+    occBits += enc.positionBits;
+    gapBits += encodeSites(im.sites, im.n, 28, 28, steps, { shared }).positionBits;
+  });
+  const crowd = randomSites(30, 28, 28, rng(14));
+  for (let i = 0; i < 30; i += 1) { crowd[i * SITE_FLOATS] = 13.2 + (i % 3) * 0.1; crowd[i * SITE_FLOATS + 1] = 7.5; }
+  roundTrip("shared occupancy one cell", crowd, 30, 28, 28, null, { shared: occ });
+  roundTrip("shared occupancy odd size", randomSites(40, 61, 37, rng(13)), 40, 61, 37, null, { shared: occ });
+  roundTrip("shared occupancy one site", one, 1, 28, 28, null, { shared: occ });
+  roundTrip("shared occupancy no sites", none, 3, 28, 28, null, { shared: occ, globalSite: 1 });
+  console.log(`shared occupancy: ${(occBits / sites).toFixed(2)} position bits/site vs ${(gapBits / sites).toFixed(2)} as gaps`);
   console.log(`shared: ${(withShared / sites).toFixed(1)} bits/site held out (header ${(header / sites).toFixed(1)}) ` +
               `vs ${(alone / sites).toFixed(1)} per image alone; strengths ${JSON.stringify(shared.strengths)}`);
 }

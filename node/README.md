@@ -435,13 +435,26 @@ image's label (MNIST's labels file next to the images, the parquet `label` colum
 |---|---|---|---|---|
 | pixels (k-means) | 55.0% | 43.8 ± 6.0% | 21.3% | 13.0 ± 2.0% |
 | site map (k-means) | 53.5–56.4% | 38.0–41.8% | 19.9% | 11.9 ± 1.9% |
-| codelength | 37.8% | 22.7 ± 4.8% | 20.1% | 12.5 ± 2.0% |
+| codelength, positions as gaps | 37.8% | 22.7 ± 4.8% | 20.1% | 12.5 ± 2.0% |
+| codelength, occupancy 14 × 14 | 51.1% | 36.2 ± 6.1% | | |
 
 The site map matches the pixels on MNIST (two runs, so ±3% from encoding and k-means
 seeding); on CIFAR-10 every method is near chance, as k-means on pixels is known to be.
 The codec does not classify: its shared model is factorized per plane (value histograms
 and raster position gaps), with no model of where on the image which values sit, so the
 clusters it settles into share value statistics, not shapes (325 → 322 bits/image).
+
+Positions as an occupancy map (`--pos-regions R`, now the default at 14; codec.js
+`buildSharedModel(…, { posRegions })`) give the shared model a place to learn where
+sites go: the position grid in R × R blocks, each block occupied or not in a context of
+the block itself and its left and upper neighbours, then each site's cell inside its
+block as gaps. On MNIST the codelength clusters then keep most of the site map's shape
+(37.3 → 51.1% purity, 22.8 → 36.2% one peek) and code shorter too (322.2 → 314.8
+bits/image after the rounds). By blocks a side: 4 → 42.3%, 7 → 47.3%, 14 → 51.1%, 28 →
+50.9% at twice the time. It still ends a little below the site map it starts from
+(53.5%): the values are still predicted from neighbours and one constant per plane, not
+by place. A first version with one occupancy symbol per grid cell (0.11 px cells, ~61k
+per image) took 361 s a round instead of 8.
 
 
 ## Gap to RECOMBINER on CIFAR-10 (qat.mjs)

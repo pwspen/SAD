@@ -442,6 +442,48 @@ function codePositions(io, idx, n, enc, ms = new ModelSet()) {
   }
 }
 
+// Positions as an occupancy map (a shared model's posRegions R > 0): the
+// gx × gy grid in R × R blocks. Every block in raster order, until all n
+// sites are placed, is occupied or not, in a context of the block itself and
+// whether its left and upper blocks are occupied; an occupied block then
+// codes its sites beyond the first (usually none) and their cells within it,
+// as raster gaps in the block. Primed on a dataset, the block models learn
+// where its images put their sites, which plain gaps cannot (they code
+// density, not location). `idx` comes out sorted, as the encoder has it.
+function codeOccupancy(io, idx, n, gx, gy, R, enc, ms) {
+  const occ = new Uint8Array(R * R);
+  const extra = intModels(false, ms, "xe/"), first = intModels(false, ms, "xf/"), gaps = intModels(false, ms, "xg/");
+  const edge = (b, g) => Math.ceil((b * g) / R); // a block's first cell
+  const blockOf = (v) => {
+    const x = v % gx, y = (v - x) / gx;
+    return Math.floor((y * R) / gy) * R + Math.floor((x * R) / gx);
+  };
+  const byBlock = new Map();
+  if (enc) for (let i = 0; i < n; i += 1) {
+    const b = blockOf(idx[i]);
+    if (!byBlock.has(b)) byBlock.set(b, []);
+    byBlock.get(b).push(idx[i]);
+  }
+  const out = [];
+  for (let b = 0; b < R * R && out.length < n; b += 1) {
+    const bx = b % R, by = (b - bx) / R;
+    const pat = (bx > 0 ? occ[b - 1] : 0) | (by > 0 ? occ[b - R] << 1 : 0);
+    const mine = byBlock.get(b) ?? [];
+    if (!io.sym(ms.get(`xo${b * 4 + pat}`, 2), enc ? (mine.length ? 1 : 0) : undefined)) continue;
+    occ[b] = 1;
+    const count = 1 + codeInt(io, extra, enc ? mine.length - 1 : undefined);
+    const x0 = edge(bx, gx), y0 = edge(by, gy), bw = edge(bx + 1, gx) - x0;
+    let prev = 0;
+    for (let j = 0; j < count; j += 1) {
+      const local = enc ? (mine[j] - y0 * gx - x0) % gx + Math.floor((mine[j] - y0 * gx) / gx) * bw : undefined;
+      const l = j ? prev + codeInt(io, gaps, enc ? local - prev : undefined) : codeInt(io, first, local);
+      out.push((y0 + Math.floor(l / bw)) * gx + x0 + (l % bw));
+      prev = l;
+    }
+  }
+  if (!enc) out.sort((a, b) => a - b).forEach((v, i) => { idx[i] = v; });
+}
+
 // Everything the coder needs about one image's active sites at steps `q`.
 function analyze(sites, count, width, height, q, basis) {
   const { rows } = quantize(sites, count, width, height, q, basis);
@@ -470,6 +512,8 @@ function ownConstant(s) {
 //   tables     primed starting frequencies of the adaptive models, by key
 //   incs       their increments per symbol where smaller than usual
 //   strengths  per model family, the prior weight the tables were made with
+//   posRegions positions as an occupancy map in R × R blocks (codeOccupancy),
+//              or 0 (absent in older models) for raster gaps
 // A shared stream is arithmetic coded from its first bit, header included:
 // a size flag (then the size if it differs), the count, the layer's index + 1,
 // and per plane a mode: 0 = predict the shared constant, 1 = neighbours (the
@@ -501,10 +545,11 @@ function sharedStream(io, S, st, enc, ms = new ModelSet(S.tables, S.incs)) {
   }
   const headerBits = io.bits;
   if (!enc) st.idx = new Array(st.n);
-  codePositions(io, st.idx, st.n, enc, ms);
+  const gx = Math.max(1, Math.ceil(st.width / stepOf(S.q.pos)));
+  if (S.posRegions) codeOccupancy(io, st.idx, st.n, gx, Math.max(1, Math.ceil(st.height / stepOf(S.q.pos))), S.posRegions, enc, ms);
+  else codePositions(io, st.idx, st.n, enc, ms);
   const positionBits = io.bits - headerBits;
   if (!enc) {
-    const gx = Math.max(1, Math.ceil(st.width / stepOf(S.q.pos)));
     st.xs = st.idx.map((v) => v % gx); st.ys = st.idx.map((v) => Math.floor(v / gx));
     st.nbrs = priorNeighbors(st.xs, st.ys);
     st.planes = CODEC_PLANES.map(() => new Array(st.n).fill(0));
@@ -603,8 +648,10 @@ function primedTables(counts, strengths) {
 // family's strength (header, positions, each plane) is picked from
 // PRIOR_STRENGTHS by two-fold cross-validation over the images (counts from
 // one half, bits on the other), so it is not fit to the images it is scored
-// on. `iterations` alternate modes and tables. Returns a plain JSON object.
-export function buildSharedModel(list, steps, { colorBasis = null, iterations = 2 } = {}) {
+// on. `iterations` alternate modes and tables. `posRegions`: code positions
+// as an occupancy map in that many blocks a side (0: raster gaps). Returns a
+// plain JSON object.
+export function buildSharedModel(list, steps, { colorBasis = null, iterations = 2, posRegions = 0 } = {}) {
   const q = {};
   for (const k of STEP_GROUPS) q[k] = quantizeStep(steps[k]);
   const items = list.map((im) => {
@@ -620,7 +667,7 @@ export function buildSharedModel(list, steps, { colorBasis = null, iterations = 
     for (const { a } of items) a.specs[p].vals.forEach((x, i) => { if (!a.specs[p].has || a.specs[p].has[i]) v.push(x); });
     return v.length ? median(v) : 0;
   });
-  const S = { version: SHARED_VERSION, q, colorBasis, width, height, constants, tables: {}, incs: {}, strengths: {} };
+  const S = { version: SHARED_VERSION, q, colorBasis, width, height, constants, tables: {}, incs: {}, strengths: {}, posRegions };
   for (let iter = 0; iter < iterations; iter += 1) {
     const states = items.map((it) => sharedState(it.a, it.width, it.height, it.globalIndex, S));
     const count = (sel) => { const io = new CountIO(); sel.forEach((st) => sharedStream(io, S, st, true, new ModelSet())); return io.counts; };
