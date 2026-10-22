@@ -100,6 +100,21 @@ only +0.13 held out (its point is the single best measurement, so noise flatters
 the same preset scores 24.78–24.84 dB across repeats). The best sample tracks CMA-ES's
 mean within noise. `results/tunecmp/{cifar_lr,mnist_9keys}.{json,log}`.
 
+The MNIST run again with `--sigma 0.25` (±1σ ≈ ×1.28; coord rerun alongside):
+
+| batches | coord | cma σ 0.25 |
+|---|---|---|
+| 20 | +0.05 (−0.02…0.12) | +0.04 (−0.06…0.16) |
+| 40 | +0.05 (0.00…0.10) | +0.18 (0.02…0.29) |
+| 60 | +0.09 (0.07…0.10) | +0.23 (0.08…0.33) |
+| 100 | +0.20 (0.11…0.25) (done) | +0.39 (0.27…0.51) |
+| 240 | +0.20 | +0.44 (0.30…0.62) |
+
+No dip: CMA-ES is level with the coordinate search at 20 batches and ahead from 40 on,
+where at σ 0.5 it was still −0.13 dB. It also ends higher, though one repeat stopped at
+210 batches (step below ×1.1). The coordinate search's +0.20 vs +0.13 before is the
+repeat-to-repeat spread. `results/tunecmp/mnist_9keys_s025.{json,log}`.
+
 `probe.mjs` runs one batch and reports three diagnostics for putting the LR groups in
 common units (header comment for details): E1, candidate units per LR group (the codec
 quantizer step Δ, the median 1/√F of the Gauss–Newton diagonal, the spread σ of the
