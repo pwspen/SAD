@@ -617,6 +617,12 @@ const VIEWS = {
                 draw: drawAgreementPlot, hit: hitSpectrum,
                 note: "Per frequency ring: spectral SNR = 10·log₁₀(P_target / P_residual), and Fourier ring " +
                       "correlation Σ Re(F_r·F_t*) / √(Σ|F_r|² Σ|F_t|²): 1 = matches, 0 = unrelated." },
+  mseShare:   { stage: "spectral", label: "Residual MSE share by frequency", kind: "plot", source: "derived", on: ["render", "target"],
+                draw: drawMseSharePlot, hit: hitSpectrum,
+                note: "Which frequencies the luma residual's MSE sits in (Parseval: ring power × coefficients in the " +
+                      "ring, as a share of the total over the rings from 2/min(w, h) to 0.5 c/px). Bars: each ring's " +
+                      "share; line: cumulative from low frequencies; dashed: the target's own cumulative power. " +
+                      "Dashed vertical: 1/(2·site spacing), labelled with the residual share above it." },
   spectrum2d: { stage: "spectral", label: "2D power spectrum", kind: "plot", source: "derived", on: ["render", "target"],
                 draw: drawSpectrum2d,
                 note: "log₁₀ |F|² with DC at the centre, on one shared scale set by the target; " +
@@ -733,8 +739,8 @@ const LAYOUTS = {
   },
   spectral: {
     label: "Spectral",
-    areas: `"spectrum  spectrum  spectrum2d spectrum2d"
-            "agreement agreement bandSnr    bandSnr"`,
+    areas: `"spectrum  spectrum  spectrum  spectrum2d spectrum2d spectrum2d"
+            "agreement agreement mseShare  mseShare   bandSnr    bandSnr"`,
   },
   sites: {
     label: "Site statistics",
@@ -1318,6 +1324,7 @@ function axisTicks(r, px, spacing) {
 const fmtNum = (v) => String(Math.round(v * 10) / 10 || 0);
 const fmtIter = (v) => (v >= 10000 ? `${v / 1000}k` : String(Number(v.toPrecision(6))));
 const fmtSig = (v) => (v >= 10 ? v.toFixed(0) : v >= 1 ? v.toFixed(1) : String(Number(v.toPrecision(2))));
+const fmtPct = (v) => `${(100 * v).toFixed(v > 0 && v < 0.1 ? 1 : 0)}%`;
 const fmtExp = (v) => (v > 0 ? v.toExponential(2) : "0");
 const fmtLogTick = (v) => (isDecade(v) ? `1e${Math.round(Math.log10(v))}` : v.toExponential(0));
 
@@ -2241,6 +2248,77 @@ function drawSpectrumPlot(view) {
   drawTooltip(p, g, g.x(hover.f), null, {
     header: [fmtFreq(hover.f), "power"],
     rows: signals.map((sig) => ({ color: sig.color, cells: [sig.label, fmtExp(hover[sig.key])] })),
+  });
+}
+
+// ---- Residual MSE share by frequency ----
+
+// Per bin: share of the summed power (power × coefficient count) and the
+// cumulative share from the lowest bin, for signal `key`.
+function powerShares(bins, key) {
+  const sums = bins.map((b) => b[key] * b.count);
+  const total = sums.reduce((a, v) => a + v, 0);
+  let cum = 0;
+  return sums.map((v) => {
+    const share = total > 0 ? v / total : 0;
+    cum += share;
+    return { share, cum };
+  });
+}
+
+function drawMseSharePlot(view) {
+  const p = beginPlot(view);
+  if (!p) return;
+  const s = currentSpectra();
+  const bins = s?.render ? s.bins : [];
+  const [target, , residual] = SIGNALS;
+  const top = drawLegend(p, [
+    { label: "residual per ring", color: residual.color },
+    { label: "residual cum.", color: PSNR_LINE_COLOR },
+    { label: "target cum.", color: target.color, dash: [5, 4] },
+  ]) + 10;
+  const xr = { min: s?.bins.length ? s.bins[0].f : 0.004, max: 0.5, log: true };
+  const g = view.geom = plotAxes(plotBox(p, top, LEGEND_PAD), xr, { min: 0, max: 1 });
+  drawAxes(p, g, { xTitle: "frequency (cycles/px)", yTitle: "share", xFmt: fmtSig, yFmt: fmtPct,
+                   xSpacing: 44, ySpacing: 30 });
+  if (!bins.length) {
+    drawEmpty(p, g, s ? "Train to compare with the target" : "Load a target and train");
+    return;
+  }
+  const res = powerShares(bins, "residual");
+  const tgt = powerShares(bins, "target");
+  // Log-spaced bins: each spans its centre × / ÷ half a bin ratio.
+  const freq = s.ta.plan.freq;
+  const half = Math.sqrt(freq[1] / freq[0]);
+  const { ctx } = p;
+  ctx.fillStyle = residual.color;
+  ctx.globalAlpha = 0.55;
+  bins.forEach((b, i) => {
+    const x0 = g.x(Math.max(xr.min, b.f / half)), x1 = g.x(Math.min(xr.max, b.f * half));
+    ctx.fillRect(x0 + 0.5, g.y(res[i].share), Math.max(1, x1 - x0 - 1), g.bottom - g.y(res[i].share));
+  });
+  ctx.globalAlpha = 1;
+  const fSite = siteFrequency(s.ta);
+  if (fSite) {
+    let above = 0;
+    bins.forEach((b, i) => { if (b.f > fSite) above += res[i].share; });
+    drawRefLine(p, g, { x: fSite, label: `${fmtPct(above)} above site spacing` });
+  }
+  drawLine(p, g, bins.map((b, i) => [b.f, tgt[i].cum]), target.color, { dash: [5, 4] });
+  drawLine(p, g, bins.map((b, i) => [b.f, res[i].cum]), PSNR_LINE_COLOR);
+  const k = view.hoverKey;
+  if (k == null || !bins[k]) return;
+  const f = bins[k].f;
+  drawCrosshair(p, g, f);
+  drawMarker(p, g, f, res[k].cum, PSNR_LINE_COLOR);
+  drawMarker(p, g, f, tgt[k].cum, target.color);
+  drawTooltip(p, g, g.x(f), null, {
+    header: [fmtFreq(f), "share"],
+    rows: [
+      { color: residual.color, cells: ["residual, this ring", fmtPct(res[k].share)] },
+      { color: PSNR_LINE_COLOR, cells: ["residual, up to here", fmtPct(res[k].cum)] },
+      { color: target.color, cells: ["target, up to here", fmtPct(tgt[k].cum)] },
+    ],
   });
 }
 

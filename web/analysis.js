@@ -286,7 +286,8 @@ export function spectrumDiff(a, b) {
 }
 
 // Per radial bin: power of target / recon / residual (|F|² / Σwindow², i.e.
-// per-pixel power), spectral SNR in dB, and Fourier ring correlation
+// per-pixel power), the bin's FFT coefficient count, spectral SNR in dB, and
+// Fourier ring correlation
 // FRC = Σ Re(F_r · F_t*) / sqrt(Σ|F_r|² · Σ|F_t|²).
 export function radialStats(plan, Ft, Fr, Fe) {
   const nb = SPECTRUM_BINS;
@@ -308,6 +309,7 @@ export function radialStats(plan, Ft, Fr, Fe) {
     const norm = 1 / (c * plan.w2Sum);
     bins.push({
       f: plan.freq[b],
+      count: c,
       target: pt[b] * norm,
       recon: pr[b] * norm,
       residual: pe[b] * norm,
