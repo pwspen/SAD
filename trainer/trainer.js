@@ -52,6 +52,7 @@ import {
   cellMoments, pickMerges, mergedSite, mergePrecision, sitePrecision, candidateEdges, neighborMerge, EDGE_GROUPS,
 } from "./merge.js?v=20261019";
 import { CandidateLists } from "./candidates.js?v=w2b-20261021";
+import { cellInit } from "./cell_init.js?v=cells2-20261022";
 import { codecSteps } from "./codec.js?v=rui-20261021";
 import { RATE_FLOATS, fitRateModel, rateBits, rateBuffer, QNOISE_FLOATS, quantNoiseBuffer } from "./rate.js?v=w2b-20261021";
 import {
@@ -201,6 +202,15 @@ export const LAYER_MODES = {
   learn: "learned depth",
   mean: "learned depth + color, from the mean",
   site: "ordinary site (coded), from the mean",
+};
+// Starting sites when no sites file is given: "gradient" (init_gradient.wgsl:
+// R2 points past a Sobel threshold, the pixel's color, τ from INIT_LOG_TAU
+// plus the gradient, INIT_RADIUS, round) or "cells" (cell_init.js: every
+// parameter from a squared-error fit of the τ → ∞ model's cells, τ by a
+// search on the soft loss; INIT_LOG_TAU and INIT_RADIUS unused).
+export const INIT_MODES = {
+  gradient: "gradient (edges)",
+  cells: "fit to cells",
 };
 // What adam.wgsl learns of the layer (AdamParams.layer_learn) per mode.
 const LAYER_LEARN = { off: 0, learn: 0, mean: 1, site: 2 };
@@ -369,6 +379,8 @@ export function buildArgs(config, overrides = {}) {
     lrAnisoBase: Number(pick("lrAnisoBase", "LR_ANISO_BASE", 0.02)),
     initLogTau: Number(pick("initLogTau", "INIT_LOG_TAU", NaN)),
     initRadius: Number(pick("initRadius", "INIT_RADIUS", NaN)),
+    init: String(pick("init", "INIT", "gradient")),
+    initIters: Math.max(0, Math.floor(Number(pick("initIters", "INIT_ITERS", 0)))),
     beta1: Number(pick("beta1", "BETA1", 0.9)),
     beta2: Number(pick("beta2", "BETA2", 0.999)),
     eps: Number(pick("eps", "EPS", 1e-8)),
@@ -433,6 +445,9 @@ export function buildArgs(config, overrides = {}) {
   }
   if (!LOSSES[args.loss]) {
     throw new Error(`loss must be one of ${Object.keys(LOSSES).join(", ")} (got "${args.loss}")`);
+  }
+  if (!INIT_MODES[args.init]) {
+    throw new Error(`init must be one of ${Object.keys(INIT_MODES).join(", ")} (got "${args.init}")`);
   }
   if (!LAYER_MODES[args.layer]) {
     throw new Error(`layer must be one of ${Object.keys(LAYER_MODES).join(", ")} (got "${args.layer}")`);
@@ -637,6 +652,22 @@ export class Trainer {
         if (initSites[i * SITE_FLOATS] >= 0) this.activeEstimate += 1;
       }
       this._log(`Loaded init sites: ${baseSiteCount} (active ${this.activeEstimate})`);
+    } else if (args.init === "cells") {
+      const t0 = performance.now();
+      const { sites, info } = cellInit({
+        target: targetRgba32f, mask: this.maskCpu, width, height, tiling, iters: args.initIters,
+        count: tiling ? tiling.sitesPerTile - (useLayer ? 1 : 0) : baseSiteCount,
+        skipSlot: tiling && useLayer ? this.layerIndex : -1,
+      });
+      device.queue.writeBuffer(this.sitesBuf, 0, encodeSiteColors(sites, baseSiteCount, this.colorSpace));
+      if (useLayer) this._writeLayerSite();
+      this.actualSites = initSiteCount;
+      this.activeEstimate = info.reduce((a, r) => a + r.active, 0) + (useLayer ? (tiling ? tiling.count : 1) : 0);
+      const lt = info.map((r) => r.logTau).sort((a, b) => a - b);
+      const med = (v) => v[v.length >> 1];
+      this._log(`Cell init: ${initSiteCount} sites (active ${this.activeEstimate}), ${args.initIters} Lloyd passes, ` +
+                `log τ ${med(lt).toFixed(2)}${lt.length > 1 ? ` (median of ${lt.length})` : ""}, ` +
+                `${((performance.now() - t0) / 1000).toFixed(2)} s`);
     } else {
       const gradThreshold = 0.01;
       const initParamsBuf = createInitParamsBuffer(device, baseSiteCount, gradThreshold, 256,

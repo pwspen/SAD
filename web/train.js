@@ -5,7 +5,7 @@
 
 import { loadShaders, tileSlotsForLimit } from "../trainer/shader_loader.js?v=w2b-20261021";
 import { requestTrainingDevice } from "../trainer/device.js?v=20261019";
-import { Trainer, buildArgs, GRAD_GROUPS, GRAD_CHANNELS, lrSchedule, LR_SCHEDULES, LOSSES, COLOR_MOMENTS, COUNT_SCHEDULES, LAYER_MODES, countPlan, countVaries, countHorizon } from "../trainer/trainer.js?v=w2b-20261021";
+import { Trainer, buildArgs, GRAD_GROUPS, GRAD_CHANNELS, lrSchedule, LR_SCHEDULES, LOSSES, COLOR_MOMENTS, COUNT_SCHEDULES, LAYER_MODES, INIT_MODES, countPlan, countVaries, countHorizon } from "../trainer/trainer.js?v=cells2-20261022";
 import { loadImageToFloat32, loadMaskRgba32Float, whiteMaskRgba32Float } from "../trainer/textures.js?v=20261019";
 import { loadSitesFromFile, serializeSitesTxt, triggerDownload, floatImageToRgba8, computeBpp, computePsnr, BITS_PER_SITE } from "../trainer/io.js?v=20261019";
 import { SITE_FLOATS } from "../trainer/params.js?v=w2b-20261021";
@@ -88,6 +88,8 @@ const UI_FIELDS = [
   ["layer", "p-layer"],
   ["initLogTau", "p-initLogTau"],
   ["initRadius", "p-initRadius"],
+  ["init", "p-init"],
+  ["initIters", "p-initIters"],
 ];
 
 const state = {
@@ -229,6 +231,8 @@ function applyConfigToForm(config, overrides = {}) {
     .replaceChildren(...Object.entries(COUNT_SCHEDULES).map(([key, label]) => new Option(label, key)));
   document.getElementById("p-layer")
     .replaceChildren(...Object.entries(LAYER_MODES).map(([key, label]) => new Option(label, key)));
+  document.getElementById("p-init")
+    .replaceChildren(...Object.entries(INIT_MODES).map(([key, label]) => new Option(label, key)));
   const defaults = buildArgs(config, overrides);
   for (const [key, elId, opts] of UI_FIELDS) {
     const el = document.getElementById(elId);

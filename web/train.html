@@ -893,6 +893,15 @@
           <div class="tip" role="tooltip">Start from these sites instead of the default placement (sites sampled where the image has edges). Positions are rescaled to the target size and every site's τ is reset to <b>init log τ</b>. Its site count becomes the starting count: it replaces <b>start sites</b>, which is locked to show it until the file is cleared. Single runs only.</div>
         </div>
         <div class="param">
+          <div class="row"><label>init</label><select id="p-init" aria-label="Site initialization"></select></div>
+          <div class="tip" role="tooltip">How the starting sites are placed when no init sites file is loaded. <b>gradient</b>: points on an even (R2) sequence where the image has edges, each with its pixel's color, τ from <b>init log τ</b> plus a bonus for steep edges, radius <b>init radius</b>, round. <b>fit to cells</b>: every parameter from one squared-error fit of the model's hard-edged limit. Sites are spread with density ∝ √(local variance at the site spacing), the density that minimizes a flat-cell fit's error; each site then takes its cell's mean color, and its direction, anisotropy and radius from the cell's spatial covariance; τ is the one value that minimizes the soft model's error with those sites. <b>init log τ</b> and <b>init radius</b> are unused.</div>
+        </div>
+        <div class="param">
+          <div class="row"><label>init Lloyd passes</label><input id="p-initIters" type="number" min="0" step="1" /></div>
+          <p class="help"><span class="unit">Lloyd passes before the cell fit</span></p>
+          <div class="tip" role="tooltip">Fit to cells only. Each pass moves every site to its cell's density-weighted centroid before the fit (a centroidal Voronoi diagram). On Kodak they didn't help; 0 (default) fits the seeds' own cells.</div>
+        </div>
+        <div class="param">
           <div class="row"><label>init log τ</label><input id="p-initLogTau" type="number" step="0.1" /></div>
           <p class="help"><span class="unit">natural log of τ at iteration 0, every site</span></p>
           <div class="tip" role="tooltip">Starting edge sharpness. τ is measured per image long side: a site's edge blends over roughly (long side ÷ τ) px, so log τ = 5 (τ ≈ 148) on a 768 px image ≈ 5 px edges. Also applied to a loaded init sites file.</div>
@@ -1219,6 +1228,6 @@
       </section>
     </div>
 
-    <script type="module" src="train.js?v=groups2-20261021"></script>
+    <script type="module" src="train.js?v=cells2-20261022"></script>
   </body>
 </html>

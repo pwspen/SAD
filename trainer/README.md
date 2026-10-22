@@ -77,6 +77,22 @@ read and write per pixel, one atomic per tile), so it costs no extra dispatch. G
 a pixel's 8 candidates, so the weights pull nearby sites; `errGrowth` also weights growth's split
 moments, so new sites go where the error persists. Off by default and untested against the presets.
 
+Without a sites file, `init` places the starting sites. `"gradient"` (default, `init_gradient.wgsl`)
+takes R2 points whose Sobel gradient passes 0.01, each with its pixel's color, log τ = `INIT_LOG_TAU`
++ 2·gradient^¼, radius `INIT_RADIUS`, round. `"cells"` (`cell_init.js`) fits every parameter to the
+τ → ∞ model's flat cells by squared error: sites spread with density ∝ √(local variance at the site
+spacing) (the density that minimizes a flat-cell fit's error), each takes its Voronoi cell's mean
+color and, from the cell's spatial covariance, its direction, anisotropy and radius (the cell's edge
+in that metric), and log τ is the one value per image that minimizes the soft model's error over a
+grid. `initIters` Lloyd passes (density-weighted centroids) can run first; feeding the fitted metric
+and radius back into the assignment runs away, and on Kodak the passes didn't help. Single runs on
+four Kodak images at 768 px, one run each: +0.22 dB mean at a fixed 1000 sites (Kodak preset
+otherwise), +0.23 dB with the preset's 2000 → 1000 merge, and 0.5–1.5 dB higher at iteration 0. On
+MNIST batches (128 digits, MNIST preset) it is far behind: 20.6 vs 25.8 dB mean (20.3 vs 22.2 without
+the layer). Ten flat cells over a digit come out grey, where the gradient init puts sites on stroke
+edges and leaves the background to the layer, and the preset's τ, radius and LRs were tuned to the
+gradient init.
+
 There is no LR warmup. `lrSchedule` is `"cosine"` (1 to 0 over `iters`), `"fixed"` (default, constant) or
 `"decay-after-growth"` (constant until growth ends, then cosine to 0 by the end of the run).
 
