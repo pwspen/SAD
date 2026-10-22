@@ -32,7 +32,7 @@ async function main() {
       ...DATASET_OPTIONS,
       keys: { type: "string" }, budget: { type: "string", default: "240" }, repeats: { type: "string", default: "3" },
       every: { type: "string", default: "20" }, holdout: { type: "string", default: "2048" },
-      "start-runs": { type: "string", default: "5" }, sigma: { type: "string", default: "0.5" },
+      "start-runs": { type: "string", default: "5" }, sigma: { type: "string", default: "0.25" },
       lambda: { type: "string", default: "0" }, out: { type: "string" },
     },
   });

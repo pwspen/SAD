@@ -48,7 +48,7 @@ const HELP = `Usage: node tune.mjs (--mnist <idx3.gz> | --parquet <file> | --ima
   --rounds <n>        At most this many rounds per setting per cycle (default 8).
   --cycles <n>        Passes over --keys (default 2).
   --method <m>        coord (above, default) or cma: CMA-ES over all --keys at once.
-  --sigma <s>         cma: starting step in natural-log units (default 0.5, ±1σ ≈ ×1.65).
+  --sigma <s>         cma: starting step in natural-log units (default 0.25, ±1σ ≈ ×1.28).
   --lambda <n>        cma: points per generation (default 4 + ⌊3 ln n⌋ for n keys).
   --seed <n>          cma: sampling seed (default 1).
   --budget <n>        Stop after this many batches (default 0 = no cap; cma needs one or --min-ratio).
@@ -280,7 +280,7 @@ async function main() {
       keys: { type: "string" }, ratio: { type: "string", default: "2" }, decay: { type: "string", default: "0.5" },
       "min-ratio": { type: "string", default: "1.1" }, rounds: { type: "string", default: "8" },
       cycles: { type: "string", default: "2" }, method: { type: "string", default: "coord" },
-      sigma: { type: "string", default: "0.5" }, lambda: { type: "string", default: "0" },
+      sigma: { type: "string", default: "0.25" }, lambda: { type: "string", default: "0" },
       seed: { type: "string", default: "1" }, budget: { type: "string", default: "0" }, holdout: { type: "string" }, out: { type: "string" },
       help: { type: "boolean", short: "h", default: false },
     },

@@ -80,7 +80,7 @@ times (cma with a new seed each time), and scores each one's incumbent on held-o
 every `--every` batches, so the two compare as held-out gain per tuning batch.
 
 Held-out gain (median PSNR over 2048 images after the 1024 tuning ones) vs tuning
-batches, mean (min…max) over 3 repeats, defaults (coord ×2 → ×1.1; cma σ 0.5):
+batches, mean (min…max) over 3 repeats, coord ×2 → ×1.1, cma σ 0.5 (the default then):
 
 | batches | CIFAR, 6 LR bases: coord | cma | MNIST, 9 keys: coord | cma |
 |---|---|---|---|---|
@@ -114,6 +114,22 @@ No dip: CMA-ES is level with the coordinate search at 20 batches and ahead from 
 where at σ 0.5 it was still −0.13 dB. It also ends higher, though one repeat stopped at
 210 batches (step below ×1.1). The coordinate search's +0.20 vs +0.13 before is the
 repeat-to-repeat spread. `results/tunecmp/mnist_9keys_s025.{json,log}`.
+
+CIFAR (six LR bases) at both σ on the same trainer code (b75cfe1; d0b65e2's opt-in cell
+init landed between the two runs, and both score the start the same):
+
+| batches | coord (σ 0.25 run) | cma σ 0.25 | coord (σ 0.5 run) | cma σ 0.5 |
+|---|---|---|---|---|
+| 20 | +0.14 (0.12…0.15) | +0.08 (0.01…0.13) | +0.20 (0.19…0.20) | +0.16 (0.04…0.28) |
+| 40 | +0.22 (0.19…0.24) | +0.24 (0.15…0.32) | +0.23 (0.21…0.25) | +0.29 (0.21…0.35) |
+| 60 | +0.32 (0.30…0.34) | +0.29 (0.24…0.34) | +0.30 (0.27…0.34) | +0.33 (0.31…0.38) |
+| 100 | +0.32 (done) | +0.32 (0.30…0.36) | +0.30 (done) | +0.31 (0.28…0.34) |
+| 240 | +0.32 | +0.34 (0.32…0.37) | +0.30 | +0.34 (0.33…0.35) |
+
+At 240 batches the two σ are even (best sample +0.37 vs +0.33). σ 0.25 trails by
+0.04–0.08 dB over the first 60 batches, within the repeats' spread; on MNIST σ 0.5 was
+0.3 dB behind over the same stretch. So `--sigma` now defaults to 0.25.
+`results/tunecmp/cifar_lr_s{0.25,0.5}.{json,log}`.
 
 `probe.mjs` runs one batch and reports three diagnostics for putting the LR groups in
 common units (header comment for details): E1, candidate units per LR group (the codec
