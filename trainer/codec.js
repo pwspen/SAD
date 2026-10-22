@@ -306,7 +306,8 @@ function median(vals) {
 }
 
 // Codes plane `vals` (filled in when decoding) with mode 0 (predict `constant`)
-// or 1 (predict from neighbours; `constant` for a site without any). `levels`:
+// or 1 (predict from neighbours; `constant` for a site without any), where
+// `constant` is one number or one per site. `levels`:
 // per site, M for a value mod M (an angle in M levels over π; the nearest
 // neighbour's angle is the prediction, rescaled to M), or null for integers.
 // Models come from `ms` under `key` (fresh uniform ones by default).
@@ -317,7 +318,8 @@ function codePlane(io, { vals, has, levels }, nbrs, mode, constant, enc, ms = ne
     const near = nbrs[i].filter((j) => !has || has[j]);
     const nv = near.map((j) => vals[j]);
     const m = levels ? levels[i] : 0;
-    let pred = m ? constant % m : constant;
+    const c = typeof constant === "number" ? constant : constant[i];
+    let pred = m ? c % m : c;
     if (mode === 1 && near.length) pred = m ? Math.round((vals[near[0]] * m) / levels[near[0]]) % m : median(nv);
     const ctx = m ? 0 : spreadCtx(nv);
     let r;
@@ -514,6 +516,10 @@ function ownConstant(s) {
 //   strengths  per model family, the prior weight the tables were made with
 //   posRegions positions as an occupancy map in R × R blocks (codeOccupancy),
 //              or 0 (absent in older models) for raster gaps
+//   valueRegions, blockConstants  per plane, the median in each block of
+//              valueRegions × valueRegions (the plane's constant where a block
+//              has too few sites): the shared prediction of a site in that
+//              block, in place of the plane's one constant (0: off)
 // A shared stream is arithmetic coded from its first bit, header included:
 // a size flag (then the size if it differs), the count, the layer's index + 1,
 // and per plane a mode: 0 = predict the shared constant, 1 = neighbours (the
@@ -524,6 +530,7 @@ function ownConstant(s) {
 // one it was coded with.
 
 const SHARED_VERSION = 1;
+const BLOCK_MIN_SITES = 8; // fewer in a block (valueRegions): the plane's constant
 const SHARED_MODES = 3;
 const PRIOR_STRENGTHS = [0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768];
 const PRIOR_MASS = INC * 2048; // most a primed table holds (plus 1 per symbol), under MAX_TOTAL
@@ -545,14 +552,15 @@ function sharedStream(io, S, st, enc, ms = new ModelSet(S.tables, S.incs)) {
   }
   const headerBits = io.bits;
   if (!enc) st.idx = new Array(st.n);
-  const gx = Math.max(1, Math.ceil(st.width / stepOf(S.q.pos)));
-  if (S.posRegions) codeOccupancy(io, st.idx, st.n, gx, Math.max(1, Math.ceil(st.height / stepOf(S.q.pos))), S.posRegions, enc, ms);
+  const gx = gridSize(S.q, st.width);
+  if (S.posRegions) codeOccupancy(io, st.idx, st.n, gx, gridSize(S.q, st.height), S.posRegions, enc, ms);
   else codePositions(io, st.idx, st.n, enc, ms);
   const positionBits = io.bits - headerBits;
   if (!enc) {
     st.xs = st.idx.map((v) => v % gx); st.ys = st.idx.map((v) => Math.floor(v / gx));
     st.nbrs = priorNeighbors(st.xs, st.ys);
     st.planes = CODEC_PLANES.map(() => new Array(st.n).fill(0));
+    st.blocks = blocksOf(S, st.xs, st.ys, st.width, st.height);
   }
   const planeBits = CODEC_PLANES.map((_, p) => {
     const before = io.bits;
@@ -574,14 +582,31 @@ function sharedPlane(io, S, st, p, enc, ms) {
   const spec = p === THETA_PLANE ? { vals: st.planes[p], has: st.levels.map((m) => m > 1), levels: st.levels }
                                  : { vals: st.planes[p], has: null, levels: null };
   const mode = st.modes[p];
-  codePlane(io, spec, st.nbrs, mode === 1 ? 1 : 0, mode === 2 ? st.constants[p] : S.constants[p], enc, ms, `p${p}/`);
+  codePlane(io, spec, st.nbrs, mode === 1 ? 1 : 0, mode === 2 ? st.constants[p] : sharedConstant(S, p, st.blocks), enc, ms, `p${p}/`);
+}
+
+const gridSize = (q, size) => Math.max(1, Math.ceil(size / stepOf(q.pos)));
+
+// Each site's block of S.valueRegions a side, or null when S has none.
+function blocksOf(S, xs, ys, width, height) {
+  const R = S.valueRegions;
+  if (!R) return null;
+  const gx = gridSize(S.q, width), gy = gridSize(S.q, height);
+  return xs.map((x, i) => Math.floor((ys[i] * R) / gy) * R + Math.floor((x * R) / gx));
+}
+
+// Plane p's shared prediction: per site its block's constant, else the plane's.
+function sharedConstant(S, p, blocks) {
+  const t = S.blockConstants?.[p];
+  return t && blocks ? blocks.map((b) => t[b]) : S.constants[p];
 }
 
 // An analyzed image (analyze) as a shared stream's state, each plane's mode
 // whichever codes shortest with S's primed models (its mode symbol and
 // constant included; planes use disjoint models, so each is costed alone).
 function sharedState(a, width, height, globalIndex, S) {
-  const st = { width, height, n: a.n, globalIndex, idx: a.idx, nbrs: a.nbrs, planes: a.planes, modes: [], constants: [] };
+  const st = { width, height, n: a.n, globalIndex, idx: a.idx, nbrs: a.nbrs, planes: a.planes, modes: [], constants: [],
+               blocks: blocksOf(S, a.xsPos, a.ysPos, width, height) };
   a.specs.forEach((spec, p) => {
     if (!planeCoded(S.colorBasis, p)) { st.modes[p] = 0; st.constants[p] = 0; return; }
     const own = ownConstant(spec);
@@ -592,7 +617,7 @@ function sharedState(a, width, height, globalIndex, S) {
       const trial = { modes: [], constants: [] };
       trial.modes[p] = mode; trial.constants[p] = own;
       sharedPlaneHeader(io, S, trial, p, true, ms);
-      codePlane(io, spec, a.nbrs, mode === 1 ? 1 : 0, mode === 2 ? own : S.constants[p], true, ms, `p${p}/`);
+      codePlane(io, spec, a.nbrs, mode === 1 ? 1 : 0, mode === 2 ? own : sharedConstant(S, p, st.blocks), true, ms, `p${p}/`);
       if (io.bits < best) { best = io.bits; st.modes[p] = mode; st.constants[p] = mode === 2 ? own : S.constants[p]; }
     }
   });
@@ -649,9 +674,11 @@ function primedTables(counts, strengths) {
 // PRIOR_STRENGTHS by two-fold cross-validation over the images (counts from
 // one half, bits on the other), so it is not fit to the images it is scored
 // on. `iterations` alternate modes and tables. `posRegions`: code positions
-// as an occupancy map in that many blocks a side (0: raster gaps). Returns a
-// plain JSON object.
-export function buildSharedModel(list, steps, { colorBasis = null, iterations = 2, posRegions = 0 } = {}) {
+// as an occupancy map in that many blocks a side (0: raster gaps).
+// `valueRegions`: predict each plane (θ excepted) from a constant per block of
+// that many a side, each the median of that block's sites (0: one constant).
+// Returns a plain JSON object.
+export function buildSharedModel(list, steps, { colorBasis = null, iterations = 2, posRegions = 0, valueRegions = 0 } = {}) {
   const q = {};
   for (const k of STEP_GROUPS) q[k] = quantizeStep(steps[k]);
   const items = list.map((im) => {
@@ -667,7 +694,15 @@ export function buildSharedModel(list, steps, { colorBasis = null, iterations = 
     for (const { a } of items) a.specs[p].vals.forEach((x, i) => { if (!a.specs[p].has || a.specs[p].has[i]) v.push(x); });
     return v.length ? median(v) : 0;
   });
-  const S = { version: SHARED_VERSION, q, colorBasis, width, height, constants, tables: {}, incs: {}, strengths: {}, posRegions };
+  const S = { version: SHARED_VERSION, q, colorBasis, width, height, constants, tables: {}, incs: {}, strengths: {}, posRegions, valueRegions };
+  if (valueRegions) {
+    const pooled = CODEC_PLANES.map(() => Array.from({ length: valueRegions * valueRegions }, () => []));
+    items.forEach(({ a, width, height }) => {
+      blocksOf(S, a.xsPos, a.ysPos, width, height).forEach((b, i) => a.planes.forEach((vals, p) => pooled[p][b].push(vals[i])));
+    });
+    S.blockConstants = pooled.map((blocks, p) => (p === THETA_PLANE ? null
+      : blocks.map((v) => (v.length >= BLOCK_MIN_SITES ? median(v) : constants[p]))));
+  }
   for (let iter = 0; iter < iterations; iter += 1) {
     const states = items.map((it) => sharedState(it.a, it.width, it.height, it.globalIndex, S));
     const count = (sel) => { const io = new CountIO(); sel.forEach((st) => sharedStream(io, S, st, true, new ModelSet())); return io.counts; };

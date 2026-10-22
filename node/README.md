@@ -437,6 +437,7 @@ image's label (MNIST's labels file next to the images, the parquet `label` colum
 | site map (k-means) | 53.5–56.4% | 38.0–41.8% | 19.9% | 11.9 ± 1.9% |
 | codelength, positions as gaps | 37.8% | 22.7 ± 4.8% | 20.1% | 12.5 ± 2.0% |
 | codelength, occupancy 14 × 14 | 51.1% | 36.2 ± 6.1% | | |
+| codelength, occupancy + value constants 14 × 14 | 51.9% | 38.3 ± 6.2% | | |
 
 The site map matches the pixels on MNIST (two runs, so ±3% from encoding and k-means
 seeding); on CIFAR-10 every method is near chance, as k-means on pixels is known to be.
@@ -455,6 +456,16 @@ bits/image after the rounds). By blocks a side: 4 → 42.3%, 7 → 47.3%, 14 →
 (53.5%): the values are still predicted from neighbours and one constant per plane, not
 by place. A first version with one occupancy symbol per grid cell (0.11 px cells, ~61k
 per image) took 361 s a round instead of 8.
+
+Values by place (`--value-regions V`, default 14; `buildSharedModel(…, { valueRegions })`):
+each plane but θ is predicted from the median of its block (V × V; the plane's constant
+where a block has fewer than 8 sites) in place of one constant per plane. It helps only
+a little: by blocks a side, 4 → 51.1% purity, 36.9% one peek; 7 → 51.2%, 38.0%; 14 →
+51.9%, 38.3%; 311.7 bits/image after the rounds against 314.8, all within a run's noise
+(the site map moves 53.4–53.7% between runs). The constant was already the prediction
+almost every image picks (per plane, 82–100% of images with one constant; with block
+constants the luma plane drops from 98% to 90% in favour of neighbours), so at 10 sites
+an image the remaining gap to the site map is not in where values sit.
 
 
 ## Gap to RECOMBINER on CIFAR-10 (qat.mjs)

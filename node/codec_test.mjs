@@ -7,7 +7,7 @@
 //   6. edge cases: one site, every site round, every site in one cell
 //   7. colors along a KLT basis
 //   8. a shared model (buildSharedModel) fit on other images: round trip, and cheaper;
-//      positions as an occupancy map (posRegions): round trip
+//      positions as an occupancy map (posRegions), constants per block (valueRegions): round trip
 // Usage: node codec_test.mjs
 
 import { encodeSites, decodeSites, codecSteps, buildSharedModel } from "../trainer/codec.js?v=rui-20261021";
@@ -222,6 +222,13 @@ function roundTrip(name, sites, count, w, h, steps, opts = {}) {
   roundTrip("shared occupancy one site", one, 1, 28, 28, null, { shared: occ });
   roundTrip("shared occupancy no sites", none, 3, 28, 28, null, { shared: occ, globalSite: 1 });
   console.log(`shared occupancy: ${(occBits / sites).toFixed(2)} position bits/site vs ${(gapBits / sites).toFixed(2)} as gaps`);
+  // Constants per block: round trips, and a JSON copy decodes the same.
+  const blocks = buildSharedModel(train, steps, { posRegions: 4, valueRegions: 4 });
+  const blocksJson = JSON.parse(JSON.stringify(blocks));
+  check("block constants", blocks.blockConstants?.[0]?.length === 16 && blocks.blockConstants[1] === null, JSON.stringify(blocks.blockConstants));
+  test.slice(0, 20).forEach((im, k) => roundTrip(`shared blocks ${k}`, im.sites, im.n, 28, 28, null, { globalSite: im.globalSite, shared: k % 2 ? blocksJson : blocks }));
+  roundTrip("shared blocks odd size", randomSites(40, 61, 37, rng(13)), 40, 61, 37, null, { shared: blocks });
+  roundTrip("shared blocks no sites", none, 3, 28, 28, null, { shared: blocks, globalSite: 1 });
   console.log(`shared: ${(withShared / sites).toFixed(1)} bits/site held out (header ${(header / sites).toFixed(1)}) ` +
               `vs ${(alone / sites).toFixed(1)} per image alone; strengths ${JSON.stringify(shared.strengths)}`);
 }
