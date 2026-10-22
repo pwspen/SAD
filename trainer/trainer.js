@@ -231,14 +231,20 @@ export function colorPeak(target, n, mask = null) {
     hist[(bin(r) * B + bin(g)) * B + bin(b)] += 1;
     total += 1;
   }
-  let best = 0, bestMass = -1;
-  for (let i = 0; i < B; i += 1) for (let j = 0; j < B; j += 1) for (let k = 0; k < B; k += 1) {
-    let m = 0;
-    for (let a = Math.max(0, i - 1); a <= Math.min(B - 1, i + 1); a += 1)
-      for (let c = Math.max(0, j - 1); c <= Math.min(B - 1, j + 1); c += 1)
-        for (let d = Math.max(0, k - 1); d <= Math.min(B - 1, k + 1); d += 1) m += hist[(a * B + c) * B + d];
-    if (m > bestMass) { bestMass = m; best = (i * B + j) * B + k; }
+  // The ±1-bin box sum, one axis at a time (counts, so exact in f64).
+  let box = hist;
+  for (const stride of [1, B, B * B]) {
+    const out = box.slice();
+    for (let p = 0; p < B * B * B; p += stride * B) {
+      for (let q = p; q < p + stride; q += 1) {
+        for (let c = 1; c < B; c += 1) out[q + c * stride] += box[q + (c - 1) * stride];
+        for (let c = 0; c < B - 1; c += 1) out[q + c * stride] += box[q + (c + 1) * stride];
+      }
+    }
+    box = out;
   }
+  let best = 0, bestMass = -1;
+  for (let p = 0; p < B * B * B; p += 1) if (box[p] > bestMass) { bestMass = box[p]; best = p; }
   for (let p = 0; p < n; p += 1) {
     if (mask && !(mask[p] > 0)) continue;
     const r = target[p * 4], g = target[p * 4 + 1], b = target[p * 4 + 2];
