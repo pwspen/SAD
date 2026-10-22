@@ -50,6 +50,10 @@ node batch.mjs --images ../../comp/data/kodak --preset ../presets/kodak.json \
   256 digits: 9.4× faster than 8 separate trainers, −0.18 dB mean (per-image noise
   ±6 dB). Kodak at 1000 sites: no speedup (one image already fills the GPU), −0.11 dB.
 
+`profile.mjs` takes the same dataset options (plus `--alone`) and breaks a run's time down:
+wall clock by phase (prepare / run / finalize), the share spent on log ticks, and GPU time
+per kernel from timestamp queries on every compute pass.
+
 ## Auto-tune and diagnostics (batch mode)
 
 `tune.mjs` is train.html's auto-tune without the browser: each evaluation is one batched
