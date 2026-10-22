@@ -68,6 +68,38 @@ node tune.mjs --mnist ../../comp/data/mnist/t10k-images-idx3-ubyte.gz --count 10
 node tune.mjs --parquet ../../comp/data/cifar10/test.parquet --count 1024 --preset ../presets/mnist.json --keys lrMult
 ```
 
+`--method cma` searches all `--keys` at once with CMA-ES instead: each generation samples
+λ points (4 + ⌊3 ln n⌋ by default) from a Gaussian in log space, moves its mean to the
+weighted best half, and adapts the covariance toward the directions that paid, so
+settings that trade off against each other (lrMult against the bases) move together.
+The mean is scored once per generation and is what it returns; the best single sample is
+reported alongside. `--budget` caps either method at that many batches.
+
+`tunecmp.mjs` runs both methods from the same preset at the same `--budget`, `--repeats`
+times (cma with a new seed each time), and scores each one's incumbent on held-out images
+every `--every` batches, so the two compare as held-out gain per tuning batch.
+
+Held-out gain (median PSNR over 2048 images after the 1024 tuning ones) vs tuning
+batches, mean (min…max) over 3 repeats, defaults (coord ×2 → ×1.1; cma σ 0.5):
+
+| batches | CIFAR, 6 LR bases: coord | cma | MNIST, 9 keys: coord | cma |
+|---|---|---|---|---|
+| 20 | +0.18 (0.13…0.21) | +0.16 (0.04…0.27) | +0.03 (−0.00…0.08) | −0.30 (−0.42…−0.11) |
+| 60 | +0.29 (0.27…0.31) | +0.31 (0.30…0.33) | +0.04 (0.01…0.07) | −0.17 (−0.32…0.05) |
+| 100 | +0.29 (done) | +0.31 (0.30…0.32) | +0.13 (0.01…0.33) (done) | +0.24 (0.13…0.35) |
+| 240 | +0.29 | +0.36 (0.34…0.38) | +0.13 | +0.39 (0.32…0.51) |
+
+CIFAR-10 starts from presets/mnist.json and tunes the six LR bases; MNIST starts from
+its own preset and tunes those plus lrMult, INIT_LOG_TAU and INIT_RADIUS. The coordinate
+search stops on its own once every step is below ×1.1 (55–62 batches on CIFAR, 69–87 on
+MNIST), so past that it is flat. Up to there the two are even on CIFAR; CMA-ES keeps
+going and ends +0.07 dB higher. With 9 keys, CMA-ES's first generations (σ 0.5 on every
+key at once, the init values included) land below the start for ~60 batches, then it
+passes the coordinate search, which on MNIST gains +0.28 dB on the tuning images but
+only +0.13 held out (its point is the single best measurement, so noise flatters it;
+the same preset scores 24.78–24.84 dB across repeats). The best sample tracks CMA-ES's
+mean within noise. `results/tunecmp/{cifar_lr,mnist_9keys}.{json,log}`.
+
 `probe.mjs` runs one batch and reports three diagnostics for putting the LR groups in
 common units (header comment for details): E1, candidate units per LR group (the codec
 quantizer step Δ, the median 1/√F of the Gauss–Newton diagonal, the spread σ of the
