@@ -1,0 +1,26 @@
+c=1 b=2 | 13.51 dB (13.51 float weights) | 3528 bits = latent 80 + decoder 3448 (207 params) | 0.0090 bpp
+c=1 b=3 | 13.51 dB (13.51 float weights) | 3492 bits = latent 80 + decoder 3412 (207 params) | 0.0089 bpp
+c=1 b=4 | 13.51 dB (13.51 float weights) | 3540 bits = latent 110 + decoder 3430 (207 params) | 0.0090 bpp
+c=1 b=5 | 13.51 dB (13.51 float weights) | 9604 bits = latent 6192 + decoder 3412 (207 params) | 0.0244 bpp
+c=1 b=6 | 13.51 dB (13.51 float weights) | 9995 bits = latent 6583 + decoder 3412 (207 params) | 0.0254 bpp
+c=2 b=2 | 20.91 dB (20.90 float weights) | 32166 bits = latent 23943 + decoder 8223 (591 params) | 0.0818 bpp
+c=2 b=3 | 22.73 dB (22.77 float weights) | 40149 bits = latent 31328 + decoder 8821 (591 params) | 0.1021 bpp
+c=2 b=4 | 23.03 dB (23.06 float weights) | 50902 bits = latent 42420 + decoder 8482 (591 params) | 0.1294 bpp
+c=2 b=5 | 23.24 dB (23.31 float weights) | 60654 bits = latent 51891 + decoder 8763 (591 params) | 0.1543 bpp (over budget)
+c=2 b=6 | 23.30 dB (23.37 float weights) | 71666 bits = latent 62574 + decoder 9092 (591 params) | 0.1823 bpp (over budget)
+c=3 b=2 | 13.55 dB (13.55 float weights) | 12934 bits = latent 80 + decoder 12854 (1155 params) | 0.0329 bpp
+c=3 b=3 | 13.55 dB (13.55 float weights) | 12328 bits = latent 80 + decoder 12248 (1155 params) | 0.0314 bpp
+c=3 b=4 | 13.55 dB (13.55 float weights) | 12680 bits = latent 80 + decoder 12600 (1155 params) | 0.0322 bpp
+c=3 b=5 | 13.55 dB (13.55 float weights) | 13869 bits = latent 80 + decoder 13789 (1155 params) | 0.0353 bpp
+c=3 b=6 | 13.55 dB (13.55 float weights) | 13926 bits = latent 80 + decoder 13846 (1155 params) | 0.0354 bpp
+c=4 b=2 | 25.08 dB (25.18 float weights) | 65289 bits = latent 47653 + decoder 17635 (1899 params) | 0.1660 bpp (over budget)
+c=4 b=3 | 25.80 dB (25.89 float weights) | 88737 bits = latent 71432 + decoder 17305 (1899 params) | 0.2257 bpp (over budget)
+c=4 b=4 | 26.27 dB (26.41 float weights) | 106908 bits = latent 90259 + decoder 16650 (1899 params) | 0.2719 bpp (over budget)
+c=4 b=5 | 26.54 dB (26.74 float weights) | 130466 bits = latent 112707 + decoder 17758 (1899 params) | 0.3318 bpp (over budget)
+c=4 b=6 | 26.77 dB (26.97 float weights) | 145357 bits = latent 129819 + decoder 15539 (1899 params) | 0.3697 bpp (over budget)
+c=6 b=2 | 26.54 dB (26.65 float weights) | 98829 bits = latent 71398 + decoder 27431 (3927 params) | 0.2513 bpp (over budget)
+c=6 b=3 | 27.05 dB (27.51 float weights) | 135268 bits = latent 107496 + decoder 27771 (3927 params) | 0.3440 bpp (over budget)
+c=6 b=4 | 28.06 dB (28.31 float weights) | 167014 bits = latent 140285 + decoder 26729 (3927 params) | 0.4247 bpp (over budget)
+c=6 b=5 | 28.15 dB (28.62 float weights) | 199232 bits = latent 172975 + decoder 26258 (3927 params) | 0.5067 bpp (over budget)
+c=6 b=6 | 28.51 dB (28.59 float weights) | 240891 bits = latent 209246 + decoder 31644 (3927 params) | 0.6126 bpp (over budget)
+best under 51606 bits: c=2 b=4 23.03 dB at 50902 bits
